@@ -1,0 +1,68 @@
+# Training / eval artifacts (huge: 60+ GB)
+outputs/
+lerobot-piper/outputs/
+
+# WandB local
+wandb/
+**/wandb/
+
+# HuggingFace cache
+.cache/
+~/.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug / logs
+*.log
+tea_debug.log
+debug.log
+
+# Test / scratch
+test.jpeg
+test_*.png
+scratch/
+tmp/
+
+# Datasets (do not commit raw recordings)
+data/
+**/data/chunk-*/
+**/videos/
+**/images/
+
+# Large model artifacts
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+!**/configuration_*.py
+!**/config.json
+
+# Phase 2 IMU reward pickle (36 MB, regeneratable)
+outputs/eval/d2_imu_reward_computer*.pkl
+
+# Local Claude harness state (per-machine, not for sharing)
+.claude/

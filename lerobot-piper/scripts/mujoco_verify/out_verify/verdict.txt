@@ -1,0 +1,11 @@
+=== Verification Report ===
+E_hf(A raw)      = 2.0122e+01
+E_hf(B smoothed) = 1.3481e+01
+E_hf(C jittered) = 3.8727e+01
+r1 = E_hf(C)/E_hf(B) = 2.873
+r2 = E_hf(A)/E_hf(B) = 1.493
+peak ratio @8Hz (C/B) = 2.268
+
+Verdict: GRAY — 灰色地带，建议加做中等幅度扰动组
+
+Plot saved to: /home/enolab-guo/claude-test-2/lerobot-piper/scripts/mujoco_verify/out_verify/verification_plot.png

@@ -1,0 +1,11 @@
+=== Verification Report ===
+E_hf(A raw)      = 2.5881e+01
+E_hf(B smoothed) = 1.8566e+00
+E_hf(C jittered) = 4.0504e+02
+r1 = E_hf(C)/E_hf(B) = 218.166
+r2 = E_hf(A)/E_hf(B) = 13.940
+peak ratio @8Hz (C/B) = 114.775
+
+Verdict: PASS — MuJoCo 保留高频，方法可行（原方向 + ΦSim）
+
+Plot saved to: /home/enolab-guo/claude-test-2/lerobot-piper/scripts/mujoco_verify/out_verify_v3/verification_plot.png

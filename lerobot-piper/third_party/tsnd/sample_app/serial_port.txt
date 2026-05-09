@@ -1,0 +1,7 @@
+/dev/tty.TSND151-AP09181537
+#COM4
+
+# only the first line is used.
+# Examples
+#   win      : COM4 
+#   mac/linux: /dev/tty.TSND151-AP09181537
