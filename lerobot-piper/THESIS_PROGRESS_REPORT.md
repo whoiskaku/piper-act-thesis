@@ -239,6 +239,47 @@ Monitoring (6 categories):
 - Buffer: 30 episodes
 - **Total: ~462 real-robot episodes ≈ 6 hours rollout, ~1 week part-time**
 
+### 6.9 Results (executed 2026-05-09 → 2026-05-10)
+
+**Pipeline status**: full Phase 2 RL fine-tuning ran end-to-end on real Piper.
+
+- C1-v3 retrain on fresh v3 dataset (50 ep, fixed IMU/camera mount): l1=0.019 @ 70K, deterministic deploy 4/5 — adopted as Phase 2 starting point.
+- D2-v3 IMU reward computer rebuilt against v3 demos; OOD threshold τ=0.510.
+- Critic warmup Stage A (20 deterministic ep) + Stage B (2000 GPU steps) completed without divergence.
+- Main loop: **100 PPO updates × 4 ep/update = 400 rollout episodes**.
+- Eval gates @ update 25 / 50 / 75 / 100: **5/5, 5/5, 5/5, 5/5** task success — RL did not degrade task performance.
+- Final ckpt deterministic deploy: **5/5 task success** (vs C1-v3 4/5).
+- L_BC at update 99: 0.015, ratio_to_C1 = 0.796 → BC anchor preserved (no drift).
+- KL early-stop fired routinely under σ=0.05; `target_kl=50` calibration (vs LLM-RLHF default 0.05) was correct.
+
+**Smoothness comparison** (5 ep deterministic each, real-robot):
+
+| Metric | C1-v3 | Phase2-v3 | Δ |
+|---|---:|---:|---|
+| Action RMS jerk | 182.5 | 332.8 | ↑ 82.4% |
+| Action high-freq (>5Hz) % | 0.0006 | 0.0010 | ↑ 57.5% |
+| Real IMU accel RMS (m/s²) | 3.78 | 3.66 | ↓ 3.0% |
+| Real IMU gyro RMS (rad/s) | 0.37 | 0.45 | ↑ 21.2% |
+| Real IMU high-freq (>5Hz) % | 0.294 | 0.306 | ↑ 4.0% |
+
+**Honest assessment**: 100 updates was insufficient to extract IMU smoothness gains via PPO at the current α schedule. Action stream became markedly less smooth (jerk +82%); measured IMU is mixed-to-slightly-negative (accel −3% but gyro +21%). Task success was preserved.
+
+**Probable causes**:
+1. **α schedule never activated**. All 100 updates ran with α ≤ 0.005 (first stage); α=0.025/0.05 stages start at update 100/300. RL gradient was effectively dominated by the BC anchor for the entire run.
+2. **σ-noise side-effect on μ**. Training with σ=0.05 injected per-step exploration; the policy μ learned to be robust to noise but lost the smoothness inductive bias of pure BC.
+3. **Reward direction ≠ smoothness gradient**. D2 reward = L2 IMU distance to v3 demo + state-NN GT alignment + OOD skip. This rewards "looking like the demo," which is correlated with but not identical to minimizing jerk; PPO updates moved μ in directions that reduce IMU divergence on average without enforcing temporal smoothness.
+
+**Verdict**: pipeline correctness validated, smoothness hypothesis not yet supported. Reportable as a structured negative result with three concrete diagnostic axes (α budget, σ-induced μ drift, reward signal orthogonality).
+
+**Engineering deliverables** (Phase 2):
+- `lerobot/common/policies/act/configuration_phase2.py` — central Phase2Config (~40 hyperparams)
+- `lerobot/common/policies/act/phase2_actor_critic.py` — StochasticActor, GAE, PPO clip loss, value loss
+- `lerobot/common/policies/act/phase2_rollout.py` — rollout_episode with safety integration
+- `lerobot/common/policies/act/phase2_reward.py`, `phase2_safety.py` — reward + safety modules
+- `lerobot/scripts/phase2_train.py` — critic warmup + PPO main loop + eval gates
+- `scripts/parse_phase2_log_to_wandb.py` — terminal-log → wandb backfill (worked around a `cfg.warmup_gpu_steps` AttributeError that swallowed main-loop wandb.log calls during the run)
+- WandB runs: `phase2_v3` (live, warmup only) + `phase2_v3_backfill` (full main-loop metrics)
+
 ---
 
 ## 7. Risks & contingencies
@@ -266,18 +307,21 @@ If RL fundamentally fails:
 ## 8. Future work / open items
 
 ### Hardware / data
-- [ ] v3 dataset collection (50 episodes, planned but not started; v2 was sufficient for Phase 1)
-- [ ] IMU mount fixture + photo documentation (for v3 reproducibility)
+- [x] v3 dataset collection (30 ep, fixed IMU/camera mount) — completed 2026-05-08
+- [x] IMU mount fixture + photo documentation
 
 ### Model / method
-- [ ] Phase 2 implementation (codebase changes outlined in §6)
+- [x] Phase 2 implementation
+- [x] Phase 1 retrain on v3 (C1-v3) + Phase 2 v3 end-to-end
+- [ ] **Phase 2 round 2** — α=0.025/0.05 starting, n_updates=300, to test whether the smoothness regression in §6.9 is a "not enough RL signal" issue
+- [ ] Direct jerk-penalty reward variant (alternative to L2 IMU-distance reward) — addresses §6.9 cause #3
 - [ ] Sim-to-real IMU calibration (deploy_mean drift correction if needed)
-- [ ] Ablation: v3 retrain Phase 1 + Phase 2 to compare
 
 ### Paper writing
 - [ ] Method section (autoregressive ACT + RL fine-tuning)
-- [ ] Experiments: 5-way real-robot comparison (already collected)
+- [ ] Experiments: 5-way real-robot comparison (already collected) + Phase2-v3 vs C1-v3 (this report §6.9)
 - [ ] Ablations: with/without history input, with/without RL fine-tune
+- [ ] Discussion: structured negative result for §6.9 (3 diagnostic axes)
 
 ---
 
@@ -307,7 +351,10 @@ If RL fundamentally fails:
 | Apr 29 | C1 trained on v2 (not v3) | v2 had IMU; saved 2 hours of data collection |
 | Apr 30 | C3 5/5 task success | Phase 1 validated, unlock Phase 2 |
 | May 1 | Phase 2 spec D2-D6 locked | Ready for implementation |
+| May 7 | Re-collect v3 dataset (fixed mount) | C1-v2 deploy degraded — env IMU/camera position drift since v2 |
+| May 8 | C1-v3 70K accepted as Phase 2 starting ckpt | l1=0.019 matches v2; PyAV segfault at 75K blocked further training; deploy 4/5 acceptable |
+| May 10 | Phase 2 v3 100 updates completed; smoothness regression observed | Pipeline validated, but α schedule did not activate within 100 updates — see §6.9 |
 
 ---
 
-**Status (as of 2026-05-01)**: Phase 2 implementation begins next.
+**Status (as of 2026-05-10)**: Phase 2 v3 completed end-to-end. Pipeline validated, smoothness hypothesis not yet supported (§6.9). Next decisions: round-2 PPO with α=0.025/0.05 + n_updates=300, or pivot to direct jerk-penalty reward.

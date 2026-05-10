@@ -421,7 +421,7 @@ def ppo_update_step(
     if n_minibatches > 0:
         for k in metrics_accum:
             metrics_accum[k] /= n_minibatches
-    metrics_accum["α"] = α
+    metrics_accum["alpha"] = α
     metrics_accum["n_minibatches"] = n_minibatches
     metrics_accum["early_stopped_epochs"] = early_stopped_epochs
     return metrics_accum
@@ -593,10 +593,20 @@ def main(cfg: Phase2RunConfig):
 
         if wandb_logger:
             try:
+                # Convert numpy types to native Python (wandb older versions choke on np.bool_, np.int64).
+                clean_log = {}
+                for k, v in all_log.items():
+                    if hasattr(v, "item"):  # numpy scalar
+                        v = v.item()
+                    clean_log[k] = v
                 # Offset main-loop step past the warmup steps to keep wandb monotonic.
-                wandb_logger.log(all_log, step=cfg.warmup_gpu_steps + 1 + update_step)
-            except Exception:
-                pass
+                wandb_step = p2.warmup_gpu_steps + 1 + update_step
+                wandb_logger.log(clean_log, step=wandb_step)
+                logger.info(f"  wandb logged {len(clean_log)} keys at step {wandb_step}")
+            except Exception as e:
+                logger.error(f"  wandb log FAILED: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
 
         # ── Eval gate ──────────────────────────────────────
         if (update_step + 1) % p2.eval_freq == 0 and update_step > 0:
