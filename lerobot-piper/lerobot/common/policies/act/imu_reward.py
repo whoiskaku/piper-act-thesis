@@ -8,11 +8,12 @@ deployment time. Holds:
   - Normalization stats (state, IMU)
   - OOD distance threshold τ
 
-At inference time:
-  state ──► query_chunk_gt(state)
+At inference time (Round C — cross-demo k=5 NN averaging):
+  state ──► query_chunk_gt(state, k_demos=5)
             ├─► normalized state
-            ├─► KDTree.query(k=1)
-            └─► return (gt_imu_window_normalized, nn_distance, is_valid)
+            ├─► KDTree.query(k=50) → filter to 1 NN per demo, take top k_demos
+            ├─► average their imu_windows → gt_avg
+            └─► return (gt_avg_normalized, mean_nn_distance, is_valid)
 """
 from __future__ import annotations
 
@@ -48,23 +49,72 @@ class IMURewardComputer:
     # Stats summary (for monitoring)
     nn_dist_stats: dict  # {"v2_inter_p95": ..., "c1_mean": ..., "c1_p95": ..., ...}
 
-    def query_chunk_gt(self, state: np.ndarray) -> tuple[np.ndarray, float, bool]:
-        """At chunk boundary: state -> (gt_imu_window, nn_dist, is_valid).
+    def query_chunk_gt(
+        self,
+        state: np.ndarray,
+        k_demos: int = 5,
+        k_query: int = 50,
+    ) -> tuple[np.ndarray, float, bool]:
+        """At chunk boundary: state -> (gt_imu_window, mean_nn_dist, is_valid).
+
+        Round C: cross-demo k=5 NN averaging. Decouples gt_imu noise from
+        any single demo's high-frequency content by averaging k_demos
+        nearest neighbors taken from DISTINCT demos. Gt becomes smoother
+        than any individual demo by factor √k_demos (assuming independent
+        demo-specific noise), which indirectly drives policy smoothness.
 
         Args:
-            state: (state_dim,) raw (un-normalized) joint angles.
+            state: (state_dim,) raw joint angles.
+            k_demos: number of distinct demos to average. Round C = 5.
+            k_query: how many KDTree neighbors to fetch before filtering to
+                     k_demos unique demos. Must be >= k_demos. Higher values
+                     more robust when same-demo frames cluster nearby.
         Returns:
-            gt_imu_window: (chunk_size, imu_dim) NORMALIZED IMU window
+            gt_imu_window: (chunk_size, imu_dim) averaged NORMALIZED window
                           (use .normalize_imu(real_imu) to compare)
-            nn_dist: float, Euclidean distance in normalized state space
-            is_valid: True if nn_dist <= tau
+            mean_nn_dist: float, mean Euclidean distance over selected NNs
+            is_valid: True if mean_nn_dist <= tau
+
+        Edge cases:
+            - If fewer than k_demos distinct demos found in k_query, average
+              over what we have (degrades gracefully toward k=1 in worst case).
+            - If all selected nodes are OOD individually we still average and
+              return mean dist; gate is on the mean.
         """
         q = (state - self.state_mean) / (self.state_std + 1e-8)
-        dist, idx = self.kdtree.query(q.reshape(1, -1), k=1)
-        dist = float(dist[0][0])
-        idx = int(idx[0][0])
-        is_valid = (dist <= self.tau)
-        return self.imu_windows[idx].copy(), dist, is_valid
+        # Over-fetch then filter by demo.
+        k = min(int(k_query), int(self.kdtree.data.shape[0]))
+        dists, idxs = self.kdtree.query(q.reshape(1, -1), k=k)
+        dists = dists[0]
+        idxs = idxs[0]
+
+        # Filter: keep the nearest hit from each distinct demo, up to k_demos.
+        seen_demos: set[int] = set()
+        selected_idxs: list[int] = []
+        selected_dists: list[float] = []
+        for d, i in zip(dists, idxs):
+            demo_id = int(self.demo_ids[int(i)])
+            if demo_id in seen_demos:
+                continue
+            seen_demos.add(demo_id)
+            selected_idxs.append(int(i))
+            selected_dists.append(float(d))
+            if len(selected_idxs) >= k_demos:
+                break
+
+        # Degrade gracefully if k_query was too small.
+        if not selected_idxs:
+            # Should never happen unless KDTree is empty.
+            idx0 = int(idxs[0])
+            return (self.imu_windows[idx0].copy(),
+                    float(dists[0]),
+                    bool(float(dists[0]) <= self.tau))
+
+        selected_windows = self.imu_windows[selected_idxs]  # (k, chunk, imu_dim)
+        gt_avg = selected_windows.mean(axis=0)              # (chunk, imu_dim)
+        mean_dist = float(np.mean(selected_dists))
+        is_valid = bool(mean_dist <= self.tau)
+        return gt_avg, mean_dist, is_valid
 
     def normalize_imu(self, imu: np.ndarray) -> np.ndarray:
         """Normalize raw IMU using v2 stats. imu shape (..., imu_dim)."""
@@ -124,9 +174,12 @@ class RewardCalculator:
         valid_flag = chunk_valid (whether this whole chunk passed OOD gate).
         Caller uses valid_flag to mask GAE/PPO loss.
         """
-        # Normalize real IMU using v2 stats (same as gt_imu was normalized)
+        # Normalize real IMU using v3 stats (same normalization as gt_imu).
+        # Round C: change sum→mean over IMU dims so reward magnitude is
+        # dim-independent (cleaner scaling; same gradient direction up to a
+        # constant factor of 1/imu_dim, absorbed by EMA standardization).
         r_norm = self.computer.normalize_imu(real_imu)
-        l2 = -float(((r_norm - gt_imu) ** 2).sum())
+        l2 = -float(((r_norm - gt_imu) ** 2).mean())
         bonus = self.cfg.success_bonus if task_success else 0.0
         raw_R = l2 + bonus
 
