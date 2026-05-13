@@ -34,12 +34,12 @@ class Phase2Config:
     )
     # Step schedule: at each step value, σ multiplier changes (multiplied
     # against sigma_per_dim). Discrete jumps for simplicity.
-    # Round B fix (v4): schedule lookup uses update_step, NOT gpu_step. v3 had
-    # (0, 25_000, 50_000) which never advanced past stage 0 across 100 updates,
-    # so σ stayed at 1.0× the whole time — leaving the σ-noise drift on μ
-    # uncorrected (§6.9 cause #2). v4 budgets the taper to the 300-update plan.
-    sigma_schedule_steps: tuple[int, ...] = (0, 100, 200)
-    sigma_schedule_values: tuple[float, ...] = (1.0, 0.7, 0.5)
+    # Round v4a (reward-only ablation): match Round A schedule (effectively
+    # σ × 1.0 throughout 100 updates) so the only variable vs Round A is
+    # the new k=5 cross-demo reward. Round B's taper (0,100,200)/(1.0,0.7,0.5)
+    # will return for v4b if v4a passes.
+    sigma_schedule_steps: tuple[int, ...] = (0, 25_000, 50_000)
+    sigma_schedule_values: tuple[float, ...] = (1.0, 0.5, 0.2)
     # → effective σ at step t is sigma_per_dim × sigma_schedule_values[stage(t)]
 
     # ============================================================
@@ -85,14 +85,11 @@ class Phase2Config:
     # Loss coordination (D5)
     # ============================================================
     # α schedule: weight of RL loss in total loss
-    # Round B (v4): skip the α=0.005 warmup stage that consumed all 100 updates
-    # in v3 without activating RL. Start at v3's stage-2 value, escalate further.
-    # Drift risk: α=0.025 from step 0 is 5× v3 — if L_BC > 2×c1_baseline triggers,
-    # rollback by reducing α one stage.
-    alpha_schedule_steps: tuple[int, ...] = (0, 50, 150)
-    alpha_schedule_values: tuple[float, ...] = (0.025, 0.05, 0.10)
-    # v3 schedule for reference: (0,100,300)/(0.005,0.025,0.05) — never reached
-    # stage 2 in 100-update run; §6.9 cause #1.
+    # Round v4a (reward-only ablation): revert to Round A schedule so only
+    # the reward changes. v4b will use Round B schedule (0,50,150)/(0.025,0.05,0.10).
+    alpha_schedule_steps: tuple[int, ...] = (0, 100, 300)
+    alpha_schedule_values: tuple[float, ...] = (0.005, 0.025, 0.05)
+    # v4b schedule for reference: (0,50,150)/(0.025,0.05,0.10), n_updates=300
     value_loss_coef: float = 0.5  # coefficient of L_V (V detached from encoder)
     bc_batch_size_chunks: int = 12  # B=12 × L=600 ≈ 14GB; B=24 was OOM on RTX 3090
     # KL penalty (off by default, enable on failure)
@@ -125,7 +122,7 @@ class Phase2Config:
     # ============================================================
     # Main loop (D6)
     # ============================================================
-    n_updates: int = 300  # Round B (v4): tripled vs v3 to let α schedule run.
+    n_updates: int = 100  # Round v4a: match Round A's 100 updates for direct ablation.
     save_freq: int = 20  # save ckpt every N updates
 
     # ============================================================
@@ -161,7 +158,7 @@ class Phase2Config:
         "2026-05-08/C1_v3_history_seed42/checkpoints/070000/pretrained_model"
     )
     v2_dataset_repo: str = "local/piper_pick_place_imu_v3"
-    output_dir: str = "outputs/train/phase2_v4"
+    output_dir: str = "outputs/train/phase2_v4a"
     reward_computer_pickle: str = "outputs/eval/d2_imu_reward_computer.pkl"
 
     # ============================================================
