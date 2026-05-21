@@ -34,12 +34,12 @@ class Phase2Config:
     )
     # Step schedule: at each step value, σ multiplier changes (multiplied
     # against sigma_per_dim). Discrete jumps for simplicity.
-    # Round v4a (reward-only ablation): match Round A schedule (effectively
-    # σ × 1.0 throughout 100 updates) so the only variable vs Round A is
-    # the new k=5 cross-demo reward. Round B's taper (0,100,200)/(1.0,0.7,0.5)
-    # will return for v4b if v4a passes.
-    sigma_schedule_steps: tuple[int, ...] = (0, 25_000, 50_000)
-    sigma_schedule_values: tuple[float, ...] = (1.0, 0.5, 0.2)
+    # Round B (v4b): σ taper aligned to update_step. Round A bug had
+    # (0, 25K, 50K) which never advanced past stage 0 in 100 updates, so
+    # σ stayed at 1.0× the whole run (§6.9 cause #2). Now σ tapers to 0.7
+    # at update 100 and 0.5 at update 200 across the 300-update budget.
+    sigma_schedule_steps: tuple[int, ...] = (0, 100, 200)
+    sigma_schedule_values: tuple[float, ...] = (1.0, 0.7, 0.5)
     # → effective σ at step t is sigma_per_dim × sigma_schedule_values[stage(t)]
 
     # ============================================================
@@ -58,6 +58,12 @@ class Phase2Config:
     reward_clip_max: float = 3.0
     # Sim-to-real IMU offset correction (None = trust v2 stats)
     real_imu_calib_episodes: int = 0  # >0 = calibrate at episode 0..N-1
+    # Number of distinct demos to average for cross-demo NN reward.
+    # k=1 → Round A style (single nearest demo).
+    # k=5 → Round C style (cross-demo averaging, decouples per-demo noise).
+    # Round B (v4b) uses k=1 to keep reward identical to Round A for clean
+    # single-axis (schedule) ablation.
+    reward_k_demos: int = 1
 
     # ============================================================
     # Trajectory / GAE (D3)
@@ -85,11 +91,14 @@ class Phase2Config:
     # Loss coordination (D5)
     # ============================================================
     # α schedule: weight of RL loss in total loss
-    # Round v4a (reward-only ablation): revert to Round A schedule so only
-    # the reward changes. v4b will use Round B schedule (0,50,150)/(0.025,0.05,0.10).
-    alpha_schedule_steps: tuple[int, ...] = (0, 100, 300)
-    alpha_schedule_values: tuple[float, ...] = (0.005, 0.025, 0.05)
-    # v4b schedule for reference: (0,50,150)/(0.025,0.05,0.10), n_updates=300
+    # Round B (v4b): skip the α=0.005 stage that consumed all 100 updates of
+    # Round A without activating RL (§6.9 cause #1). Start at 0.025, escalate
+    # to 0.05 at update 50, then 0.10 at update 150.
+    # Drift risk: 5× Round A starting α — if L_BC > 2× c1_baseline triggers,
+    # eval-gate rollback halves α automatically.
+    alpha_schedule_steps: tuple[int, ...] = (0, 50, 150)
+    alpha_schedule_values: tuple[float, ...] = (0.025, 0.05, 0.10)
+    # Round A schedule for reference: (0,100,300)/(0.005,0.025,0.05)
     value_loss_coef: float = 0.5  # coefficient of L_V (V detached from encoder)
     bc_batch_size_chunks: int = 12  # B=12 × L=600 ≈ 14GB; B=24 was OOM on RTX 3090
     # KL penalty (off by default, enable on failure)
@@ -100,19 +109,19 @@ class Phase2Config:
     # Safety (D6)
     # ============================================================
     # Action range = v2 stats min/max × this margin
-    # v4a_safe: 1.2 → 0.95 after collision at update 30. Was permitting drift
-    # outside demo range (mean_nn_dist hit 240 at update 28 → arm hit table).
-    action_clamp_margin: float = 0.95
+    # Round B (v4b): middle ground after v4a (1.2 collision) and v4a_safe (0.95
+    # over-clamping caused PPO ratio mismatch + KL explosion to 1000-10000).
+    # 1.05 gives ACT 5% explore room while staying close to demo range.
+    action_clamp_margin: float = 1.05
     # Step-to-step velocity limit (rad). Only enforced in stochastic mode.
-    # v4a_safe: 0.10 → 0.05 to halve per-step displacement.
-    velocity_max_delta: float = 0.05
+    # Round B: middle of v4a (0.10) and v4a_safe (0.05).
+    velocity_max_delta: float = 0.08
     # Chunk boundary μ smoothing
     chunk_boundary_ramp_steps: int = 5
     # IMU sanity check
     imu_safety_max_accel_norm: float = 50.0  # m/s²
     # Consecutive episode failure threshold for auto-pause
-    # v4a_safe: 3 → 2 for earlier intervention.
-    consecutive_failure_threshold: int = 2
+    consecutive_failure_threshold: int = 3
 
     # ============================================================
     # Critic warmup (D4 + D6)
@@ -123,7 +132,7 @@ class Phase2Config:
     # ============================================================
     # Main loop (D6)
     # ============================================================
-    n_updates: int = 100  # Round v4a: match Round A's 100 updates for direct ablation.
+    n_updates: int = 300  # Round B (v4b): tripled vs Round A to let α schedule run.
     save_freq: int = 20  # save ckpt every N updates
 
     # ============================================================
@@ -154,15 +163,14 @@ class Phase2Config:
     # ============================================================
     # Paths (updated 2026-05-09 to v3 — fixed IMU/camera mount)
     # ============================================================
-    # v4a_safe: resume from step_0020 of phase2_v4a (clean pre-drift snapshot).
-    # Original C1-v3 path kept as comment for reference:
-    #   .../2026-05-08/C1_v3_history_seed42/checkpoints/070000/pretrained_model
+    # Round B (v4b): fresh start from C1-v3 70K (clean BC baseline) for
+    # single-axis ablation vs Round A.
     c1_ckpt_path: str = (
         "/home/enolab-guo/claude-test-2/lerobot-piper/outputs/train/"
-        "phase2_v4a/checkpoints/step_0020/pretrained_model"
+        "2026-05-08/C1_v3_history_seed42/checkpoints/070000/pretrained_model"
     )
     v2_dataset_repo: str = "local/piper_pick_place_imu_v3"
-    output_dir: str = "outputs/train/phase2_v4a_safe"
+    output_dir: str = "outputs/train/phase2_v4b"
     reward_computer_pickle: str = "outputs/eval/d2_imu_reward_computer.pkl"
 
     # ============================================================

@@ -152,7 +152,9 @@ class RewardCalculator:
         self._n_seen = 0
 
     def fetch_chunk_gt(self, state: np.ndarray):
-        return self.computer.query_chunk_gt(state)
+        return self.computer.query_chunk_gt(
+            state, k_demos=getattr(self.cfg, "reward_k_demos", 1)
+        )
 
     def _update_ema(self, raw_r: float):
         a = self.cfg.reward_ema_alpha
