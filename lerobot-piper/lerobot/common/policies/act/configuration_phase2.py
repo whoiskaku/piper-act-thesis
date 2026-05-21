@@ -100,18 +100,19 @@ class Phase2Config:
     # Safety (D6)
     # ============================================================
     # Action range = v2 stats min/max × this margin
-    action_clamp_margin: float = 1.2
+    # v4a_safe: 1.2 → 0.95 after collision at update 30. Was permitting drift
+    # outside demo range (mean_nn_dist hit 240 at update 28 → arm hit table).
+    action_clamp_margin: float = 0.95
     # Step-to-step velocity limit (rad). Only enforced in stochastic mode.
-    # Bumped from 0.05 → 0.10 because σ-noise on gripper + natural ACT motion
-    # were tripping the limit on 41-66% of steps in smoketest. 0.10 rad/step
-    # = 3 rad/s, still well within Piper safety envelope.
-    velocity_max_delta: float = 0.10
+    # v4a_safe: 0.10 → 0.05 to halve per-step displacement.
+    velocity_max_delta: float = 0.05
     # Chunk boundary μ smoothing
     chunk_boundary_ramp_steps: int = 5
     # IMU sanity check
     imu_safety_max_accel_norm: float = 50.0  # m/s²
     # Consecutive episode failure threshold for auto-pause
-    consecutive_failure_threshold: int = 3
+    # v4a_safe: 3 → 2 for earlier intervention.
+    consecutive_failure_threshold: int = 2
 
     # ============================================================
     # Critic warmup (D4 + D6)
@@ -153,12 +154,15 @@ class Phase2Config:
     # ============================================================
     # Paths (updated 2026-05-09 to v3 — fixed IMU/camera mount)
     # ============================================================
+    # v4a_safe: resume from step_0020 of phase2_v4a (clean pre-drift snapshot).
+    # Original C1-v3 path kept as comment for reference:
+    #   .../2026-05-08/C1_v3_history_seed42/checkpoints/070000/pretrained_model
     c1_ckpt_path: str = (
         "/home/enolab-guo/claude-test-2/lerobot-piper/outputs/train/"
-        "2026-05-08/C1_v3_history_seed42/checkpoints/070000/pretrained_model"
+        "phase2_v4a/checkpoints/step_0020/pretrained_model"
     )
     v2_dataset_repo: str = "local/piper_pick_place_imu_v3"
-    output_dir: str = "outputs/train/phase2_v4a"
+    output_dir: str = "outputs/train/phase2_v4a_safe"
     reward_computer_pickle: str = "outputs/eval/d2_imu_reward_computer.pkl"
 
     # ============================================================
