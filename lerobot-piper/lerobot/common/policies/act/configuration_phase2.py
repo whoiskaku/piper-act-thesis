@@ -91,14 +91,15 @@ class Phase2Config:
     # Loss coordination (D5)
     # ============================================================
     # α schedule: weight of RL loss in total loss
-    # Round B (v4b): skip the α=0.005 stage that consumed all 100 updates of
-    # Round A without activating RL (§6.9 cause #1). Start at 0.025, escalate
-    # to 0.05 at update 50, then 0.10 at update 150.
-    # Drift risk: 5× Round A starting α — if L_BC > 2× c1_baseline triggers,
-    # eval-gate rollback halves α automatically.
-    alpha_schedule_steps: tuple[int, ...] = (0, 50, 150)
-    alpha_schedule_values: tuple[float, ...] = (0.025, 0.05, 0.10)
-    # Round A schedule for reference: (0,100,300)/(0.005,0.025,0.05)
+    # v4c (Round D / α sweet-spot search): constant α=0.012, midpoint between
+    # Round A's 0.005 (RL too weak, no smoothness change) and Round B's 0.025
+    # (RL too strong, task collapsed in 8 updates). Single-value schedule
+    # makes the α effect isolable.
+    alpha_schedule_steps: tuple[int, ...] = (0,)
+    alpha_schedule_values: tuple[float, ...] = (0.012,)
+    # Reference schedules:
+    #   Round A: (0,100,300)/(0.005,0.025,0.05) → 100 updates
+    #   Round B: (0,50,150)/(0.025,0.05,0.10)   → 300 updates, collapsed @ 8
     value_loss_coef: float = 0.5  # coefficient of L_V (V detached from encoder)
     bc_batch_size_chunks: int = 12  # B=12 × L=600 ≈ 14GB; B=24 was OOM on RTX 3090
     # KL penalty (off by default, enable on failure)
@@ -132,7 +133,7 @@ class Phase2Config:
     # ============================================================
     # Main loop (D6)
     # ============================================================
-    n_updates: int = 300  # Round B (v4b): tripled vs Round A to let α schedule run.
+    n_updates: int = 150  # v4c: shorter budget for α sweet-spot test; abort fast if no improvement.
     save_freq: int = 20  # save ckpt every N updates
 
     # ============================================================
@@ -170,7 +171,7 @@ class Phase2Config:
         "2026-05-08/C1_v3_history_seed42/checkpoints/070000/pretrained_model"
     )
     v2_dataset_repo: str = "local/piper_pick_place_imu_v3"
-    output_dir: str = "outputs/train/phase2_v4b"
+    output_dir: str = "outputs/train/phase2_v4c"
     reward_computer_pickle: str = "outputs/eval/d2_imu_reward_computer.pkl"
 
     # ============================================================
