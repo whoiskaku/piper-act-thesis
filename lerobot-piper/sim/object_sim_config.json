@@ -1,0 +1,26 @@
+{
+  "_note": "Stage 4.0 object-aware sim 参数。占位值仅用于跑通管线，结论需替换为实测 cube。",
+  "cube": {
+    "size_mm": [40.0, 40.0, 40.0],
+    "mass_g": 50.0,
+    "_todo": "替换为实测 W×D×H(mm) 与 mass(g)。宽度须 < ~70mm 才抓得住(gripper 最大开合 ~0.07-0.095m)。"
+  },
+  "table": {
+    "thickness_m": 0.02,
+    "half_extent_m": 0.30,
+    "override_top_z": null,
+    "_note": "table_top_z 默认由 demo 抓取帧 FK 反推(= grasp_z − cube_H/2)；override_top_z 非 null 时直接用该值。"
+  },
+  "contact": {
+    "friction": [1.0, 0.005, 0.0001],
+    "solref": [0.02, 1.0],
+    "solimp": [0.9, 0.95, 0.001],
+    "condim": 4,
+    "_note_restitution": "restitution≈0.05 用默认 solref 近似(MuJoCo 无直接 restitution)；不忠实映射，标定阶段再调。"
+  },
+  "placement": {
+    "derive_from_demo": true,
+    "override_cube_xyz": null,
+    "_note": "cube 平面位置 = demo 抓取帧 gripper(ee_imu_site) 的世界 xy；z 由 table 顶面+H/2 决定。"
+  }
+}
