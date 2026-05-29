@@ -124,9 +124,33 @@ Run #1 后做了量纲统计（`sim/analyze_loss_scales.py`），发现了一个
 
 ---
 
+## Run B — L_BC + 0.05·hf + 0.1·|ΔA|（主方案，第一个正结果）
+
+**配置**：`--lambda-hf 0.05 --lambda-delta 0.1 --lambda-acc 0`，200 ep。
+输出：`outputs/train/refine_net/phase1_runB_hf0.05_dl0.1_lr0.0003_bs64_ep200/`
+
+**结果（val，final ep199；best ckpt = ep125）**：
+
+| 指标 | Run A (BC only) | **Run B** | best ckpt(ep125) | ACT baseline | clean floor |
+|---|---|---|---|---|---|
+| hf_ratio | 3.29 [FAIL] | **0.41 [pass]** | **0.26** | 1.0 | 0.025 |
+| hf_fraction | 0.106 | **0.0131** | 0.0085 | 0.0322 | 0.0008 |
+| L_BC (guardrail) | 0.0047 | **0.0046** ✅ | 0.0047 | 0.0057 | 0 |
+| \|ΔA\| (guardrail) | 0.0050 | **0.0030** ✅ | — | — | — |
+
+逐关节 hf（Run B refined vs ACT）：j1 0.0118 vs 0.0295、j2 0.0094 vs 0.0280、j3 0.0161 vs 0.0382、grip 0.0151 vs 0.0328 → **四个 active joint 全部降 ~2~2.5×**。
+
+**结论**：
+1. **核心命题成立** —— RefineNet 能去掉 ACT 引入的高频污染（hf 比 ACT 低 ~60%，比 BC-only 低 ~8×），**同时任务保真不降反升**（L_BC 0.0046 < ACT 0.0057），|ΔA| 仅 0.003。两个 guardrail 全过。
+2. **自平衡调度兑现**：ep0 hf 主导（0.158）→ ep50 暴降到 0.011 → 后期 BC 接管，hf 从 best 0.0085 轻微回升到 final 0.0131。模型选择按 hf_ratio + BC guardrail，已保留 ep125 ckpt（ratio 0.264）。
+3. **仍有上探空间**：final(0.41) > best(0.26) 的回升 + 距 good/excellent 仍有余量 → 下一步 λ_hf 上探 sweep，描绘平滑-保真 Pareto 前沿。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |
 |---|---|---|---|
 | #1 | 2026-05-29 | L_BC + 0.1·jerk_RMS | 负结果：无平滑增益、平滑项过拟合。**后续诊断发现 jerk 指标本身不可靠，问题定义被修正（见上）** |
 | A | 2026-05-29 | L_BC only | sanity check：模型能拟合 A_clean（L_BC 0.0047<0.0057），但纯 L1 把 hf 放大 3.3×（ratio FAIL）。证明显式 hf 项必需 |
+| B | 2026-05-29 | L_BC + 0.05·hf + 0.1·\|ΔA\| | **正结果**：hf_ratio 0.41(best 0.26) [pass]，L_BC/\|ΔA\| guardrail 全过，四关节 hf 全降 2~2.5×。RefineNet 去污染命题成立 |
