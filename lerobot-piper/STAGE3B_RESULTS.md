@@ -176,21 +176,23 @@ Run #1 后做了量纲统计（`sim/analyze_loss_scales.py`），发现了一个
 约束：ACT receding-horizon 开环（n_action_steps=100=chunk，无 temporal ensemble）；
 ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲染）；Phase 1 无物体→不测 task success。
 
-**度量须与训练 scale 一致**：full-episode hf_fraction 会被大幅度低频臂运动稀释（ACT 仅 0.0004，jitter 被 washout，和当初否定 jerk 同病）→ 改用 chunk-scale 度量。
+**度量教训**：full-episode hf_fraction 被低频臂运动稀释（washout）；windowed fraction 在超平滑信号上又有分母陷阱（小分母放大残余 kink）。最终采用 **5Hz 零相位 Butterworth 高通后的 RMS（hp_rms，rad）** 作可信的绝对 jitter 度量；hf_aln（chunk 对齐窗 fraction）仅作 chunk 内训练-scale 对照。
 
-| 度量 | ACT | refined | ratio | 含义 |
-|---|---|---|---|---|
-| **hf_aln**（chunk 对齐窗，不跨边界） | 0.0313 | **0.0091** | **0.29** | ✅ chunk 内完美还原监督式 0.25 |
-| **hf_win50**（滑窗 stride50，跨边界） | 0.0291 | 0.0747 | 2.57 | ❌ 跨边界窗被未平滑的 chunk 间断主导 |
-| bnd_jump（边界跳变） | 0.0101 | 0.0106 | 1.05 | 边界未平滑，refined 略大 |
-| hf_rms_cmd（全 ep 绝对幅值） | 0.0212 | 0.0218 | 1.03 | 平手 |
-| fidelity \|traj−demo\| | 0.0079 | 0.0071 | — | ✅ refined 轨迹保真更好 |
+| 条件 | hp_rms_cmd | hp_rms_exec | hf_aln | bnd_jump | fidelity |
+|---|---|---|---|---|---|
+| **demo（地板）** | 0.00108 | 0.00464 | 0.0002 | 0.0034 | 0 |
+| ACT | 0.00161 | 0.00515 | 0.0306 | 0.0102 | 0.0079 |
+| refined（无 blend） | **0.00169** | 0.00518 | 0.0086 | 0.0109 | 0.0071 |
+| +blend10/20（边界续接） | **0.00151** | 0.00486 | 0.0073 | **0.0000** | 0.0072 |
 
-（refined_real 与 refined_cl 两种 history 几乎无差异：hf_win 0.0747 vs 0.0762 → 反馈漂移可忽略，history 非瓶颈，与监督式 j3 地板一致。）
+**结论（用可信的 hp_rms）：**
+1. **chunk 内**：refined hf_aln 0.0086 vs ACT 0.0306（0.28×）——监督式去污染在 deploy 内部完美保留。
+2. **但 chunk 边界未平滑**：RefineNet 训练时只见孤立 100 步 chunk，目标无边界项。receding-horizon 部署（每 100 步重预测）下，**不做边界处理 refined 反而让 deploy jitter 变差（0.00169>0.00161, 1.046×）**——边界跳变增加抵消了 chunk 内平滑。
+3. **deploy-time 边界续接 blend**（前 m 步线性消除 offset）：bnd_jump→0，hp_rms_cmd 0.00151（0.933× ACT），**消除 ACT 超额污染（=ACT−demo=0.00053）的 ~20%**，executed 0.943×，保真不降（0.0072<0.0079）。
+4. **关键现实**：ACT 的 deploy 高频污染本身就小（仅比 demo 地板高 ~33%），且集中在 j1/j2；j3/grip 绝对量几乎无污染（监督式里它们的高 fraction 是小分母陷阱）。**Phase 1 自由空间的平滑 headroom 很小** → 真正的平滑收益需在 Stage 4（接触/抓取产生 IMU 抖动）与 Stage 5（真机）验证。
+5. real vs closed-loop history 几乎无差异 → 反馈漂移可忽略，history 非瓶颈。
 
-**结论**：RefineNet 的逐 chunk 平滑在 deploy 内部完美保留（hf 0.29×），**但对 chunk 之间的边界不连续完全没处理**——训练时只见孤立 100 步 chunk，目标里无边界项。receding-horizon 部署下边界（每 100 步）成为主要高频源，chunk 内超平滑反而凸显未处理的边界，**净部署平滑度未改善**。
-
-**→ Stage 3b 重新定向：boundary-aware refinement**（目标/上下文纳入 chunk 边界连续性，例如跨边界续接 loss、用上一 chunk 已执行尾部作条件、或重叠窗训练）。这是闭环 eval 才能暴露的问题——监督式 0.25 的结论在部署中不成立。
+**→ 两个层面的下一步**：(a) 战术：boundary-aware（blend 已证明方向，或训练期纳入边界续接）；(b) 战略：Phase 1 已验证机制 + 边界问题 + headroom 偏小，平滑卖点应在 Stage 4/5 兑现。
 
 ---
 
@@ -202,4 +204,4 @@ ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲�
 | A | 2026-05-29 | L_BC only | sanity check：模型能拟合 A_clean（L_BC 0.0047<0.0057），但纯 L1 把 hf 放大 3.3×（ratio FAIL）。证明显式 hf 项必需 |
 | B | 2026-05-29 | L_BC + 0.05·hf + 0.1·\|ΔA\| | **正结果**：hf_ratio 0.41(best 0.26) [pass]，L_BC/\|ΔA\| guardrail 全过，四关节 hf 全降 2~2.5×。RefineNet 去污染命题成立 |
 | B-sweep | 2026-05-29 | +hf∈{0.05,0.1,0.2,0.4} | hf_ratio 饱和 ~0.25（j3 卡地板），无 trade-off cliff，BC 始终安全。**best-by-rule λ_hf=0.10**。地板为信息/容量限制 |
-| deploy | 2026-05-29 | λ_hf=0.10 闭环 | **关键**：chunk 内 hf 0.29×（监督式成立），但 chunk 边界未平滑→receding-horizon 部署净平滑度未改善。**需 boundary-aware refinement** |
+| deploy | 2026-05-29 | λ_hf=0.10 闭环 | **关键**：chunk 内 0.28×（监督式成立），但边界未平滑→无 blend 时 deploy jitter 反升 1.046×；deploy-time blend 后 0.933×（消除超额污染 20%, bnd_jump→0）。Phase1 headroom 小（ACT 仅高于 demo 33%），平滑卖点应在 Stage 4/5 |

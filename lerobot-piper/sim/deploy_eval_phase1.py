@@ -129,11 +129,25 @@ def hf_windowed(traj_7, win: int = 100, stride: int = 50) -> np.ndarray:
 
 
 def hf_rms(traj_7) -> np.ndarray:
-    """Per-active-joint absolute high-freq amplitude (rad), bulk-motion-independent.
-    sqrt(high-freq power / T) from the Hann-windowed FFT."""
+    """Per-active-joint absolute high-freq amplitude (rad) via Hann-windowed FFT.
+    NOTE: contaminated by spectral leakage from the large low-freq sweep — use
+    hp_rms (zero-phase Butterworth) as the trustworthy absolute jitter metric."""
     t = torch.from_numpy(traj_7.astype(np.float32))[None]
     E_high, _ = hf_power(t)                                  # (1,7)
     return torch.sqrt(E_high[0, ACTIVE_JOINTS] / len(traj_7)).numpy()
+
+
+from scipy.signal import butter, filtfilt
+FPS = 30.0
+_HP_B, _HP_A = butter(4, 5.0 / (FPS / 2.0), btype="high")   # 5 Hz zero-phase HP
+
+
+def hp_rms(traj_7) -> np.ndarray:
+    """Per-active-joint RMS of the 5 Hz high-pass-filtered trajectory (rad).
+    Clean absolute jitter measure — Butterworth filtfilt removes the low-freq
+    bulk motion with far less leakage than FFT-bin zeroing."""
+    x = filtfilt(_HP_B, _HP_A, traj_7, axis=0)
+    return np.sqrt((x[:, ACTIVE_JOINTS] ** 2).mean(axis=0))
 
 
 def boundary_jump(traj_7) -> np.ndarray:
@@ -148,6 +162,19 @@ def boundary_jump(traj_7) -> np.ndarray:
 def fidelity(traj_7, demo_7) -> float:
     """Mean |traj - real demo action| over active joints (BC-style guardrail)."""
     return float(np.abs(traj_7 - demo_7)[:, ACTIVE_JOINTS].mean())
+
+
+def blend_boundaries(traj_7, chunk: int = CHUNK, m: int = 10) -> np.ndarray:
+    """Deploy-time C0 boundary join: at each chunk start b, remove the
+    discontinuity (out[b-1]-traj[b]) and decay the correction linearly over m
+    steps. Keeps within-chunk shape, kills the single-sample boundary jump."""
+    out = traj_7.copy()
+    for b in range(chunk, len(traj_7), chunk):
+        offset = out[b - 1] - traj_7[b]
+        for i in range(m):
+            if b + i < len(traj_7):
+                out[b + i] = traj_7[b + i] + offset * (1.0 - i / m)
+    return out
 
 
 # ─── main ──────────────────────────────────────────────────────────
@@ -172,8 +199,8 @@ def main():
     sim = NoisyPiperSim(MODEL_XML, NOISE_PARAMS, seed=SIM_SEED)
 
     # accumulators: condition -> list of per-episode (hf_cmd, hf_exec, bnd, fid)
-    conds = ["ACT", "refined_real", "refined_cl"]
-    keys = ["hf_full", "hf_win", "hf_aln", "hf_rms_cmd", "hf_rms_exec", "bnd", "fid"]
+    conds = ["demo", "ACT", "refined_real", "refined_cl", "blend5", "blend10", "blend20"]
+    keys = ["hf_aln", "hp_rms_cmd", "hp_rms_exec", "hf_rms_cmd", "bnd", "fid"]
     agg = {c: {k: [] for k in keys} for c in conds}
 
     for ep in VAL_EPS:
@@ -233,19 +260,31 @@ def main():
                 tl_i.append(obs["imu_noisy"].astype(np.float32))
                 tl_p.append(False)
 
-        # ---- execute ACT-only & refined_real through sim (executed hf) ----
+        # ---- deploy-time boundary-blend probe (post-process refined_real) ----
+        traj_b5 = blend_boundaries(traj_rr, m=5)
+        traj_b10 = blend_boundaries(traj_rr, m=10)
+        traj_b20 = blend_boundaries(traj_rr, m=20)
+
+        # ---- execute all conditions through sim (executed hf) ----
         exec_act, _ = execute_traj(sim, qpos0_8, traj_act)
         exec_rr, _ = execute_traj(sim, qpos0_8, traj_rr)
         exec_cl, _ = execute_traj(sim, qpos0_8, traj_cl)
+        exec_b5, _ = execute_traj(sim, qpos0_8, traj_b5)
+        exec_b10, _ = execute_traj(sim, qpos0_8, traj_b10)
+        exec_b20, _ = execute_traj(sim, qpos0_8, traj_b20)
+        exec_demo, _ = execute_traj(sim, qpos0_8, demo_7)
 
-        for c, cmd, ex in [("ACT", traj_act, exec_act),
+        for c, cmd, ex in [("demo", demo_7, exec_demo),
+                           ("ACT", traj_act, exec_act),
                            ("refined_real", traj_rr, exec_rr),
-                           ("refined_cl", traj_cl, exec_cl)]:
-            agg[c]["hf_full"].append(hf_active(cmd))
-            agg[c]["hf_win"].append(hf_windowed(cmd, win=CHUNK, stride=CHUNK // 2))
+                           ("refined_cl", traj_cl, exec_cl),
+                           ("blend5", traj_b5, exec_b5),
+                           ("blend10", traj_b10, exec_b10),
+                           ("blend20", traj_b20, exec_b20)]:
             agg[c]["hf_aln"].append(hf_windowed(cmd, win=CHUNK, stride=CHUNK))
+            agg[c]["hp_rms_cmd"].append(hp_rms(cmd))
+            agg[c]["hp_rms_exec"].append(hp_rms(ex))
             agg[c]["hf_rms_cmd"].append(hf_rms(cmd))
-            agg[c]["hf_rms_exec"].append(hf_rms(ex))
             agg[c]["bnd"].append(boundary_jump(cmd))
             agg[c]["fid"].append(fidelity(cmd, demo_7))
         print(f"  [ep{ep}] T={T} done")
@@ -256,43 +295,40 @@ def main():
     def mean_scalar(c, key):
         return float(np.mean(agg[c][key]))
 
-    print(f"\n{'='*92}")
+    print(f"\n{'='*96}")
     print("Stage 3b — Phase 1 闭环 deploy eval  (6 val eps, active joints j1/j2/j3/grip)")
-    print("  hf_win = 滑窗100 hf_fraction(训练scale); hf_rms = 绝对高频幅值(rad);")
-    print("  hf_full = full-ep fraction(被bulk motion稀释,仅作对照)")
-    print(f"{'='*92}")
-    hdr = (f"{'condition':>13} {'hf_win50':>9} {'hf_aln':>8} {'hf_rms_cmd':>11} {'hf_rms_exec':>12} "
+    print("  hp_rms = 5Hz零相位高通后RMS(rad，干净的绝对jitter度量); ")
+    print("  hf_aln = chunk对齐窗 hf_fraction(训练scale，仅作chunk内对照,fraction有分母陷阱)")
+    print(f"{'='*96}")
+    hdr = (f"{'condition':>13} {'hp_rms_cmd':>11} {'hp_rms_exec':>12} {'hf_aln':>8} "
            f"{'bnd_jump':>9} {'fidelity':>9}")
-    print(hdr); print("-" * 92)
+    print(hdr); print("-" * 96)
     report = {}
     for c in conds:
-        hw = mean_joints(c, "hf_win"); ha = mean_joints(c, "hf_aln")
-        hr = mean_joints(c, "hf_rms_cmd")
-        hre = mean_joints(c, "hf_rms_exec"); bn = mean_joints(c, "bnd")
-        hf = mean_joints(c, "hf_full"); fd = mean_scalar(c, "fid")
+        ha = mean_joints(c, "hf_aln")
+        hp = mean_joints(c, "hp_rms_cmd"); hpe = mean_joints(c, "hp_rms_exec")
+        bn = mean_joints(c, "bnd"); fd = mean_scalar(c, "fid")
         report[c] = {
-            "hf_win_mean": float(hw.mean()), "hf_win_joints": hw.tolist(),
+            "hp_rms_cmd_mean": float(hp.mean()), "hp_rms_cmd_joints": hp.tolist(),
+            "hp_rms_exec_mean": float(hpe.mean()),
             "hf_aln_mean": float(ha.mean()), "hf_aln_joints": ha.tolist(),
-            "hf_rms_cmd_mean": float(hr.mean()), "hf_rms_cmd_joints": hr.tolist(),
-            "hf_rms_exec_mean": float(hre.mean()),
-            "bnd_jump_mean": float(bn.mean()), "bnd_jump_joints": bn.tolist(),
-            "hf_full_mean": float(hf.mean()), "fidelity": fd,
+            "hf_rms_cmd_mean": float(mean_joints(c, "hf_rms_cmd").mean()),
+            "bnd_jump_mean": float(bn.mean()), "fidelity": fd,
         }
-        print(f"{c:>13} {hw.mean():>9.4f} {ha.mean():>8.4f} {hr.mean():>11.5f} {hre.mean():>12.5f} "
+        print(f"{c:>13} {hp.mean():>11.5f} {hpe.mean():>12.5f} {ha.mean():>8.4f} "
               f"{bn.mean():>9.4f} {fd:>9.4f}")
-    print("-" * 92)
-    print("  hf_win50=滑窗stride50(含跨边界); hf_aln=chunk对齐窗(不跨边界,=监督scale)")
-    base = report["ACT"]
-    for c in ["refined_real", "refined_cl"]:
-        print(f"  {c} vs ACT:  hf_win ratio={report[c]['hf_win_mean']/(base['hf_win_mean']+1e-12):.3f}"
-              f"  hf_rms_cmd ratio={report[c]['hf_rms_cmd_mean']/(base['hf_rms_cmd_mean']+1e-12):.3f}"
-              f"  hf_rms_exec ratio={report[c]['hf_rms_exec_mean']/(base['hf_rms_exec_mean']+1e-12):.3f}")
-    print("\nper-joint hf_win (j1/j2/j3/grip):")
+    print("-" * 96)
+    floor, base = report["demo"]["hp_rms_cmd_mean"], report["ACT"]["hp_rms_cmd_mean"]
+    excess = base - floor
+    print(f"  demo floor={floor:.5f}  ACT={base:.5f}  ACT excess pollution={excess:.5f}")
+    for c in ["refined_real", "blend10", "blend20"]:
+        v = report[c]["hp_rms_cmd_mean"]
+        red = (base - v) / (excess + 1e-12)
+        print(f"  {c:>13}: hp_rms_cmd={v:.5f}  vs ACT ratio={v/base:.3f}  "
+              f"消除超额污染 {100*red:.0f}%  (exec ratio={report[c]['hp_rms_exec_mean']/report['ACT']['hp_rms_exec_mean']:.3f})")
+    print("\nper-joint hp_rms_cmd (j1/j2/j3/grip):")
     for c in conds:
-        print(f"  {c:>13}: " + " ".join(f"{x:.4f}" for x in mean_joints(c, "hf_win")))
-    print("per-joint hf_rms_cmd (j1/j2/j3/grip):")
-    for c in conds:
-        print(f"  {c:>13}: " + " ".join(f"{x:.5f}" for x in mean_joints(c, "hf_rms_cmd")))
+        print(f"  {c:>13}: " + " ".join(f"{x:.5f}" for x in mean_joints(c, "hp_rms_cmd")))
 
     (OUT_DIR / "deploy_eval.json").write_text(json.dumps({
         "refine_ckpt": str(REFINE_CKPT), "refine_epoch": int(ckpt["epoch"]),
