@@ -446,3 +446,4 @@ Items explicitly excluded from main thesis but mentioned in §7 of the paper:
 | v2 | 2026-05-09 | Phase 2 RL experiments running |
 | v3 | 2026-05-22 | After Phase 2 RL failures, proposed supervised pivot |
 | **v4.3** | **2026-05-27** | **Sim-based denoising + RefineNet, T1-T5 finalized, 3 principles** |
+| v4.3a | 2026-05-29 | Stage 3b Run #1 (λ=0.1 baseline) 跑完：负结果，无平滑增益、平滑项过拟合。详见 `STAGE3B_RESULTS.md` |
