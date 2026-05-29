@@ -147,6 +147,29 @@ Run #1 后做了量纲统计（`sim/analyze_loss_scales.py`），发现了一个
 
 ---
 
+## λ_hf Pareto sweep（λ_delta=0.1, λ_acc=0, 200ep）
+
+按拍板规则选 ckpt（`sim/sweep_pareto.py`）：primary = mean hf_ratio↓；guardrail = L_BC ≤ 1.1×baseline、mean|ΔA|<0.02、每个 active joint hf_ratio < 1.0（不许牺牲单关节换平均）。
+
+| λ_hf | sel_ep | hf_ratio | L_BC | mean\|ΔA\| | j1 | j2 | j3 | grip |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.05 | 125 | 0.264 | 0.0047 | 0.0030 | 0.273 | 0.254 | 0.372 | 0.140 |
+| **0.10** | 68 | **0.253** | 0.0053 | 0.0021 | 0.224 | 0.165 | 0.459 | 0.115 |
+| 0.20 | 120 | 0.266 | 0.0051 | 0.0018 | 0.218 | 0.283 | 0.467 | 0.060 |
+| 0.40 | 130 | 0.276 | 0.0051 | 0.0018 | 0.237 | 0.390 | 0.376 | 0.095 |
+
+（ACT baseline L_BC=0.0057；clean floor hf_ratio=0.025）
+
+**核心发现 —— 不是 trade-off 曲线，是饱和地板：**
+
+1. **hf_ratio 在 λ_hf 8× 范围内饱和于 ~0.25–0.28。** 加大 λ_hf 既不再压低高频也不损 BC → **λ 不是瓶颈**，方法对超参鲁棒。
+2. **0.40 未击穿 BC guardrail**（L_BC 0.0051<0.0057，|ΔA| 0.0018）。预期的 trade-off cliff 在此范围内不存在——stopgrad 分母 + 残差自然收缩使 BC 始终安全。**只有 plateau，没有 cliff。**
+3. **地板被 j3 卡住**（ratio 0.37–0.47 跨 run 最高），grip 在高 λ 下可压到 0.06–0.14。0.25 地板距 clean 的 0.025 还差 ~10×。这是**信息/容量限制**（7 维瓶颈 + history/state 不足以预测抵消 ACT 在 j3 上的特定高频残差），非 λ 限制 → 对应 Future Work：ACT hidden state 作 RefineNet 输入 / 更强 context。
+
+**Stage 3b 当前最佳：λ_hf=0.10**（best-by-rule，hf_ratio 0.253，L_BC 0.0053<baseline）。0.05 与之在噪声内且 BC 更优（0.0047），二者皆可作代表点。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |
@@ -154,3 +177,4 @@ Run #1 后做了量纲统计（`sim/analyze_loss_scales.py`），发现了一个
 | #1 | 2026-05-29 | L_BC + 0.1·jerk_RMS | 负结果：无平滑增益、平滑项过拟合。**后续诊断发现 jerk 指标本身不可靠，问题定义被修正（见上）** |
 | A | 2026-05-29 | L_BC only | sanity check：模型能拟合 A_clean（L_BC 0.0047<0.0057），但纯 L1 把 hf 放大 3.3×（ratio FAIL）。证明显式 hf 项必需 |
 | B | 2026-05-29 | L_BC + 0.05·hf + 0.1·\|ΔA\| | **正结果**：hf_ratio 0.41(best 0.26) [pass]，L_BC/\|ΔA\| guardrail 全过，四关节 hf 全降 2~2.5×。RefineNet 去污染命题成立 |
+| B-sweep | 2026-05-29 | +hf∈{0.05,0.1,0.2,0.4} | hf_ratio 饱和 ~0.25（j3 卡地板），无 trade-off cliff，BC 始终安全。**best-by-rule λ_hf=0.10**。地板为信息/容量限制 |

@@ -310,8 +310,8 @@ def main():
                   f"[{elapsed_ep:.1f}s, tot {elapsed_total/60:.1f}m]")
 
         # Save best ckpt by headline metric, with BC guardrail
-        # (refined BC must not be > 1.5× the ACT-baseline BC).
-        bc_ok = val_stats["l_bc"] <= 1.5 * val_stats["l_bc_act"]
+        # (refined BC must not exceed the ACT-baseline BC by more than 10%).
+        bc_ok = val_stats["l_bc"] <= 1.1 * val_stats["l_bc_act"]
         if bc_ok and val_stats["hf_ratio"] < best_hf_ratio:
             best_hf_ratio = val_stats["hf_ratio"]
             torch.save({
