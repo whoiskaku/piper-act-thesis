@@ -335,19 +335,37 @@ for batch in dataloader(stage2_data):
 
 **Time**: ~3 days GPU.
 
-### Stage 4: Object-aware sim incremental
+### Stage 4: Object-aware sim incremental（2026-05-30 重构：transfer-audit 先行）
 
-**Goal**: Add contact/object physics to sim, fine-tune RefineNet on the new contact phase, without full retrain.
+**重构动机**（见 STAGE3B_RESULTS.md 真机 de-risk + 闭环 eval）：
+论文指标是真机 IMU hf，但 RefineNet 至今只优化 action hf，两者 transfer 未知。
+object-aware sim 对**训练**的增量取决于 action→IMU transfer 是否成立 → 先测，再定 loss 路线。
 
-**Sub-stages**:
-- **4.1**: Add cube + table to MuJoCo. Configure contact parameters (friction, restitution).
-- **4.2**: Validate contact noise. Compare sim IMU spikes during grasp to real IMU spikes (qualitative match in timing and order-of-magnitude amplitude).
-- **4.3**: Generate small object-aware paired dataset (~100-200 episodes), emphasizing grasp/release events.
-- **4.4**: Fine-tune RefineNet from Stage 3b ckpt on object-aware data (~half the steps of Stage 3b, lower learning rate).
+**Stage 4.0 — Object-aware transfer audit（先做，与 loss 路线无关）**
+- 建 object-aware sim：cube + table + 接触参数。
+- 接触标定：对齐真机抓取 IMU spike（**靶**：accel 峰值 ~7.5 / ratio 2.5×，gyro 峰值 ~0.8 / ratio 4–6×；
+  baseline accel ~3.0、gyro ~0.1–0.24，来自 eval_C1_v3 + demo）。
+- **2×2×2 IMU 审计**：{no-object, object} × {clean, noisy} × {ACT, refined+blend}，度量 hp_rms(IMU)。
+  分离：接触贡献多少 IMU 高频 / action 平滑消掉多少 / 噪声层淹没多少。
+- 关键判据：
+  - `ΔIMU_clean = hp_rms_clean_IMU(ACT) − hp_rms_clean_IMU(refined+blend)`
+  - `ΔIMU_noisy = hp_rms_noisy_IMU(ACT) − hp_rms_noisy_IMU(refined+blend)`
+  - clean 明显降 → transfer 成立，L0/L1 可能够；
+  - clean 降但 noisy 不降 → 被 noise floor 淹没，重点转 Stage 5；
+  - clean 不降 → action 与 IMU 解耦，才需认真上 L2 surrogate。
 
-**Output**: `outputs/train/refine_net_phase2/` ckpt + sim deploy results.
+**Stage 4.1 — 据 audit 定 loss 路线**：L0（action loss，IMU 仅验证）/ L1（可微运动学链 gyro≈J_rot(q)·q̇）/ L2（可微 action→IMU surrogate，sim 产训练对）。
 
-**Time**: ~1-2 weeks.
+**Stage 4.2 — fine-tune RefineNet**：从 λ_hf=0.10 ckpt fine-tune（~半步数、低 lr）；transfer 成立后把 L_boundary（跨 chunk 续接）加进来（在此之前部署继续用 deploy-blend）。
+
+**已确定的物理/几何参数**：
+- gripper：joint7/8 slide，每指行程 ctrlrange 0–0.0475m（关节限位 0.035m），最大开合 ~0.07–0.095m → cube 宽度须 < ~0.07m。
+- **待实测**：cube 尺寸/质量（尺+秤）、table 高度（或在 sim 里调到 demo gripper 接触高度一致）。
+- 接触初值：restitution 0.0–0.1，friction 0.8–1.2 起步，再用抓取 IMU spike 标定。
+
+**Output**: `outputs/train/refine_net_phase2/` ckpt + 2×2×2 audit + sim deploy results。
+
+**Time**: ~1-2 weeks。
 
 ### Stage 5: Real-world supervised fine-tune
 
@@ -447,3 +465,4 @@ Items explicitly excluded from main thesis but mentioned in §7 of the paper:
 | v3 | 2026-05-22 | After Phase 2 RL failures, proposed supervised pivot |
 | **v4.3** | **2026-05-27** | **Sim-based denoising + RefineNet, T1-T5 finalized, 3 principles** |
 | v4.3a | 2026-05-29 | Stage 3b Run #1 (λ=0.1 baseline) 跑完：负结果，无平滑增益、平滑项过拟合。详见 `STAGE3B_RESULTS.md` |
+| v4.3b | 2026-05-30 | Stage 3b 收尾：指标改 hf_fraction/高通RMS，Run B(hf+delta) chunk内0.28×，闭环揭示边界瓶颈+deploy-blend修复，真机 de-risk(IMU hf +48.7%)。Stage 4 重构为 transfer-audit 先行 |
