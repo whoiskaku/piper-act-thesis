@@ -170,6 +170,30 @@ Run #1 后做了量纲统计（`sim/analyze_loss_scales.py`），发现了一个
 
 ---
 
+## Phase 1 闭环 deploy eval — 揭示 chunk 边界问题（关键发现）
+
+脚本：`sim/deploy_eval_phase1.py`。ckpt：λ_hf=0.10 best（ep68）。6 val eps（24–29）。
+约束：ACT receding-horizon 开环（n_action_steps=100=chunk，无 temporal ensemble）；
+ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲染）；Phase 1 无物体→不测 task success。
+
+**度量须与训练 scale 一致**：full-episode hf_fraction 会被大幅度低频臂运动稀释（ACT 仅 0.0004，jitter 被 washout，和当初否定 jerk 同病）→ 改用 chunk-scale 度量。
+
+| 度量 | ACT | refined | ratio | 含义 |
+|---|---|---|---|---|
+| **hf_aln**（chunk 对齐窗，不跨边界） | 0.0313 | **0.0091** | **0.29** | ✅ chunk 内完美还原监督式 0.25 |
+| **hf_win50**（滑窗 stride50，跨边界） | 0.0291 | 0.0747 | 2.57 | ❌ 跨边界窗被未平滑的 chunk 间断主导 |
+| bnd_jump（边界跳变） | 0.0101 | 0.0106 | 1.05 | 边界未平滑，refined 略大 |
+| hf_rms_cmd（全 ep 绝对幅值） | 0.0212 | 0.0218 | 1.03 | 平手 |
+| fidelity \|traj−demo\| | 0.0079 | 0.0071 | — | ✅ refined 轨迹保真更好 |
+
+（refined_real 与 refined_cl 两种 history 几乎无差异：hf_win 0.0747 vs 0.0762 → 反馈漂移可忽略，history 非瓶颈，与监督式 j3 地板一致。）
+
+**结论**：RefineNet 的逐 chunk 平滑在 deploy 内部完美保留（hf 0.29×），**但对 chunk 之间的边界不连续完全没处理**——训练时只见孤立 100 步 chunk，目标里无边界项。receding-horizon 部署下边界（每 100 步）成为主要高频源，chunk 内超平滑反而凸显未处理的边界，**净部署平滑度未改善**。
+
+**→ Stage 3b 重新定向：boundary-aware refinement**（目标/上下文纳入 chunk 边界连续性，例如跨边界续接 loss、用上一 chunk 已执行尾部作条件、或重叠窗训练）。这是闭环 eval 才能暴露的问题——监督式 0.25 的结论在部署中不成立。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |
@@ -178,3 +202,4 @@ Run #1 后做了量纲统计（`sim/analyze_loss_scales.py`），发现了一个
 | A | 2026-05-29 | L_BC only | sanity check：模型能拟合 A_clean（L_BC 0.0047<0.0057），但纯 L1 把 hf 放大 3.3×（ratio FAIL）。证明显式 hf 项必需 |
 | B | 2026-05-29 | L_BC + 0.05·hf + 0.1·\|ΔA\| | **正结果**：hf_ratio 0.41(best 0.26) [pass]，L_BC/\|ΔA\| guardrail 全过，四关节 hf 全降 2~2.5×。RefineNet 去污染命题成立 |
 | B-sweep | 2026-05-29 | +hf∈{0.05,0.1,0.2,0.4} | hf_ratio 饱和 ~0.25（j3 卡地板），无 trade-off cliff，BC 始终安全。**best-by-rule λ_hf=0.10**。地板为信息/容量限制 |
+| deploy | 2026-05-29 | λ_hf=0.10 闭环 | **关键**：chunk 内 hf 0.29×（监督式成立），但 chunk 边界未平滑→receding-horizon 部署净平滑度未改善。**需 boundary-aware refinement** |
