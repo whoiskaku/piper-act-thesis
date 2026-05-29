@@ -161,6 +161,15 @@ class ACTConfig(PreTrainedConfig):
     history_use_action: bool = True     # include a.seq(T-1) branch
     history_use_imu: bool = True        # include r.IMU(T-1) branch
 
+    # Stage 3a (negative ablation): fine-tune ACT itself with a high-frequency
+    # smoothness penalty on its predicted action chunk. Default OFF — when False
+    # the ACT loss is unchanged. hf_fraction (5Hz, stopgrad denominator) matches
+    # the Stage 3b RefineNet metric so the two are directly comparable.
+    enable_denoise_smooth: bool = False
+    denoise_lambda_hf: float = 0.1
+    denoise_active_joints: tuple[int, ...] | None = (0, 1, 2, 6)  # j1/j2/j3/grip; None=all
+    denoise_hf_cutoff_hz: float = 5.0
+
     # Phase 2 RL fine-tuning: value head for actor-critic.
     # When True, ACT gains a Linear(dim_model → 1) value head on the latent
     # token's encoder output. The value head's gradient is detached from the

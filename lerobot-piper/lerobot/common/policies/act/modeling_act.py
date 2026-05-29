@@ -38,6 +38,29 @@ from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 
 
+def _hf_fraction_loss(actions: Tensor, fps: float = 30.0, cutoff: float = 5.0,
+                      active=None, eps: float = 1e-8) -> Tensor:
+    """High-freq energy fraction (>cutoff Hz) with stopgrad denominator.
+
+    actions: (B, T, A). Per-channel scale-invariant, so equals the raw-space
+    value even when computed on normalized actions. Used by the Stage 3a
+    negative ablation (enable_denoise_smooth); matches Stage 3b's RefineNet hf.
+    """
+    B, T, A = actions.shape
+    x = actions - actions.mean(dim=1, keepdim=True)
+    w = torch.hann_window(T, device=actions.device).view(1, T, 1)
+    X = torch.fft.rfft(x * w, dim=1)
+    P = X.abs() ** 2                                              # (B, F, A)
+    freqs = torch.fft.rfftfreq(T, d=1.0 / fps).to(actions.device)
+    hf = (freqs > cutoff).view(1, -1, 1)
+    E_high = (P * hf).sum(dim=1)                                  # (B, A)
+    E_total = P.sum(dim=1)
+    frac = E_high / (E_total.detach() + eps)                     # stopgrad denom
+    if active is not None:
+        frac = frac[:, list(active)]
+    return frac.mean()
+
+
 class ACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -163,6 +186,19 @@ class ACTPolicy(PreTrainedPolicy):
         ).mean()
 
         loss_dict = {"l1_loss": l1_loss.item()}
+
+        # Stage 3a negative ablation: high-freq smoothness penalty on ACT's own
+        # output (default OFF). hf_fraction is per-channel scale-invariant, so
+        # computing it on the normalized actions_hat equals the raw-space value.
+        denoise_smooth = torch.zeros((), device=actions_hat.device)
+        if getattr(self.config, "enable_denoise_smooth", False):
+            denoise_smooth = _hf_fraction_loss(
+                actions_hat,
+                cutoff=self.config.denoise_hf_cutoff_hz,
+                active=self.config.denoise_active_joints,
+            )
+            loss_dict["denoise_hf"] = denoise_smooth.item()
+
         if self.config.use_vae:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total
@@ -175,6 +211,9 @@ class ACTPolicy(PreTrainedPolicy):
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
+
+        if getattr(self.config, "enable_denoise_smooth", False):
+            loss = loss + self.config.denoise_lambda_hf * denoise_smooth
 
         # ΦSim aux loss removed (Phase 2 cleanup, 2026-05-05)
 
