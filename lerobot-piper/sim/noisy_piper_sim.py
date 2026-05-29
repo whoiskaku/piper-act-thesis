@@ -32,6 +32,66 @@ import numpy as np
 CONTROL_HZ = 30.0
 CONTROL_DT = 1.0 / CONTROL_HZ
 
+# Piper action / state convention vs MuJoCo internal convention:
+#   - Piper (and ACT / RefineNet) use 7 dims: [j1..j6, gripper]
+#   - MuJoCo model has 8 actuators: [j1..j6, joint7 = grip, joint8 = -grip mirror]
+# Conversion is required at the sim boundary. RefineNet I/O stays 7-dim.
+
+ACTION_DIM_PIPER = 7
+CTRL_DIM_MUJOCO = 8
+
+
+def action_7_to_ctrl_8(a7: np.ndarray, grip_min: float = 0.0,
+                       grip_max: float = 0.035) -> np.ndarray:
+    """Map Piper 7-dim action to MuJoCo 8-dim ctrl (gripper finger mirror)."""
+    a7 = np.asarray(a7, dtype=np.float64)
+    if a7.ndim == 1:
+        ctrl = np.zeros(CTRL_DIM_MUJOCO)
+        ctrl[:6] = a7[:6]
+        grip = float(np.clip(a7[6], grip_min, grip_max))
+        ctrl[6] = grip
+        ctrl[7] = -grip
+        return ctrl
+    elif a7.ndim == 2:
+        ctrl = np.zeros((a7.shape[0], CTRL_DIM_MUJOCO))
+        ctrl[:, :6] = a7[:, :6]
+        grip = np.clip(a7[:, 6], grip_min, grip_max)
+        ctrl[:, 6] = grip
+        ctrl[:, 7] = -grip
+        return ctrl
+    else:
+        raise ValueError(f"unsupported a7 shape: {a7.shape}")
+
+
+def ctrl_8_to_action_7(ctrl8: np.ndarray) -> np.ndarray:
+    """Reverse mapping: MuJoCo 8-dim ctrl back to Piper 7-dim action.
+
+    Uses joint7 (gripper opening) as the gripper dimension; joint8 is its mirror
+    so it carries no extra info.
+    """
+    ctrl8 = np.asarray(ctrl8, dtype=np.float64)
+    if ctrl8.ndim == 1:
+        a7 = np.zeros(ACTION_DIM_PIPER)
+        a7[:6] = ctrl8[:6]
+        a7[6] = ctrl8[6]
+        return a7
+    elif ctrl8.ndim == 2:
+        a7 = np.zeros((ctrl8.shape[0], ACTION_DIM_PIPER))
+        a7[:, :6] = ctrl8[:, :6]
+        a7[:, 6] = ctrl8[:, 6]
+        return a7
+    else:
+        raise ValueError(f"unsupported ctrl8 shape: {ctrl8.shape}")
+
+
+def qpos_8_to_state_7(qpos8: np.ndarray) -> np.ndarray:
+    """Reduce MuJoCo qpos (8-dim, with mirrored gripper finger) to Piper 7-dim state.
+
+    Same shape rule as ctrl_8_to_action_7. Useful for handing sim state to ACT
+    or RefineNet, which expect 7-dim Piper-convention state.
+    """
+    return ctrl_8_to_action_7(qpos8)
+
 
 class NoisyPiperSim:
     def __init__(
@@ -210,11 +270,18 @@ class NoisyPiperSim:
             noisy_imu[t] = obs["imu_noisy"]
             noisy_action_exec[t] = obs["action_executed"]
 
+        # Convert MuJoCo 8-dim ctrl ↔ Piper 7-dim action at the sim boundary.
+        # RefineNet / ACT operate in 7-dim space; only sim physics uses 8-dim.
         return {
-            "A_clean": action_chunk,
-            "IMU_clean": clean_imu,
-            "A_noisy": noisy_action_exec,
-            "IMU_noisy": noisy_imu,
-            "qpos_clean": clean_qpos,
+            # Piper / RefineNet 7-dim convention (primary):
+            "A_clean":  ctrl_8_to_action_7(action_chunk),       # (T, 7) target
+            "A_noisy":  ctrl_8_to_action_7(noisy_action_exec),  # (T, 7) sim-executed
+            "IMU_clean": clean_imu,                              # (T, 6)
+            "IMU_noisy": noisy_imu,                              # (T, 6)
+
+            # MuJoCo 8-dim (kept for debug / sim-side analysis):
+            "A_clean_8":  action_chunk,
+            "A_noisy_8":  noisy_action_exec,
+            "qpos_clean": clean_qpos,                            # (T, 8) sim state
             "qpos_noisy": noisy_qpos,
         }

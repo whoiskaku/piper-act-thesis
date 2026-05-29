@@ -23,22 +23,17 @@ from replay_demo_validation import (
     MODEL_PATH, CONTROL_HZ, CONTROL_DT,
     load_real_demo, state_mdeg_to_rad,
 )
-from noisy_piper_sim import NoisyPiperSim
+from noisy_piper_sim import NoisyPiperSim, action_7_to_ctrl_8
 
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "outputs/sim/stage1_noisy"
 NOISE_PARAMS = Path(__file__).resolve().parents[1] / "outputs/sim/noise_params.json"
 
 
+# Backwards-compatible alias (kept for any earlier callers).
 def real_action_to_ctrl(real_action_chunk):
-    """Map v3 7-dim action to 8-dim actuator ctrl (j7 = grip, j8 = -grip)."""
-    T = real_action_chunk.shape[0]
-    ctrl = np.zeros((T, 8))
-    ctrl[:, :6] = real_action_chunk[:, :6]
-    grip = np.clip(real_action_chunk[:, 6], 0.0, 0.035)
-    ctrl[:, 6] = grip
-    ctrl[:, 7] = -grip
-    return ctrl
+    """Map v3 7-dim action to 8-dim actuator ctrl. Wrapper around action_7_to_ctrl_8."""
+    return action_7_to_ctrl_8(real_action_chunk)
 
 
 def compute_psd(x, fs=CONTROL_HZ):
