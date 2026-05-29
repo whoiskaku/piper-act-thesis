@@ -60,8 +60,50 @@ best val_loss = **18.05** @ ep24。
 
 ---
 
+## Run #1 后续诊断（2026-05-29）— 问题定义被修正
+
+Run #1 后做了量纲统计（`sim/analyze_loss_scales.py`），发现了一个比 loss 设计更根本的问题：**jerk 不是合适的指标，原定的 113.7 target 是聚合口径混用造成的幻象。**
+
+### 关键测量（val，逐关节）
+
+| 关节 | ACT jerk_RMS | A_clean jerk_RMS | ACT hf_frac | A_clean hf_frac |
+|---|---|---|---|---|
+| j1 | 268 | 241 | 0.0295 | 0.0002 |
+| j2 | 378 | 366 | 0.0280 | 0.0001 |
+| **j3** | **136** | **188** | **0.0382** | **0.0001** |
+| j7 (grip) | 61 | 76 | 0.0435 | 0.003 |
+
+### 结论
+
+1. **jerk 没在测我们关心的高频抖动。** 铁证：j3 上 ACT 的高频能量是 A_clean 的 ~380×，但 jerk 反而更低（136 < 188）。jerk 被「大幅度的正常运动」主导，而非高频污染。用 jerk 当 Run #1 的主 loss 与目标，方向就错了。
+
+2. **「113.7 是目标」的叙事作废。** noise_params.json 里的 `demo_jerk_rms_overall_mean=113.7` 是 **7 关节均值**（含 j4/j5/j6=0 的稀释）：per-joint=[220, 309, 165, 0, 0, 0, 102] → 均值 113.7。而训练日志里的 ACT「181.8」是 **pooled-RMS**（按元素方差加权）。二者是**不同聚合口径**，不可比；逐关节看 demo 本身（220/309/165）比 ACT（268/378/136）还抖或相当。113.7 与 A_clean 本就是同一个真机示教信号。**Stage 3b 不得以「降 jerk 到 113.7」为 headline target。**
+
+3. **A_clean 来源确认**：`A_clean = ctrl_8_to_action_7(action_chunk)`，即 v3 真机 demo 原始 action（经 ±10% 幅度扰动），非任何滤波/平滑版本。
+
+4. **hf_fraction 才是判别性指标**（ACT/clean 比值高达 100~380×），且暴露出真实的大改进空间。**这正是 RefineNet 要去掉的「ACT 额外引入的高频污染」。**
+
+### 指标 / loss / 目标修正（已拍板）
+
+- **Stage 3b headline metric** → **active-joint mean hf_fraction**（j1/j2/j3/grip，排除 j4/j5/j6=0）。jerk 仅保留为 secondary / continuity 指标。
+- **成功标准用比值** `hf_frac_refined / hf_frac_ACT`：pass < 0.5，good < 0.25，excellent < 0.1。不设「压到 0.0001」的硬标准（过苛、易被 clean 的极低高频比例误导）。
+- **两个 guardrail**：① L_BC(refined, A_clean) 不明显差于 ACT baseline；② |ΔA| 不过大。
+- **训练 loss**（替换原 jerk 项）：
+  `L_total = L_BC + λ_hf·L_hf_fraction + λ_delta·|ΔA| (+ optional 小 λ_acc·L_acc)`
+  - L_hf_fraction 为平滑主力，**分母 stopgrad**（`E_high(pred)/stopgrad(E_total(pred)+ε)`）防止模型靠抬高低频能量作弊。
+  - L_acc 判别力弱（ACT/clean 仅 1.17×）且可能惩罚合法轨迹曲率 → 暂不作核心项，最多小权重 ablation。
+- **λ 初值范围**（按 val 量级推，令各正则项加权后 = L_BC 的 10~30%）：λ_delta ∈ [0.10, 0.30]，λ_hf ∈ [0.024, 0.072]，λ_acc ∈ [0.39, 1.16]。
+
+### 修正后的 Run 计划
+
+- **Run A**：L_BC only（λ 全 0）。sanity check —— RefineNet 到底有没有能力学回 A_clean，用 hf_fraction 判断是否真的去掉 ACT 高频污染。
+- **Run B**：L_BC + λ_hf·hf_fraction + λ_delta·|ΔA|（主方案）。
+- L_acc：optional，不作核心项。
+
+---
+
 ## Document History
 
-| Run | 日期 | λ | 结论 |
+| Run | 日期 | loss | 结论 |
 |---|---|---|---|
-| #1 | 2026-05-29 | 0.1 | 负结果：无平滑增益，平滑项过拟合，root cause 待验证 |
+| #1 | 2026-05-29 | L_BC + 0.1·jerk_RMS | 负结果：无平滑增益、平滑项过拟合。**后续诊断发现 jerk 指标本身不可靠，问题定义被修正（见上）** |
