@@ -102,8 +102,31 @@ Run #1 后做了量纲统计（`sim/analyze_loss_scales.py`），发现了一个
 
 ---
 
+## Run A — L_BC only（sanity check）
+
+**目的**：回答根本问题——RefineNet 到底有没有能力学回 A_clean？以及纯 BC 能不能去掉 ACT 的高频污染？
+
+**配置**：`--lambda-hf 0 --lambda-delta 0 --lambda-acc 0`，200 ep，其余同 Run #1。
+输出：`outputs/train/refine_net/phase1_runA_BConly_lr0.0003_bs64_ep200/`
+
+**结果（val，final ep199）**：
+
+| 指标 | refined | ACT baseline | A_clean(floor) | 解读 |
+|---|---|---|---|---|
+| L_BC | **0.0047** | 0.0057 | 0 | ✅ 有能力拟合 A_clean，逐点精度超过 ACT |
+| hf_fraction (active-joint mean) | **0.106** | 0.032 | 0.0008 | ❌ hf 被放大 |
+| **hf_ratio = refined/act** | **3.29 [FAIL]** | 1.0 | 0.025 | ❌ 纯 L1 把高频放大 3.3× |
+| \|ΔA\| | 0.0050 | — | — | 残差量级合理 |
+
+逐关节 hf（refined vs act）：grip **0.25 vs 0.033 (7.6×)**、j3 0.095 vs 0.038、j1 0.047 vs 0.030、j2 0.030≈0.028。
+
+**结论**：**问题不在模型容量，而在目标函数。** 逐点 L1 完全不约束频率，模型靠逐帧小幅修正压低平均 L1，代价是注入高频（grip 尤甚）。hf_ratio 从早期 ~6 缓降到 3.3 但始终 >1，证明 BC-only 不可能解决污染。**显式 hf 项被实验证明是必需的** → 进 Run B。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |
 |---|---|---|---|
 | #1 | 2026-05-29 | L_BC + 0.1·jerk_RMS | 负结果：无平滑增益、平滑项过拟合。**后续诊断发现 jerk 指标本身不可靠，问题定义被修正（见上）** |
+| A | 2026-05-29 | L_BC only | sanity check：模型能拟合 A_clean（L_BC 0.0047<0.0057），但纯 L1 把 hf 放大 3.3×（ratio FAIL）。证明显式 hf 项必需 |
