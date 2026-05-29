@@ -5,6 +5,29 @@
 
 ---
 
+## 真机 headroom de-risk（2026-05-30，最重要的战略数据）
+
+闭环 deploy 发现 Phase 1 自由空间 headroom 偏小后，用 `scripts/eval_smoothness_realrobot.py`
+对比 **demo 示教（piper_pick_place_imu_v3, 30eps）vs C1-v3 ACT 真机部署（eval_C1_v3, 5eps）**，
+量化真机上的真实平滑 headroom：
+
+| 指标 | demo（地板） | ACT 部署 | Delta |
+|---|---|---|---|
+| Action RMS jerk | 113.7 | 182.5 | ↑60.5% |
+| Action hf% (>5Hz) | 0.0002 | 0.0006 | ↑214% |
+| 真机 IMU accel RMS (m/s²) | 3.47 | 3.78 | ↑8.9% |
+| 真机 IMU gyro RMS (rad/s) | 0.337 | 0.370 | ↑9.8% |
+| **真机 IMU hf% (>5Hz)** | **0.198** | **0.294** | **↑48.7%** |
+
+**结论：**
+1. ✅ **真机平滑问题真实可观**：ACT 部署比示教多 ~49% 高频 IMU 能量。论文前提成立。
+2. 🔑 **动力学放大**：action 空间高频绝对量极小（0.0002→0.0006），传到 IMU 放大成 +48.7%。微小 action 修正可能撬动大 IMU 改善——对 RefineNet 有利。
+3. ⚠️ **核心风险**：IMU hf 中 action-驱动（可修）vs 传感器/结构噪声（不可修）的占比未知。Phase 1 sim 里 executed jitter 被电机噪声地板主导（RefineNet 没怎么动 executed hf），暗示 action→IMU transfer 非必然。**只能在 Stage 5（真机）彻底回答。**
+
+**战略含义**：Phase 1 完成"机制验证"使命；平滑卖点的兑现与 transfer 验证在 Stage 4（接触放大 IMU）/ Stage 5（真机）。
+
+---
+
 ## Run #1 — λ=0.1 baseline（失败 / 负结果）
 
 **结论先行**：λ=0.1 baseline **未能改善平滑度**。refined 输出的 jerk 不低于（甚至高于）frozen ACT 自身的输出，RefineNet 在部署时只会让结果变差，没有任何平滑增益。这是一个需要记录的诊断性负结果（对应 §7 Risk Register 中已预判的「Stage 3b RefineNet shows no smoothness improvement」一行）。
