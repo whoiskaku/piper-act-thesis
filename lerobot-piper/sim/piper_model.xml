@@ -40,7 +40,7 @@
                                 <joint name="joint6" pos="0 0 0" axis="0 0 1" limited="true" range="-2.0944 2.0944" damping="5"/>
                                 <geom type="mesh" rgba="0.898039 0.917647 0.929412 1" mesh="link6" />
                                 <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="gripper_base" />
-                                <site name="ee_imu_site" pos="0 0 0.13" size="0.005" rgba="1 0 0 1"/>
+                                <site name="ee_imu_site" pos="0 0 0.13" quat="0.705583 -0.013848 -0.708475 0.004918" size="0.005" rgba="1 0 0 1"/>
                                 <body name="link7" pos="0 0 0.1358" quat="0.707105 0.707108 0 0">
                                     <inertial pos="0.000651232 -0.049193 0.00972259" quat="0.477798 0.572974 -0.518028 0.418398" mass="0.025" diaginertia="7.74531e-05 7.36783e-05 5.0886e-06" />
                                     <joint name="joint7" pos="0 0 0" axis="0 0 1" type="slide" limited="true" range="0 0.035" damping="100"/>
