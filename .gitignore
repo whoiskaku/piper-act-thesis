@@ -66,3 +66,6 @@ outputs/eval/d2_imu_reward_computer*.pkl
 
 # Local Claude harness state (per-machine, not for sharing)
 .claude/
+
+# MuJoCo mesh files (large STL/DAE, copied from external piper_ros repo)
+lerobot-piper/sim/meshes/
