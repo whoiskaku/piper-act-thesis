@@ -112,8 +112,11 @@ def main():
     args = ap.parse_args()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     cfg = load_config()
-    print(f"[cfg] cube {cfg['cube']['size_mm']}mm {cfg['cube']['mass_g']}g  "
-          f"friction={cfg['contact']['friction'][0]}  (占位={cfg['cube'].get('_todo') is not None})")
+    o = cfg["object"]
+    from sim.build_object_model import object_mass_kg
+    print(f"[cfg] tape annulus OD{o['d_outer_mm']}/ID{o['d_inner_mm']}/H{o['height_mm']}mm  "
+          f"mass={object_mass_kg(cfg)*1000:.0f}g (measured={o.get('mass_g') is not None})  "
+          f"N={cfg['modeling']['n_segments']}  friction={cfg['contact']['friction'][0]}")
 
     policy, tcfg = load_frozen_act(C1_CKPT, DATASET_REPO, DEVICE)
     dataset = make_dataset(tcfg)
@@ -145,7 +148,7 @@ def main():
         write_object_model(cfg, cube_xyz, table_top_z, obj_xml)
         sim_obj = NoisyPiperSim(obj_xml, NOISE_PARAMS, seed=SIM_SEED)
         cube_qadr = sim_obj.model.jnt_qposadr[
-            mujoco.mj_name2id(sim_obj.model, mujoco.mjtObj.mjOBJ_JOINT, "cube_free")]
+            mujoco.mj_name2id(sim_obj.model, mujoco.mjtObj.mjOBJ_JOINT, "tape_free")]
 
         for obj, sim, qadr in [("no", sim_base, None), ("yes", sim_obj, cube_qadr)]:
             for noise_name, noise in [("clean", False), ("noisy", True)]:

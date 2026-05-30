@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Stage 4.0 — 由 config + demo 抓取点反推，构建 object-aware MuJoCo 模型。
+"""Stage 4.0 — 由 config + demo 抓取点反推，构建 object-aware MuJoCo 模型（B+ 方案）。
 
-把 base piper_model.xml 注入一个静态 table 和一个带 freejoint 的 cube（参数全部
-来自 object_sim_config.json）。cube 平面位置默认由 demo 抓取帧的 gripper FK 反推，
-table 顶面 = grasp_z − cube_H/2，使 cube 静置于桌面且中心≈抓取点。
+object = 一卷胶带（薄圆环 annulus，平放）。B+ 设计：
+  - 碰撞：N 段 box 拼成的圆环（简化 proxy，但保留环孔 → 指能入孔、桌面接触正确、
+    rim-pinch 成立）。
+  - 质量分布（正确）：body 原点置于环心，`<inertial>` 显式设为解析 annulus
+    质量 + 惯量 → COM 在环心（距抓取点 ~mean_radius），重力力矩 / lift / release 真实。
+    （不靠 geom 自动推惯量，避免离散化误差。）
+  - 摆放：环心 = 指垫汇聚点 + mean_radius 沿夹爪水平前向（图片确认侧前接近）。
+    环平放（轴竖直），静置于桌面：ring_center_z = table_top + H/2。
 
-不做任何 friction 过调；占位参数仅用于跑通 transfer audit 管线。
-
-提供：
-  load_config()
-  detect_grasp_frames(demo)            — gripper 动作跳变 → 抓取/释放帧
-  gripper_world_pos(base_xml, qpos8)   — 对给定关节角做 FK，返回 ee_imu_site 世界 xyz
-  build_object_xml(cfg, cube_xyz, table_top_z) -> xml 字符串
-  write_object_model(cfg, cube_xyz, table_top_z, out_path)
+提供：load_config / detect_grasp_frames / fk_grasp / build_object_xml /
+      write_object_model / derive_placement
 """
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import mujoco
@@ -26,22 +26,30 @@ SIM_DIR = Path(__file__).resolve().parent
 BASE_XML = SIM_DIR / "piper_model.xml"
 CONFIG = SIM_DIR / "object_sim_config.json"
 
+# link6 原点 → 指垫抓取中心 的距离（沿 link6 z 轴）。link7/8 基座在 +0.1358，
+# 指垫再往前 ~0.035 → ~0.17m。近似值，4.2 标定阶段再校。
+FINGER_DIST_M = 0.17
+
 
 def load_config(path=CONFIG) -> dict:
     return json.loads(Path(path).read_text())
 
 
-def box_inertia(mass: float, full_size_m) -> tuple[float, float, float]:
-    """Diagonal inertia of a solid box. full_size_m = (W, D, H) in meters."""
-    w, d, h = full_size_m
-    ix = mass / 12.0 * (d * d + h * h)
-    iy = mass / 12.0 * (w * w + h * h)
-    iz = mass / 12.0 * (w * w + d * d)
-    return ix, iy, iz
+def object_mass_kg(cfg: dict) -> float:
+    m = cfg["object"].get("mass_g")
+    if m is None:
+        m = cfg["modeling"]["placeholder_mass_g"]
+    return float(m) / 1000.0
+
+
+def annulus_inertia(mass, r_out, r_in, h):
+    """薄圆环（hollow cylinder）绕质心的对角惯量。轴=z。"""
+    iz = 0.5 * mass * (r_out ** 2 + r_in ** 2)
+    ixy = (1.0 / 12.0) * mass * (3.0 * (r_out ** 2 + r_in ** 2) + h ** 2)
+    return ixy, ixy, iz
 
 
 def detect_grasp_frames(demo: dict, grip_channel: int = 6) -> list[int]:
-    """gripper 指令跳变 → 抓取/释放事件帧（聚类去抖）。"""
     grip = demo["action"][:, grip_channel]
     dg = np.abs(np.diff(grip))
     if dg.max() <= 0:
@@ -54,52 +62,67 @@ def detect_grasp_frames(demo: dict, grip_channel: int = 6) -> list[int]:
     return out
 
 
-def gripper_world_pos(base_xml: Path, qpos8: np.ndarray,
-                      site: str = "ee_imu_site") -> np.ndarray:
-    """对 8-dim 关节角做 forward kinematics，返回 IMU site 的世界 xyz。"""
+def fk_grasp(base_xml: Path, qpos8: np.ndarray):
+    """FK：返回 (pinch_center_xyz, fwd_unit) —— 指垫抓取中心 + 夹爪前向(link6 z, 世界)。"""
     model = mujoco.MjModel.from_xml_path(str(base_xml))
     data = mujoco.MjData(model)
     data.qpos[:len(qpos8)] = qpos8
     mujoco.mj_forward(model, data)
-    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site)
-    return data.site_xpos[sid].copy()
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "link6")
+    p6 = data.xpos[bid].copy()
+    fwd = data.xmat[bid].reshape(3, 3)[:, 2].copy()      # link6 z 轴(世界) = 夹爪前向
+    fwd = fwd / (np.linalg.norm(fwd) + 1e-9)
+    pinch = p6 + FINGER_DIST_M * fwd
+    return pinch, fwd
 
 
-def _fric_str(f):  return " ".join(f"{x:g}" for x in f)
+def _s(v):  return " ".join(f"{x:g}" for x in v)
 
 
-def build_object_xml(cfg: dict, cube_xyz, table_top_z: float) -> str:
-    """返回注入了 table+cube 的完整 MJCF 字符串。"""
+def build_object_xml(cfg: dict, ring_center, table_top_z: float) -> str:
     base = BASE_XML.read_text()
-
-    size_m = [s / 1000.0 for s in cfg["cube"]["size_mm"]]      # W,D,H meters
-    mass = cfg["cube"]["mass_g"] / 1000.0
-    hx, hy, hz = [s / 2.0 for s in size_m]
-    ix, iy, iz = box_inertia(mass, size_m)
+    o = cfg["object"]
+    r_out = o["d_outer_mm"] / 2000.0
+    r_in = o["d_inner_mm"] / 2000.0
+    h = o["height_mm"] / 1000.0
+    r_mean = (r_out + r_in) / 2.0
+    wall = r_out - r_in
+    mass = object_mass_kg(cfg)
+    N = int(cfg["modeling"]["n_segments"])
+    ixy, _, iz = annulus_inertia(mass, r_out, r_in, h)
 
     c = cfg["contact"]
-    fr, solref, solimp, condim = (c["friction"], c["solref"],
-                                  c["solimp"], c["condim"])
-    geom_phys = (f'friction="{_fric_str(fr)}" solref="{_fric_str(solref)}" '
-                 f'solimp="{_fric_str(solimp)}" condim="{condim}"')
+    phys = (f'friction="{_s(c["friction"])}" solref="{_s(c["solref"])}" '
+            f'solimp="{_s(c["solimp"])}" condim="{c["condim"]}"')
 
-    he = cfg["table"]["half_extent_m"]
-    th = cfg["table"]["thickness_m"]
-    table_cz = table_top_z - th / 2.0                          # table 几何中心 z
-    cx, cy = float(cube_xyz[0]), float(cube_xyz[1])
-    cz = table_top_z + hz                                      # cube 中心静置于桌面
+    # 环段：每段 box，local x=径向(wall), y=切向(seg_len), z=竖直(h)；绕 z 旋转 θ_i。
+    seg_len = 1.15 * (2 * math.pi * r_mean / N)            # 略重叠避免缝隙
+    segs = []
+    for i in range(N):
+        th = 2 * math.pi * i / N
+        cx, cy = r_mean * math.cos(th), r_mean * math.sin(th)
+        qz = math.sin(th / 2.0)
+        segs.append(
+            f'            <geom name="tape_seg{i}" type="box" pos="{cx:.5f} {cy:.5f} 0" '
+            f'quat="{math.cos(th/2.0):.6f} 0 0 {qz:.6f}" '
+            f'size="{wall/2:g} {seg_len/2:g} {h/2:g}" rgba="0.4 0.7 0.4 1" {phys}/>')
+    segs_xml = "\n".join(segs)
+
+    he = cfg["table"]["half_extent_m"]; th_t = cfg["table"]["thickness_m"]
+    table_cz = table_top_z - th_t / 2.0
+    cx, cy, _ = [float(x) for x in ring_center]
+    cz = table_top_z + h / 2.0                              # 环心：平放静置于桌面
 
     snippet = f"""
-        <!-- ===== Stage 4.0 object-aware additions (auto-generated) ===== -->
+        <!-- ===== Stage 4.0 object-aware (tape annulus, B+) auto-generated ===== -->
         <body name="table" pos="0 0 {table_cz:.5f}">
-            <geom name="table_geom" type="box" size="{he:g} {he:g} {th/2:g}"
-                  rgba="0.55 0.4 0.25 1" {geom_phys}/>
+            <geom name="table_geom" type="box" size="{he:g} {he:g} {th_t/2:g}"
+                  rgba="0.55 0.4 0.25 1" {phys}/>
         </body>
-        <body name="cube" pos="{cx:.5f} {cy:.5f} {cz:.5f}">
-            <freejoint name="cube_free"/>
-            <inertial pos="0 0 0" mass="{mass:g}" diaginertia="{ix:.6g} {iy:.6g} {iz:.6g}"/>
-            <geom name="cube_geom" type="box" size="{hx:g} {hy:g} {hz:g}"
-                  rgba="0.85 0.2 0.2 1" {geom_phys}/>
+        <body name="tape" pos="{cx:.5f} {cy:.5f} {cz:.5f}">
+            <freejoint name="tape_free"/>
+            <inertial pos="0 0 0" mass="{mass:g}" diaginertia="{ixy:.6g} {ixy:.6g} {iz:.6g}"/>
+{segs_xml}
         </body>
 """
     if "</worldbody>" not in base:
@@ -107,47 +130,47 @@ def build_object_xml(cfg: dict, cube_xyz, table_top_z: float) -> str:
     return base.replace("</worldbody>", snippet + "    </worldbody>")
 
 
-def write_object_model(cfg: dict, cube_xyz, table_top_z: float,
-                       out_path: Path) -> Path:
+def write_object_model(cfg: dict, ring_center, table_top_z: float, out_path: Path) -> Path:
     out_path = Path(out_path)
-    out_path.write_text(build_object_xml(cfg, cube_xyz, table_top_z))
+    out_path.write_text(build_object_xml(cfg, ring_center, table_top_z))
     return out_path
 
 
 def derive_placement(base_xml: Path, demo: dict, cfg: dict):
-    """由 demo 第一个抓取帧反推 cube_xyz 与 table_top_z（含 config override）。"""
-    H = cfg["cube"]["size_mm"][2] / 1000.0
-    pl = cfg["placement"]
-    if not pl.get("derive_from_demo", True) and pl.get("override_cube_xyz"):
-        cube_xyz = np.asarray(pl["override_cube_xyz"], dtype=float)
-    else:
-        from sim.replay_demo_validation import state_mdeg_to_rad
-        gf = detect_grasp_frames(demo)
-        gframe = gf[0] if gf else len(demo["action"]) // 2
-        qpos8 = state_mdeg_to_rad(demo["state_mdeg"][gframe])
-        cube_xyz = gripper_world_pos(base_xml, qpos8)
+    """环心 = 指垫汇聚点 + mean_radius·(夹爪水平前向)；table_top = pinch_z − H/2。"""
+    from sim.replay_demo_validation import state_mdeg_to_rad
+    o = cfg["object"]
+    H = o["height_mm"] / 1000.0
+    r_mean = (o["d_outer_mm"] + o["d_inner_mm"]) / 4000.0
+
+    gf = detect_grasp_frames(demo)
+    gframe = gf[0] if gf else len(demo["action"]) // 2
+    qpos8 = state_mdeg_to_rad(demo["state_mdeg"][gframe])
+    pinch, fwd = fk_grasp(base_xml, qpos8)
+
+    fwd_h = np.array([fwd[0], fwd[1], 0.0])                 # 水平前向
+    fwd_h = fwd_h / (np.linalg.norm(fwd_h) + 1e-9)
+    ring_xy = pinch[:2] + r_mean * fwd_h[:2]
     if cfg["table"].get("override_top_z") is not None:
         table_top_z = float(cfg["table"]["override_top_z"])
     else:
-        table_top_z = float(cube_xyz[2] - H / 2.0)
-    return cube_xyz, table_top_z
+        table_top_z = float(pinch[2] - H / 2.0)
+    ring_center = np.array([ring_xy[0], ring_xy[1], table_top_z + H / 2.0])
+    return ring_center, table_top_z
 
 
 if __name__ == "__main__":
-    # smoke test: build with placeholder cfg + demo ep0 placement, load in mujoco.
     import sys
     sys.path.insert(0, str(SIM_DIR.parent))
     from sim.replay_demo_validation import load_real_demo
     cfg = load_config()
     demo = load_real_demo(0)
-    cube_xyz, table_top_z = derive_placement(BASE_XML, demo, cfg)
-    print(f"[derive] cube_xyz={cube_xyz}  table_top_z={table_top_z:.4f}")
-    out = SIM_DIR / "_object_model_smoke.xml"
-    write_object_model(cfg, cube_xyz, table_top_z, out)
+    ring_center, table_top_z = derive_placement(BASE_XML, demo, cfg)
+    print(f"[derive] ring_center={ring_center}  table_top_z={table_top_z:.4f}  "
+          f"mass={object_mass_kg(cfg)*1000:.0f}g  N={cfg['modeling']['n_segments']}")
+    out = SIM_DIR / "_obj_smoke.xml"
+    write_object_model(cfg, ring_center, table_top_z, out)
     m = mujoco.MjModel.from_xml_path(str(out))
-    print(f"[load ok] nq={m.nq} nu={m.nu} nbody={m.nbody} "
-          f"(base nq=8 → +7 cube freejoint = {m.nq})")
-    print(f"  cube geom id={mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, 'cube_geom')}, "
-          f"table geom id={mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, 'table_geom')}")
+    print(f"[load ok] nq={m.nq} nu={m.nu} nbody={m.nbody} ngeom={m.ngeom}")
     out.unlink()
-    print("[smoke ok] object model builds + loads")
+    print("[smoke ok] tape annulus model builds + loads")
