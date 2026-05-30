@@ -219,6 +219,26 @@ ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲�
 
 ---
 
+## Stage 3a — denoising-ACT 负消融（2026-05-30）
+
+直接 fine-tune C1-v3 ACT（解冻）+ hf 平滑惩罚（`enable_denoise_smooth`, λ_hf=0.1, 20K 步），
+得 C2-denoising-ACT。与 frozen ACT / ACT+RefineNet 对比（val, active joints, `sim/eval_stage3a.py`）：
+
+| 模型 | hf_fraction | hf_ratio/ACT | L_BC（任务保真） |
+|---|---|---|---|
+| C1 frozen ACT | 0.0327 | 1.00 | 0.0057 |
+| **C2 denoise-ACT (λ0.1)** | 0.0047 | **0.145** | **0.0064 (↑13%)** |
+| A_clean 地板 | 0.0008 | 0.026 | 0 |
+| **ACT+RefineNet (Stage 3b)** | ~0.0085 | ~0.25 | **0.0046 (↓)** |
+
+**结论（负结果成立）**：直接改 ACT 能把 hf 压得很狠（0.145×，甚至比 RefineNet 更激进），**但任务保真劣化**（L_BC 0.0057→0.0064，+13%）。而 frozen-ACT + RefineNet 做到 hf↓**且** L_BC 不升反降（0.0046）。→ 反证 frozen+RefineNet 设计：**改 ACT 本身 = 平滑/保真 trade-off；RefineNet = 两者兼得**。
+
+注：Phase 1 无物体，L_BC 为任务保真代理；完整"task success 明显下降"证据待 Stage 4/5。
+
+**基建坑（已记入 memory [[infra-act-finetune-crash]]）**：本环境 ACT fine-tune via train.py 需 `num_workers=0`（否则 dataloader worker 死锁）+ `use_amp=False`（否则训练循环 native double-free / core dump）。launcher：`sim/launch_stage3a.py`（直传 cfg 绕过 CLI override 无法注入新字段的限制）。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |
@@ -228,3 +248,4 @@ ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲�
 | B | 2026-05-29 | L_BC + 0.05·hf + 0.1·\|ΔA\| | **正结果**：hf_ratio 0.41(best 0.26) [pass]，L_BC/\|ΔA\| guardrail 全过，四关节 hf 全降 2~2.5×。RefineNet 去污染命题成立 |
 | B-sweep | 2026-05-29 | +hf∈{0.05,0.1,0.2,0.4} | hf_ratio 饱和 ~0.25（j3 卡地板），无 trade-off cliff，BC 始终安全。**best-by-rule λ_hf=0.10**。地板为信息/容量限制 |
 | deploy | 2026-05-29 | λ_hf=0.10 闭环 | **关键**：chunk 内 0.28×（监督式成立），但边界未平滑→无 blend 时 deploy jitter 反升 1.046×；deploy-time blend 后 0.933×（消除超额污染 20%, bnd_jump→0）。Phase1 headroom 小（ACT 仅高于 demo 33%），平滑卖点应在 Stage 4/5 |
+| 3a | 2026-05-30 | denoise-ACT λ0.1 20K | 负消融：C2 hf 0.145×（比 RefineNet 更激进）但 L_BC ↑13%（保真劣化）；RefineNet 则 hf↓且 L_BC↓ → 反证 frozen+RefineNet。基建：num_workers=0+use_amp=False |
