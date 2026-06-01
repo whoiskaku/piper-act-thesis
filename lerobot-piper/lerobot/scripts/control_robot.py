@@ -122,6 +122,7 @@ python lerobot/scripts/control_robot.py \
 """
 
 import logging
+import os
 import time
 from dataclasses import asdict
 from pprint import pformat
@@ -255,6 +256,18 @@ def record(
 
     # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, cfg.device, ds_meta=dataset.meta)
+
+    # Stage 5 RefineNet 部署(默认关，env 门控)：设 REFINE_CKPT=<ckpt.pt> 即在 ACT 之后
+    # 接入 RefineNet 残差精修 + 边界 blend(B 条件)；不设则纯 ACT(A 条件)。
+    # 包装后 .config 仍指向 ACT，故下方 HistoryBuffer 构建不受影响。
+    _refine_ckpt = os.environ.get("REFINE_CKPT")
+    if policy is not None and _refine_ckpt:
+        from lerobot.common.policies.act.refine_deploy import build_refine_deploy_policy
+        _enabled = os.environ.get("REFINE_ENABLED", "1") != "0"
+        policy = build_refine_deploy_policy(policy, _refine_ckpt, cfg.device,
+                                            blend_m=int(os.environ.get("REFINE_BLEND_M", "10")),
+                                            refine_enabled=_enabled)
+        logging.info(f"RefineNet deploy wrapper active (enabled={_enabled}, ckpt={_refine_ckpt})")
 
     # Build a HistoryBuffer when the loaded policy was trained with autoregressive
     # history inputs. The buffer survives across episodes and is the runtime mirror
