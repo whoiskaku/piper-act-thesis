@@ -60,6 +60,15 @@ class RefineNetDeployWrapper:
         self._last_action = None                   # 上一步下发的动作(用于边界 blend)
         self._warned_state = False
 
+    def __getattr__(self, name):
+        """未定义的属性/方法委托给内部 frozen ACTPolicy
+        (如 normalize_targets / normalize_inputs / unnormalize_outputs，
+        供 HistoryBuffer / control_robot 等沿用 ACT 接口)。"""
+        act = self.__dict__.get("act")
+        if act is None:
+            raise AttributeError(name)
+        return getattr(act, name)
+
     # ---- 与 ACTPolicy 接口一致 ----
     def reset(self):
         self.act.reset()
