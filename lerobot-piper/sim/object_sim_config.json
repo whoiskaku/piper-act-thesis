@@ -7,8 +7,8 @@
     "height_mm": 5.35,
     "wall_radial_mm": 5.46,
     "mean_radius_mm": 40.79,
-    "mass_g": null,
-    "_mass_todo": "胶带卷质量待用电子秤测；暂用占位 40g 跑通管线，结论需替换。",
+    "mass_g": 61.0,
+    "_mass_note": "实测 61g (电子秤, 2026-05-30)。",
     "placement": "flat (axis vertical, resting on table)",
     "grasp": "edge/rim (fingers pinch the ~5.46mm annular wall at one circumferential point)"
   },
