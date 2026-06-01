@@ -20,15 +20,23 @@
   },
   "table": {
     "thickness_m": 0.02,
-    "half_extent_m": 0.30,
+    "half_extent_m": 0.50,
     "override_top_z": null,
     "_note": "table_top_z 默认 = grasp_z − height/2 (FK 反推)。"
   },
   "contact": {
     "friction": [1.0, 0.005, 0.0001],
-    "solref": [0.02, 1.0],
+    "solref": [0.2, 1.0],
     "solimp": [0.9, 0.95, 0.001],
     "condim": 4,
-    "_note_restitution": "restitution≈0.05 用默认 solref 近似；标定阶段再调。"
+    "_note": "solref timeconst 0.2 已标定: 桌面/自由接触 peak≈7.5 对真机靶 (calib_contact 2026-05-30)。"
+  },
+  "weld": {
+    "body1": "link6",
+    "body2": "tape",
+    "solref": [0.1, 1.0],
+    "solimp": [0.95, 0.99, 0.001],
+    "_solref_calib": "0.1 标定(calib_weld): carry_lift~79mm稳定, accel_hp收敛0.13无振铃; <0.02振铃, table放大到0.5后tape不再坠落",
+    "_note": "oracle grasp attachment 代理, 非真实接触。solref/solimp 单独配置(不沿用桌面接触甜点)。运行时 eq_active 通断。"
   }
 }

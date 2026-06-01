@@ -62,6 +62,17 @@ def detect_grasp_frames(demo: dict, grip_channel: int = 6) -> list[int]:
     return out
 
 
+def grasp_interval(demo: dict):
+    """返回 (attach_frame, release_frame, all_event_frames)。
+    固定取自 demo gripper 事件：attach=首个事件, release=末个事件(覆盖搬运段)。
+    ACT 与 refined 必须共用同一区间 → 避免事件检测差异被误判为 transfer 差异。"""
+    gf = detect_grasp_frames(demo)
+    if len(gf) >= 2:
+        return gf[0], gf[-1], gf
+    T = len(demo["action"])
+    return T // 4, 3 * T // 4, gf
+
+
 def fk_grasp(base_xml: Path, qpos8: np.ndarray):
     """FK：返回 (pinch_center_xyz, fwd_unit) —— 指垫抓取中心 + 夹爪前向(link6 z, 世界)。"""
     model = mujoco.MjModel.from_xml_path(str(base_xml))
@@ -92,8 +103,10 @@ def build_object_xml(cfg: dict, ring_center, table_top_z: float) -> str:
     ixy, _, iz = annulus_inertia(mass, r_out, r_in, h)
 
     c = cfg["contact"]
+    # contype/conaffinity=2: tape 与 table 同组互碰，但不与手臂(默认组1)碰撞 ——
+    # 因为 weld 是附着代理，夹爪↔tape 的物理接触不建模(否则 weld+接触打架→不稳定)。
     phys = (f'friction="{_s(c["friction"])}" solref="{_s(c["solref"])}" '
-            f'solimp="{_s(c["solimp"])}" condim="{c["condim"]}"')
+            f'solimp="{_s(c["solimp"])}" condim="{c["condim"]}" contype="2" conaffinity="2"')
 
     # 环段：每段 box，local x=径向(wall), y=切向(seg_len), z=竖直(h)；绕 z 旋转 θ_i。
     seg_len = 1.15 * (2 * math.pi * r_mean / N)            # 略重叠避免缝隙
@@ -127,7 +140,17 @@ def build_object_xml(cfg: dict, ring_center, table_top_z: float) -> str:
 """
     if "</worldbody>" not in base:
         raise RuntimeError("base xml 缺少 </worldbody>")
-    return base.replace("</worldbody>", snippet + "    </worldbody>")
+    xml = base.replace("</worldbody>", snippet + "    </worldbody>")
+
+    # oracle grasp attachment 代理(默认关，运行时 eq_active 通断)。非真实接触。
+    w = cfg.get("weld")
+    if w is not None:
+        eq = (f'    <equality>\n'
+              f'        <weld name="grasp_weld" body1="{w["body1"]}" body2="{w["body2"]}" '
+              f'active="false" solref="{_s(w["solref"])}" solimp="{_s(w["solimp"])}"/>\n'
+              f'    </equality>\n')
+        xml = xml.replace("</mujoco>", eq + "</mujoco>")
+    return xml
 
 
 def write_object_model(cfg: dict, ring_center, table_top_z: float, out_path: Path) -> Path:
