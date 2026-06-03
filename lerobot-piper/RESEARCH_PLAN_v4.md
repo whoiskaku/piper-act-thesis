@@ -444,18 +444,18 @@ Items explicitly excluded from main thesis but mentioned in §7 of the paper:
 ### 下一步:恢复研究时优先 — RefineNet 输入消融 S0–S3（2026-06-03 登记）
 **动机**：history_action(600×7)+history_imu(600×6) 是 RefineNet 最大、最重的输入，但间接证据显示其作用可能不大——闭环 eval 中「真机 history」vs「闭环 refined history」输出几乎一致（hf 0.0747 vs 0.0762，对 history 内容不敏感）；且 action↔IMU 耦合弱，history_imu 贡献存疑。验证是否可去掉/精简（更小网络、部署不依赖 history_buffer、论文更干净）。
 **方法**：训练 4 个变体（各 ~3min，复用 `sim/train_refine_net.py` + paired data），用统一指标对比（chunk 内 hf_ratio + L_BC 护栏 + 闭环 hp_rms + 边界段）：
-- [ ] **S0** 仅 ACT_output（盲精修 baseline）
-- [ ] **S1** + current_state
-- [ ] **S2** + 短近期 action history（只取最近 ~10–20 帧，针对 chunk 边界连续性）
-- [ ] **S3** + 完整 history(action+imu 600)（= 现状，best λ_hf=0.10 ep68）
+- [x] **S0** 仅 ACT_output（盲精修 baseline）
+- [x] **S1** + current_state
+- [x] **S2** + 短近期 action history（只取最近 ~10–20 帧，针对 chunk 边界连续性）
+- [x] **S3** + 完整 history(action+imu 600)（= 现状，best λ_hf=0.10 ep68）
 **判读**：若 S0/S1 已拿到大部分 chunk 内收益 → history 可砍；若 S2 改善边界 → 保留短 history；若只有 S3 好 → 完整 history 值这个复杂度。先验：完整 history(尤其 imu)可能不值复杂度。
 **实现注**：需给 `RefineNet.__init__` 加输入开关(use_history_action/use_history_imu/use_state)+ tokenizer 条件构建；`train_refine_net.py` 加 `--variant S0..S3`。
 
 ### 下一步:输入信号对照 — A_noisy vs ACT_output(2026-06-03 登记)
 **动机**：当前实现精修 `ACT_output→A_clean`；T2 原设想是去噪 `A_noisy→A_clean`(更直觉)。需**实证**为何选 ACT_output(而非仅口头论证 train-deploy 一致性)。
 **方法**：训两个变体,**同在部署条件(输入=ACT_output)下评估**:
-- [ ] **N0(现状)** 训 `ACT_output→A_clean`
-- [ ] **N1** 训 `A_noisy→A_clean`(A_noisy 已在 H5,改 dataset 取 A_noisy 作输入即可)
+- [x] **N0(现状)** 训 `ACT_output→A_clean`
+- [x] **N1** 训 `A_noisy→A_clean`(A_noisy 已在 H5,改 dataset 取 A_noisy 作输入即可)
 对照:① N1 在其训练分布(A_noisy 输入)上的表现;② N1 在**部署分布(ACT_output 输入)**上的表现 —— 预期 N1 因输入分布错配而在部署上劣化,从而坐实"输入须 = 部署时可得的 ACT_output;要去的是策略抖动而非合成电机噪声"。
 **先验**:N1 部署劣化 → 验证 ACT_output 是正确输入;作为论文的设计依据(input ablation)。
 
