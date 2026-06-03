@@ -44,6 +44,9 @@ class RefineNet(nn.Module):
         nhead: int = 8,
         ffn_dim: int = 512,
         dropout: float = 0.0,
+        use_state: bool = True,
+        use_history_action: bool = True,
+        use_history_imu: bool = True,
     ) -> None:
         super().__init__()
 
@@ -52,31 +55,35 @@ class RefineNet(nn.Module):
             f"patch_size ({patch_size})"
         )
         n_patch_tokens = history_max_length // patch_size
+        # 输入开关(S0–S3 消融):A_target 永远在；其余三路可关。
+        self.use_state = use_state
+        self.use_history_action = use_history_action
+        self.use_history_imu = use_history_imu
 
-        # ---- Tokenizers ----
-        # A_target: per-step Linear so output alignment is per timestep.
+        # ---- Tokenizers (条件构建) ----
+        # A_target: per-step Linear so output alignment is per timestep. (always on)
         self.act_proj = nn.Linear(action_dim, dim)
 
-        # history_action: CNN patchify
-        self.hist_action_tokenizer = nn.Sequential(
-            nn.Conv1d(action_dim, 64, kernel_size=patch_size, stride=patch_size),
-            nn.GELU(),
-            nn.Conv1d(64, dim, kernel_size=1),
-        )
-        # history_imu: CNN patchify
-        self.hist_imu_tokenizer = nn.Sequential(
-            nn.Conv1d(imu_dim, 64, kernel_size=patch_size, stride=patch_size),
-            nn.GELU(),
-            nn.Conv1d(64, dim, kernel_size=1),
-        )
-        # current_state: Linear, single token
-        self.state_proj = nn.Linear(state_dim, dim)
+        if use_history_action:
+            self.hist_action_tokenizer = nn.Sequential(
+                nn.Conv1d(action_dim, 64, kernel_size=patch_size, stride=patch_size),
+                nn.GELU(),
+                nn.Conv1d(64, dim, kernel_size=1),
+            )
+            self.pe_a_prev = nn.Embedding(n_patch_tokens, dim)
+        if use_history_imu:
+            self.hist_imu_tokenizer = nn.Sequential(
+                nn.Conv1d(imu_dim, 64, kernel_size=patch_size, stride=patch_size),
+                nn.GELU(),
+                nn.Conv1d(64, dim, kernel_size=1),
+            )
+            self.pe_i_prev = nn.Embedding(n_patch_tokens, dim)
+        if use_state:
+            self.state_proj = nn.Linear(state_dim, dim)
+            self.pe_state = nn.Embedding(1, dim)
 
         # ---- Position + type embeddings ----
         self.pe_a_target = nn.Embedding(chunk_size, dim)
-        self.pe_a_prev   = nn.Embedding(n_patch_tokens, dim)
-        self.pe_i_prev   = nn.Embedding(n_patch_tokens, dim)
-        self.pe_state    = nn.Embedding(1, dim)
         self.type_embed  = nn.Embedding(4, dim)  # 0:A_target 1:A_prev 2:I_prev 3:state
 
         # ---- Transformer ----
@@ -113,7 +120,11 @@ class RefineNet(nn.Module):
 
     @property
     def n_encoder_tokens(self) -> int:
-        return self.chunk_size + 2 * self.n_patch_tokens + 1
+        n = self.chunk_size
+        if self.use_history_action: n += self.n_patch_tokens
+        if self.use_history_imu:    n += self.n_patch_tokens
+        if self.use_state:          n += 1
+        return n
 
     def forward(
         self,
@@ -138,36 +149,39 @@ class RefineNet(nn.Module):
         B = act_output.shape[0]
         device = act_output.device
 
-        # ---- Tokenize each branch ----
+        # ---- Tokenize each branch (按开关条件组装) ----
         a_tgt = self.act_proj(act_output)
         a_tgt = a_tgt + self.pe_a_target.weight.unsqueeze(0) + self.type_embed.weight[0]
+        toks = [a_tgt]                                  # A_target 永远在
+        mask_segs = [torch.zeros(B, self.chunk_size, dtype=torch.bool, device=device)]
 
-        ha = self.hist_action_tokenizer(history_action.transpose(1, 2)).transpose(1, 2)
-        ha = ha + self.pe_a_prev.weight.unsqueeze(0) + self.type_embed.weight[1]
-
-        hi = self.hist_imu_tokenizer(history_imu.transpose(1, 2)).transpose(1, 2)
-        hi = hi + self.pe_i_prev.weight.unsqueeze(0) + self.type_embed.weight[2]
-
-        s = self.state_proj(current_state).unsqueeze(1)
-        s = s + self.pe_state.weight.unsqueeze(0) + self.type_embed.weight[3]
-
-        # Token order: [A_target (100), history_action patches (40),
-        #               history_imu patches (40), state (1)]
-        memory_tokens = torch.cat([a_tgt, ha, hi, s], dim=1)
-
-        # ---- Build key_padding_mask for encoder/decoder cross-attn ----
-        if history_pad_mask is not None:
-            # Downsample 600-frame mask to 40-patch mask: a patch is masked
-            # iff ALL frames inside it are pad.
+        patch_mask = None
+        if (self.use_history_action or self.use_history_imu) and history_pad_mask is not None:
+            # 600 帧 mask 下采样到 patch:patch 内 15 帧全 pad 才算 pad。
             patch_mask = history_pad_mask.view(
-                B, self.n_patch_tokens, self.patch_size
-            ).all(dim=-1)
-            kpm = torch.zeros(B, self.n_encoder_tokens, dtype=torch.bool, device=device)
-            kpm[:, self.chunk_size : self.chunk_size + self.n_patch_tokens] = patch_mask
-            kpm[:, self.chunk_size + self.n_patch_tokens :
-                self.chunk_size + 2 * self.n_patch_tokens] = patch_mask
-        else:
-            kpm = None
+                B, self.n_patch_tokens, self.patch_size).all(dim=-1)
+
+        if self.use_history_action:
+            ha = self.hist_action_tokenizer(history_action.transpose(1, 2)).transpose(1, 2)
+            ha = ha + self.pe_a_prev.weight.unsqueeze(0) + self.type_embed.weight[1]
+            toks.append(ha)
+            mask_segs.append(patch_mask if patch_mask is not None
+                             else torch.zeros(B, self.n_patch_tokens, dtype=torch.bool, device=device))
+        if self.use_history_imu:
+            hi = self.hist_imu_tokenizer(history_imu.transpose(1, 2)).transpose(1, 2)
+            hi = hi + self.pe_i_prev.weight.unsqueeze(0) + self.type_embed.weight[2]
+            toks.append(hi)
+            mask_segs.append(patch_mask if patch_mask is not None
+                             else torch.zeros(B, self.n_patch_tokens, dtype=torch.bool, device=device))
+        if self.use_state:
+            s = self.state_proj(current_state).unsqueeze(1)
+            s = s + self.pe_state.weight.unsqueeze(0) + self.type_embed.weight[3]
+            toks.append(s)
+            mask_segs.append(torch.zeros(B, 1, dtype=torch.bool, device=device))
+
+        memory_tokens = torch.cat(toks, dim=1)
+        # 只有存在 history 且给了 pad mask 才需要 key_padding_mask
+        kpm = torch.cat(mask_segs, dim=1) if patch_mask is not None else None
 
         # ---- Encoder ----
         memory = self.encoder(memory_tokens, src_key_padding_mask=kpm)

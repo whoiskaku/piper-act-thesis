@@ -208,6 +208,8 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--save-every", type=int, default=50)
+    ap.add_argument("--variant", choices=["S0", "S1", "S2", "S3", "full"],
+                    default="full", help="输入消融: S0=仅ACT, S1=+state, S2=+state+hist_action, S3/full=全部")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--h5", type=Path, default=H5_PATH)
     ap.add_argument("--out-dir", type=Path,
@@ -219,9 +221,19 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # 输入消融变体 → RefineNet 输入开关
+    VARIANTS = {  # (use_state, use_history_action, use_history_imu)
+        "S0": (False, False, False),
+        "S1": (True,  False, False),
+        "S2": (True,  True,  False),
+        "S3": (True,  True,  True),
+        "full": (True, True, True),
+    }
+    use_state, use_ha, use_hi = VARIANTS[args.variant]
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tag = args.tag or (
-        f"hf{args.lambda_hf}_dl{args.lambda_delta}_ac{args.lambda_acc}"
+        f"{args.variant}_hf{args.lambda_hf}_dl{args.lambda_delta}"
     )
     out_dir = args.out_dir / f"phase1_{tag}_lr{args.lr}_bs{args.batch_size}_ep{args.epochs}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -250,7 +262,9 @@ def main():
     )
 
     # ---- Model ----
-    model = RefineNet().to(device)
+    model = RefineNet(use_state=use_state, use_history_action=use_ha,
+                      use_history_imu=use_hi).to(device)
+    print(f"[variant] {args.variant}: use_state={use_state} use_hist_action={use_ha} use_hist_imu={use_hi}")
     n_params = model.num_parameters()
     print(f"[model] RefineNet n_params = {n_params:,} ({n_params/1e6:.2f}M)")
 
