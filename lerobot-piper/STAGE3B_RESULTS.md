@@ -239,6 +239,24 @@ ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲�
 
 ---
 
+## 输入消融 S0–S3（2026-06-03，#61）
+
+验证 history(action+imu 600) / current_state 是否值这个复杂度。固定 λ_hf=0.10, λ_delta=0.1, 200ep, 单 seed；best-by-rule（hf_ratio↓ 且 L_BC≤1.1×baseline）。
+
+| 变体 | 输入 | 参数 | best hf_ratio | L_BC | j1/j2/j3/grip |
+|---|---|---|---|---|---|
+| **S0** | 仅 ACT_output | **1.90M** | **0.229** | 0.0052 | 0.18/0.26/0.38/0.07 |
+| S1 | +state | 1.90M | 0.244 | 0.0050 | 0.20/0.34/0.36/0.07 |
+| S2 | +state+hist_action | 1.94M | 0.262 | 0.0052 | 0.23/0.19/0.41/0.18 |
+| S3 | 全部(=现状) | 1.97M | 0.251 | 0.0051 | 0.22/0.23/0.43/0.09 |
+
+（ACT baseline L_BC=0.0057；四者 L_BC 均 < baseline）
+
+**结论**：四变体 hf_ratio 全挤在 0.229–0.262（单 seed 噪声量级）；增量 +state +0.015 / +hist_action +0.018 / +hist_imu −0.011 —— **无任何输入分支带来明显改善**。**最简 S0(仅 ACT_output, 1.90M, 100 token)与完整模型统计等价且最小** → history/state 对 chunk 内平滑可砍，RefineNet 可大幅精简、部署不再依赖 history_buffer（论文奥卡姆加分）。与闭环"换 history 内容输出不变"一致。j3 在所有变体卡 0.36–0.43 → j3 地板与输入无关（信号结构/容量限制）。
+**caveat**：① 单 seed，0.03 差异在噪声内（严格应补 2–3 seed 确认等价）；② chunk 边界是否需短 history 未被此 supervised 指标覆盖（边界用 deploy-blend 处理，600 帧 history 显非必需）。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |
