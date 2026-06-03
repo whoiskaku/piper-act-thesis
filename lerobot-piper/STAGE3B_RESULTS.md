@@ -257,6 +257,26 @@ ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲�
 
 ---
 
+## 输入信号对照 A_noisy vs ACT_output（2026-06-03，#62）
+
+验证为何 RefineNet 输入用 ACT_output 而非 A_noisy(T2 原设想的去噪)。S0 架构, λ_hf=0.10, λ_delta=0.1, 均在 val(`sim/eval_input_signal.py`)。
+
+| 模型 | 训练输入 | 评估输入 | hf:输入→精修 | hf_ratio | L_BC | \|Δ\| |
+|---|---|---|---|---|---|---|
+| **N0** | ACT_output | ACT_output(部署) | 0.032→0.007 | **0.229** ✓ | 0.0052 | 0.0021 |
+| N1 | A_noisy | A_noisy(自身) | 0.278→0.265 | 0.953 | 0.0026 | 0.0008 |
+| N1 | A_noisy | ACT_output(部署) | 0.032→0.053 | **1.644** ✗ | 0.0059 | 0.0008 |
+
+参考(val active-joint hf): A_noisy=0.278(高), ACT_output=0.032, A_clean=0.0008。
+
+**两个独立结论, 都支持 ACT_output:**
+1. **训练/部署分布错配 → N1 部署失败**: N1 训于 A_noisy, 喂部署输入 ACT_output 时 hf 升至 1.64×(更抖)、L_BC 也差。输入必须 = 部署可得的 ACT_output。
+2. **A_noisy 高频本质不可学**: N1 在自身分布上都几乎压不动 hf(ratio 0.953, 仅 |Δ|=0.0008 微调)。因 `A_noisy=demo+i.i.d.高斯电机噪声`, 白噪声不可预测→残差无法逐步抵消。反观 ACT 抖动是策略诱导、有结构、可预测→可学可去(N0 ratio 0.229)。
+
+**结论**: "去噪 A_noisy→A_clean" 既非 well-posed(白噪声压不动)又部署错配; "精修 ACT_output→A_clean" 任务良定且部署一致。→ ACT_output 是正确输入, 数据双重佐证(作为论文 input ablation 依据)。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |

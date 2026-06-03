@@ -110,7 +110,7 @@ def jerk_rms(actions: torch.Tensor, dt: float = DT) -> torch.Tensor:
 
 
 # ─── Train / Eval loops ────────────────────────────────────────────
-def run_epoch(model, loader, optimizer, lambdas, device, train=True):
+def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="ACT_output"):
     """lambdas = dict(hf=..., delta=..., acc=...)."""
     model.train(train)
     n = 0
@@ -128,7 +128,7 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True):
     with grad_context:
         for batch in loader:
             B = batch["ACT_output"].shape[0]
-            act_output       = batch["ACT_output"].to(device, non_blocking=True)
+            act_output       = batch[input_key].to(device, non_blocking=True)  # 待精修输入(ACT_output 或 A_noisy, #62)
             history_action   = batch["history_action"].to(device, non_blocking=True)
             history_imu      = batch["history_imu"].to(device, non_blocking=True)
             history_pad_mask = batch["history_pad_mask"].to(device, non_blocking=True)
@@ -210,6 +210,8 @@ def main():
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--variant", choices=["S0", "S1", "S2", "S3", "full"],
                     default="full", help="输入消融: S0=仅ACT, S1=+state, S2=+state+hist_action, S3/full=全部")
+    ap.add_argument("--input-signal", choices=["act_output", "a_noisy"], default="act_output",
+                    help="#62 待精修输入: act_output(现状) 或 a_noisy(去噪对照)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--h5", type=Path, default=H5_PATH)
     ap.add_argument("--out-dir", type=Path,
@@ -231,9 +233,11 @@ def main():
     }
     use_state, use_ha, use_hi = VARIANTS[args.variant]
 
+    input_key = "A_noisy" if args.input_signal == "a_noisy" else "ACT_output"
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tag = args.tag or (
-        f"{args.variant}_hf{args.lambda_hf}_dl{args.lambda_delta}"
+        f"{args.variant}_in-{args.input_signal}_hf{args.lambda_hf}_dl{args.lambda_delta}"
     )
     out_dir = args.out_dir / f"phase1_{tag}_lr{args.lr}_bs{args.batch_size}_ep{args.epochs}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -302,8 +306,8 @@ def main():
 
     for epoch in range(args.epochs):
         t_ep = time.time()
-        train_stats = run_epoch(model, train_loader, optimizer, lambdas, device, train=True)
-        val_stats = run_epoch(model, val_loader, None, lambdas, device, train=False)
+        train_stats = run_epoch(model, train_loader, optimizer, lambdas, device, train=True, input_key=input_key)
+        val_stats = run_epoch(model, val_loader, None, lambdas, device, train=False, input_key=input_key)
         scheduler.step()
 
         elapsed_ep = time.time() - t_ep

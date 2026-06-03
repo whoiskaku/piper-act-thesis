@@ -51,6 +51,7 @@ class RefinePhase1Dataset(Dataset):
             grp = f[split]
             self.A_clean = grp["A_clean"][:].astype(np.float32)
             self.ACT_output = grp["ACT_output"][:].astype(np.float32)
+            self.A_noisy = grp["A_noisy"][:].astype(np.float32)  # #62 输入信号对照用
             self.history_action = grp["history_action"][:].astype(np.float32)
             self.history_imu = grp["history_imu"][:].astype(np.float32)
             self.history_pad_mask = grp["history_pad_mask"][:].astype(bool)
@@ -72,6 +73,7 @@ class RefinePhase1Dataset(Dataset):
             state = (state - self.state_mean) / (self.state_std + 1e-8)
         return {
             "ACT_output":       torch.from_numpy(self.ACT_output[i]),
+            "A_noisy":          torch.from_numpy(self.A_noisy[i]),
             "history_action":   torch.from_numpy(self.history_action[i]),
             "history_imu":      torch.from_numpy(self.history_imu[i]),
             "history_pad_mask": torch.from_numpy(self.history_pad_mask[i]),
