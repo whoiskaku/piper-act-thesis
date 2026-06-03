@@ -451,6 +451,14 @@ Items explicitly excluded from main thesis but mentioned in §7 of the paper:
 **判读**：若 S0/S1 已拿到大部分 chunk 内收益 → history 可砍；若 S2 改善边界 → 保留短 history；若只有 S3 好 → 完整 history 值这个复杂度。先验：完整 history(尤其 imu)可能不值复杂度。
 **实现注**：需给 `RefineNet.__init__` 加输入开关(use_history_action/use_history_imu/use_state)+ tokenizer 条件构建；`train_refine_net.py` 加 `--variant S0..S3`。
 
+### 下一步:输入信号对照 — A_noisy vs ACT_output(2026-06-03 登记)
+**动机**：当前实现精修 `ACT_output→A_clean`；T2 原设想是去噪 `A_noisy→A_clean`(更直觉)。需**实证**为何选 ACT_output(而非仅口头论证 train-deploy 一致性)。
+**方法**：训两个变体,**同在部署条件(输入=ACT_output)下评估**:
+- [ ] **N0(现状)** 训 `ACT_output→A_clean`
+- [ ] **N1** 训 `A_noisy→A_clean`(A_noisy 已在 H5,改 dataset 取 A_noisy 作输入即可)
+对照:① N1 在其训练分布(A_noisy 输入)上的表现;② N1 在**部署分布(ACT_output 输入)**上的表现 —— 预期 N1 因输入分布错配而在部署上劣化,从而坐实"输入须 = 部署时可得的 ACT_output;要去的是策略抖动而非合成电机噪声"。
+**先验**:N1 部署劣化 → 验证 ACT_output 是正确输入;作为论文的设计依据(input ablation)。
+
 ### 其它候选下一步（Stage 5 之后，待定优先级）
 - [ ] 诊断低层控制器跟踪误差（action vs state 残差谱）——传递链最大瓶颈在 action→state（丢约一半）
 - [ ] 训练期加边界续接损失 `L_boundary`（真机 boundary 段 refined 仍略差）
