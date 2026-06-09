@@ -54,6 +54,8 @@ class RefinePhase1Dataset(Dataset):
             self.A_noisy = grp["A_noisy"][:].astype(np.float32)  # #62 输入信号对照用
             self.act_hidden_enc = (grp["act_hidden_enc"][:].astype(np.float32)
                                    if "act_hidden_enc" in grp else None)  # #63 ACT encoder 摘要
+            self.act_img_tokens = (grp["act_img_tokens"][:].astype(np.float32)
+                                   if "act_img_tokens" in grp else None)  # #63(a) ACT image tokens
             self.history_action = grp["history_action"][:].astype(np.float32)
             self.history_imu = grp["history_imu"][:].astype(np.float32)
             self.history_pad_mask = grp["history_pad_mask"][:].astype(bool)
@@ -84,6 +86,8 @@ class RefinePhase1Dataset(Dataset):
         }
         if self.act_hidden_enc is not None:
             out["act_hidden"] = torch.from_numpy(self.act_hidden_enc[i])
+        if self.act_img_tokens is not None:
+            out["act_img"] = torch.from_numpy(self.act_img_tokens[i])
         return out
 
     def compute_state_stats(

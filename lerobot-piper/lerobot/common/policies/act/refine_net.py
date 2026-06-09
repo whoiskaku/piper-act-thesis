@@ -50,6 +50,8 @@ class RefineNet(nn.Module):
         use_act_hidden: bool = False,
         act_hidden_dim: int = 512,
         act_hidden_bottleneck: int = 32,
+        use_act_img_attn: bool = False,
+        act_img_dim: int = 512,
     ) -> None:
         super().__init__()
 
@@ -63,6 +65,7 @@ class RefineNet(nn.Module):
         self.use_history_action = use_history_action
         self.use_history_imu = use_history_imu
         self.use_act_hidden = use_act_hidden          # #63: ACT encoder 摘要作 context
+        self.use_act_img_attn = use_act_img_attn      # #63(a): ACT image tokens 注意力读出
 
         # ---- Tokenizers (条件构建) ----
         # A_target: per-step Linear so output alignment is per timestep. (always on)
@@ -93,6 +96,11 @@ class RefineNet(nn.Module):
                 nn.Linear(act_hidden_bottleneck, dim),
             )
             self.pe_act_hidden = nn.Embedding(1, dim)
+        if use_act_img_attn:
+            # RLT 式注意力读出:learned query 对 ACT image tokens 交叉注意 → 1 个 readout token
+            self.img_proj = nn.Linear(act_img_dim, dim)
+            self.img_readout_query = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+            self.img_readout_attn = nn.MultiheadAttention(dim, nhead, batch_first=True)
 
         # ---- Position + type embeddings ----
         self.pe_a_target = nn.Embedding(chunk_size, dim)
@@ -137,6 +145,7 @@ class RefineNet(nn.Module):
         if self.use_history_imu:    n += self.n_patch_tokens
         if self.use_state:          n += 1
         if self.use_act_hidden:     n += 1
+        if self.use_act_img_attn:   n += 1
         return n
 
     def forward(
@@ -147,6 +156,7 @@ class RefineNet(nn.Module):
         current_state: torch.Tensor,
         history_pad_mask: torch.Tensor | None = None,
         act_hidden: torch.Tensor | None = None,
+        act_img: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -196,6 +206,13 @@ class RefineNet(nn.Module):
             ah = self.act_hidden_proj(act_hidden).unsqueeze(1)        # (B,1,dim)
             ah = ah + self.pe_act_hidden.weight.unsqueeze(0) + self.type_embed.weight[4]
             toks.append(ah)
+            mask_segs.append(torch.zeros(B, 1, dtype=torch.bool, device=device))
+        if self.use_act_img_attn:
+            k = self.img_proj(act_img.float())                       # (B, n_img, dim)
+            q = self.img_readout_query.expand(B, -1, -1)             # (B, 1, dim)
+            readout, _ = self.img_readout_attn(q, k, k)             # (B, 1, dim)
+            readout = readout + self.type_embed.weight[4]
+            toks.append(readout)
             mask_segs.append(torch.zeros(B, 1, dtype=torch.bool, device=device))
 
         memory_tokens = torch.cat(toks, dim=1)

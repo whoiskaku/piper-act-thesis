@@ -136,10 +136,12 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
             A_clean          = batch["A_clean"].to(device, non_blocking=True)
             act_hidden = (batch["act_hidden"].to(device, non_blocking=True)
                           if "act_hidden" in batch else None)
+            act_img = (batch["act_img"].to(device, non_blocking=True)
+                       if "act_img" in batch else None)
 
             refined, delta = model(
                 act_output, history_action, history_imu, current_state,
-                history_pad_mask=history_pad_mask, act_hidden=act_hidden,
+                history_pad_mask=history_pad_mask, act_hidden=act_hidden, act_img=act_img,
             )
 
             l_bc = nn.functional.l1_loss(refined, A_clean)
@@ -216,6 +218,8 @@ def main():
                     help="#62 待精修输入: act_output(现状) 或 a_noisy(去噪对照)")
     ap.add_argument("--use-act-hidden", action="store_true",
                     help="#63 加 ACT encoder 摘要作 context token(变体 S0+H)")
+    ap.add_argument("--use-act-img-attn", action="store_true",
+                    help="#63(a) 对 ACT image tokens 做注意力读出作 context token(变体 S0+Hattn)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--h5", type=Path, default=H5_PATH)
     ap.add_argument("--out-dir", type=Path,
@@ -240,8 +244,9 @@ def main():
     input_key = "A_noisy" if args.input_signal == "a_noisy" else "ACT_output"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    _hsfx = ('+H' if args.use_act_hidden else '') + ('+Hattn' if args.use_act_img_attn else '')
     tag = args.tag or (
-        f"{args.variant}{'+H' if args.use_act_hidden else ''}_in-{args.input_signal}_hf{args.lambda_hf}_dl{args.lambda_delta}"
+        f"{args.variant}{_hsfx}_in-{args.input_signal}_hf{args.lambda_hf}_dl{args.lambda_delta}"
     )
     out_dir = args.out_dir / f"phase1_{tag}_lr{args.lr}_bs{args.batch_size}_ep{args.epochs}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -271,7 +276,8 @@ def main():
 
     # ---- Model ----
     model = RefineNet(use_state=use_state, use_history_action=use_ha,
-                      use_history_imu=use_hi, use_act_hidden=args.use_act_hidden).to(device)
+                      use_history_imu=use_hi, use_act_hidden=args.use_act_hidden,
+                      use_act_img_attn=args.use_act_img_attn).to(device)
     print(f"[variant] {args.variant}{'+H' if args.use_act_hidden else ''}: "
           f"use_state={use_state} use_hist_action={use_ha} use_hist_imu={use_hi} use_act_hidden={args.use_act_hidden}")
     n_params = model.num_parameters()

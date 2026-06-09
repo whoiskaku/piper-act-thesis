@@ -28,7 +28,8 @@ def best_by_rule(history):
 
 def main():
     runs = [("S0", "phase1_S0_in-act_output_hf0.1_dl0.1_*"),
-            ("S0+H", "phase1_S0+H_in-act_output_hf0.1_dl0.1_*")]
+            ("S0+H", "phase1_S0+H_in-act_output_hf0.1_dl0.1_*"),
+            ("S0+Hattn", "phase1_S0+Hattn_in-act_output_hf0.1_dl0.1_*")]
     print(f"\n{'='*86}")
     print("#63  S0 vs S0+H (ACT encoder 摘要 token)  best-by-rule(hf_ratio↓ & L_BC≤1.1×baseline)")
     print(f"{'='*86}")
