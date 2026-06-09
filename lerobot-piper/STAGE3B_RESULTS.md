@@ -277,6 +277,22 @@ ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲�
 
 ---
 
+## ACT 隐状态作输入 S0 vs S0+H（2026-06-10，#63，受 RLT 启发）
+
+测 hf~0.24/j3 地板是**信息瓶颈**(7维动作丢了感知信息)还是**信号/物理限制**。S0+H = S0 + ACT encoder 输出 mean-pool 摘要(512→32→256 单 token)。frozen ACT 挂 hook 取摘要(`sim/precompute_act_hidden.py`),其余同 #61。
+
+| 变体 | 参数 | hf_ratio | L_BC | \|ΔA\| | j1/j2/j3/grip |
+|---|---|---|---|---|---|
+| S0 | 1.90M | 0.241 | 0.0050 | 0.0021 | 0.30/0.20/0.34/0.11 |
+| S0+H | 1.93M | 0.244 | 0.0051 | 0.0022 | 0.25/0.23/0.31/0.17 |
+
+效应:hf_ratio **+0.003**(无改善)、j3 −0.024(噪声内)。
+
+**结论**:**加 ACT 内部 encoder embedding 不破地板** → hf~0.24/j3 地板**不是信息瓶颈**(7 维动作丢失的感知上下文喂回去也没用)。结合 #61(history/state 也无用)→ **RefineNet chunk 内平滑对输入不敏感**,地板是**信号结构/容量** + 下游控制器(Stage 5)限制。**证明保留极简 S0(仅 ACT_output)正确**(加 embedding 多 1.3% 参数 + 耦合 ACT 内部,零收益)。
+**诚实区分**:这只否定了"ACT embedding 作监督输入"能破地板;RLT 的真正收益在**RL/奖励**部分(优化真机指标),本监督测试未覆盖——留作 Future Work。caveat: 单 seed(0.003 在噪声内);仅测了 encoder mean-pool 摘要(decoder 逐步特征/RLT 式冻结压缩器未试,因 encoder 摘要已无效,按计划不再扩)。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |

@@ -462,10 +462,10 @@ Items explicitly excluded from main thesis but mentioned in §7 of the paper:
 ### 下一步:恢复研究时优先 — ACT 隐状态作 RefineNet 输入（2026-06-10 登记，受 RLT 启发）
 **动机**：RLT(Physical Intelligence 2026, arXiv 2604.23073)与本工作架构同构(冻结基策略+残差精修+锚定),其关键是用**压缩的 VLA embedding(RL token)**作精修上下文,保留 7 维动作瓶颈丢失的感知信息。本工作 #61 发现 hf 卡 ~0.25(j3 尤甚)且 history/state 无用——但**未测 ACT 内部 embedding**。重访 T3 当初故意排除的"ACT 隐状态输入",回答:**hf 地板是信息瓶颈(7维丢了东西)还是信号/物理限制?**
 **最小可行路径(推荐)**:
-- [ ] precompute: frozen ACT 挂 hook 取 **encoder 输出 mean-pool 摘要 (N,512)**(存储极小,过拟合风险最低),存进 H5。ACT 权重不动。
-- [ ] RefineNet 加 `Linear(512→32)` → 1 个 context token(新变体 **S0+H**)。小数据故先轻量压缩,过拟合再上 RLT 式冻结压缩器(重构 loss)。
-- [ ] 训 **S0+H vs S0**(其余同 #61),看 hf_ratio / j3 是否突破地板。
-- [ ] 若 (ii)encoder 摘要 有效, 再试 (i)decoder 逐步特征 (N,100,512) / RLT 式压缩 / 部署接入。
+- [x] precompute: frozen ACT 挂 hook 取 **encoder 输出 mean-pool 摘要 (N,512)**(存储极小,过拟合风险最低),存进 H5。ACT 权重不动。
+- [x] RefineNet 加 `Linear(512→32)` → 1 个 context token(新变体 **S0+H**)。小数据故先轻量压缩,过拟合再上 RLT 式冻结压缩器(重构 loss)。
+- [x] 训 **S0+H vs S0**(其余同 #61),看 hf_ratio / j3 是否突破地板。
+- [x] (结果: encoder 摘要无效, 未扩) 若 (ii)encoder 摘要 有效, 再试 (i)decoder 逐步特征 (N,100,512) / RLT 式压缩 / 部署接入。
 **权衡(需写明)**：放弃 7 维瓶颈的干净解耦(RefineNet 耦合 ACT 内部表示);ACT 仍冻结。部署 wrapper 需加同样 hook。
 **判读**：S0+H 破地板→信息瓶颈(支持 RLT 式设计, 论文正向);未破→地板非 info(支持控制器/容量解释, 强化机制结论)。两种都有价值。
 
