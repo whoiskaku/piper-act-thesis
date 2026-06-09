@@ -47,6 +47,9 @@ class RefineNet(nn.Module):
         use_state: bool = True,
         use_history_action: bool = True,
         use_history_imu: bool = True,
+        use_act_hidden: bool = False,
+        act_hidden_dim: int = 512,
+        act_hidden_bottleneck: int = 32,
     ) -> None:
         super().__init__()
 
@@ -59,6 +62,7 @@ class RefineNet(nn.Module):
         self.use_state = use_state
         self.use_history_action = use_history_action
         self.use_history_imu = use_history_imu
+        self.use_act_hidden = use_act_hidden          # #63: ACT encoder 摘要作 context
 
         # ---- Tokenizers (条件构建) ----
         # A_target: per-step Linear so output alignment is per timestep. (always on)
@@ -81,10 +85,18 @@ class RefineNet(nn.Module):
         if use_state:
             self.state_proj = nn.Linear(state_dim, dim)
             self.pe_state = nn.Embedding(1, dim)
+        if use_act_hidden:
+            # 压缩 ACT encoder 摘要(512)→ 1 个 token(RLT anti-overfit: 先过瓶颈)
+            self.act_hidden_proj = nn.Sequential(
+                nn.Linear(act_hidden_dim, act_hidden_bottleneck),
+                nn.GELU(),
+                nn.Linear(act_hidden_bottleneck, dim),
+            )
+            self.pe_act_hidden = nn.Embedding(1, dim)
 
         # ---- Position + type embeddings ----
         self.pe_a_target = nn.Embedding(chunk_size, dim)
-        self.type_embed  = nn.Embedding(4, dim)  # 0:A_target 1:A_prev 2:I_prev 3:state
+        self.type_embed  = nn.Embedding(5, dim)  # 0:A_target 1:A_prev 2:I_prev 3:state 4:act_hidden
 
         # ---- Transformer ----
         encoder_layer = nn.TransformerEncoderLayer(
@@ -124,6 +136,7 @@ class RefineNet(nn.Module):
         if self.use_history_action: n += self.n_patch_tokens
         if self.use_history_imu:    n += self.n_patch_tokens
         if self.use_state:          n += 1
+        if self.use_act_hidden:     n += 1
         return n
 
     def forward(
@@ -133,6 +146,7 @@ class RefineNet(nn.Module):
         history_imu: torch.Tensor,
         current_state: torch.Tensor,
         history_pad_mask: torch.Tensor | None = None,
+        act_hidden: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -177,6 +191,11 @@ class RefineNet(nn.Module):
             s = self.state_proj(current_state).unsqueeze(1)
             s = s + self.pe_state.weight.unsqueeze(0) + self.type_embed.weight[3]
             toks.append(s)
+            mask_segs.append(torch.zeros(B, 1, dtype=torch.bool, device=device))
+        if self.use_act_hidden:
+            ah = self.act_hidden_proj(act_hidden).unsqueeze(1)        # (B,1,dim)
+            ah = ah + self.pe_act_hidden.weight.unsqueeze(0) + self.type_embed.weight[4]
+            toks.append(ah)
             mask_segs.append(torch.zeros(B, 1, dtype=torch.bool, device=device))
 
         memory_tokens = torch.cat(toks, dim=1)

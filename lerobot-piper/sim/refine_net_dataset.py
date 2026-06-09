@@ -52,6 +52,8 @@ class RefinePhase1Dataset(Dataset):
             self.A_clean = grp["A_clean"][:].astype(np.float32)
             self.ACT_output = grp["ACT_output"][:].astype(np.float32)
             self.A_noisy = grp["A_noisy"][:].astype(np.float32)  # #62 输入信号对照用
+            self.act_hidden_enc = (grp["act_hidden_enc"][:].astype(np.float32)
+                                   if "act_hidden_enc" in grp else None)  # #63 ACT encoder 摘要
             self.history_action = grp["history_action"][:].astype(np.float32)
             self.history_imu = grp["history_imu"][:].astype(np.float32)
             self.history_pad_mask = grp["history_pad_mask"][:].astype(bool)
@@ -71,7 +73,7 @@ class RefinePhase1Dataset(Dataset):
         state = self.start_state_7[i]
         if self.state_mean is not None and self.state_std is not None:
             state = (state - self.state_mean) / (self.state_std + 1e-8)
-        return {
+        out = {
             "ACT_output":       torch.from_numpy(self.ACT_output[i]),
             "A_noisy":          torch.from_numpy(self.A_noisy[i]),
             "history_action":   torch.from_numpy(self.history_action[i]),
@@ -80,6 +82,9 @@ class RefinePhase1Dataset(Dataset):
             "current_state":    torch.from_numpy(state.astype(np.float32)),
             "A_clean":          torch.from_numpy(self.A_clean[i]),
         }
+        if self.act_hidden_enc is not None:
+            out["act_hidden"] = torch.from_numpy(self.act_hidden_enc[i])
+        return out
 
     def compute_state_stats(
         self, min_std: float = 0.01
