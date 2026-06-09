@@ -110,7 +110,8 @@ def jerk_rms(actions: torch.Tensor, dt: float = DT) -> torch.Tensor:
 
 
 # ─── Train / Eval loops ────────────────────────────────────────────
-def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="ACT_output"):
+def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="ACT_output",
+              zero_act_img=False):
     """lambdas = dict(hf=..., delta=..., acc=...)."""
     model.train(train)
     n = 0
@@ -138,6 +139,8 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
                           if "act_hidden" in batch else None)
             act_img = (batch["act_img"].to(device, non_blocking=True)
                        if "act_img" in batch else None)
+            if zero_act_img and act_img is not None:
+                act_img = torch.zeros_like(act_img)        # 零-image 对照: 同架构无真实感知信息
 
             refined, delta = model(
                 act_output, history_action, history_imu, current_state,
@@ -220,6 +223,8 @@ def main():
                     help="#63 加 ACT encoder 摘要作 context token(变体 S0+H)")
     ap.add_argument("--use-act-img-attn", action="store_true",
                     help="#63(a) 对 ACT image tokens 做注意力读出作 context token(变体 S0+Hattn)")
+    ap.add_argument("--zero-act-img", action="store_true",
+                    help="#63(a) 对照: act_img 喂零(同架构无真实感知信息) → 隔离 信息 vs 参数容量")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--h5", type=Path, default=H5_PATH)
     ap.add_argument("--out-dir", type=Path,
@@ -245,8 +250,10 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _hsfx = ('+H' if args.use_act_hidden else '') + ('+Hattn' if args.use_act_img_attn else '')
+    _hsfx += ('+zero' if args.zero_act_img else '')
+    _ssfx = '' if args.seed == 42 else f'_s{args.seed}'   # seed42 保持原 tag(兼容已有目录)
     tag = args.tag or (
-        f"{args.variant}{_hsfx}_in-{args.input_signal}_hf{args.lambda_hf}_dl{args.lambda_delta}"
+        f"{args.variant}{_hsfx}_in-{args.input_signal}_hf{args.lambda_hf}_dl{args.lambda_delta}{_ssfx}"
     )
     out_dir = args.out_dir / f"phase1_{tag}_lr{args.lr}_bs{args.batch_size}_ep{args.epochs}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -317,8 +324,8 @@ def main():
 
     for epoch in range(args.epochs):
         t_ep = time.time()
-        train_stats = run_epoch(model, train_loader, optimizer, lambdas, device, train=True, input_key=input_key)
-        val_stats = run_epoch(model, val_loader, None, lambdas, device, train=False, input_key=input_key)
+        train_stats = run_epoch(model, train_loader, optimizer, lambdas, device, train=True, input_key=input_key, zero_act_img=args.zero_act_img)
+        val_stats = run_epoch(model, val_loader, None, lambdas, device, train=False, input_key=input_key, zero_act_img=args.zero_act_img)
         scheduler.step()
 
         elapsed_ep = time.time() - t_ep

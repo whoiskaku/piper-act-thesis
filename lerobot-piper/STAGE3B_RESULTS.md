@@ -293,6 +293,26 @@ ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲�
 
 ---
 
+## #63(a) RLT 式注意力读出 image token（2026-06-10）—— 纠正 #63 并得正面结果
+
+#63 的 mean-pool 是对全部 **1502** 个 encoder token 平均,其中 **1200 个是 #61 证无用的历史 token** → 感知信息被稀释。改为只对 **300 个 image token 做 learned-query 注意力读出**(RLT 式,`sim/precompute_act_img.py` + `RefineNet.use_act_img_attn`),并加 **零-image 对照 + 多 seed**:
+
+| 变体 | 参数 | seeds | hf_ratio mean[min,max] | j1/j2/j3/grip |
+|---|---|---|---|---|
+| S0 | 1.90M | 3 | 0.249 [0.241,0.256] | 0.24/0.24/0.37/0.12 |
+| **S0+Hattn** | 2.30M | 3 | **0.209 [0.201,0.222]** | **0.17**/0.21/0.30/0.14 |
+| S0+Hattn+zero | 2.30M | 2 | 0.258 [0.251,0.265] | 0.21/0.28/0.36/0.16 |
+
+**结论(纠正 #63)**:
+1. **S0+Hattn 稳定低于 S0,range 不重叠**(0.222<0.241)→ −0.039(~16% 相对)是真效应非噪声。
+2. **零-image 对照(0.258)≈ S0,而非 ≈ S0+Hattn** → 同架构同参数、image 喂零退回基线 → **增益来自 image 信息,非参数容量**。
+3. → **hf 地板(部分)是信息瓶颈**:ACT 的 image/感知特征经 **RLT 式注意力读出**接入确有用;**压缩方式是关键**(mean-pool 被历史稀释→无效;注意力读出 image token→有效)。**正面验证 RLT 设计**;#63 的负结果是"压缩太粗"的伪影。
+4. 增益主要在 **j1(0.24→0.17 砍半)**;j3 仍 0.30–0.37(部分仍受信号结构/控制器限,见 STAGE5)。
+
+**caveat**:仍是 supervised chunk 内指标;真机 IMU 收益仍受控制器瓶颈(Stage 5)封顶——这是**方法层改进**(更好的输入提取),非直接真机 IMU 收益。部署需把 image-token attention readout 接进 wrapper(未做)。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |
