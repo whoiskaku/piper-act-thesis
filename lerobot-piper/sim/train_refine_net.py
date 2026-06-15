@@ -84,6 +84,59 @@ def hf_fraction_loss(actions: torch.Tensor, active=ACTIVE_JOINTS) -> torch.Tenso
     return frac[:, active].mean()
 
 
+def hf_abs_loss(refined: torch.Tensor, ref_signal: torch.Tensor,
+                active=ACTIVE_JOINTS) -> torch.Tensor:
+    """Absolute high-freq loss (2026-06-10) — push refined's >5Hz energy below
+    the *frozen input* (ACT). Denominator = E_high(ref_signal), detached:
+    a FIXED per-(B,joint) reference (the input being refined), NOT refined's own
+    total energy → not the fraction/denominator trap. <1 = genuine absolute
+    smoothing; only this objective can reward Δ that anti-phase-cancels ACT jitter.
+    """
+    Eh_r, _ = hf_power(refined)
+    Eh_a, _ = hf_power(ref_signal)
+    # ratio-of-SUMS (energy-weighted), NOT mean-of-ratios: the latter is dominated
+    # by near-static joints (E_high(ACT)≈0 → ratio blows up) and never touches the
+    # high-energy joints that carry the actual absolute jitter (mean-of-ratios trap).
+    return Eh_r[:, active].sum() / (Eh_a[:, active].sum().detach() + EPS)
+
+
+# FIR high-pass for the uniform-weight absolute loss (hf_mode=absfir).
+# The Hann window in hf_power has ~0 weight at chunk edges — the abs-trained
+# model learned to DUMP high-freq garbage there (t[0:5] 9×, t[95:100] 1.8×)
+# while genuinely smoothing the core. A linear-phase FIR applied along time
+# weights every step equally → no blind spot to game.
+from scipy.signal import firwin as _firwin
+_FIR_TAPS = torch.from_numpy(
+    _firwin(31, HF_CUTOFF / (FPS / 2.0), pass_zero=False).astype(np.float32))
+
+
+def _fir_highpass(x: torch.Tensor) -> torch.Tensor:
+    """x (B,T,A) → 5Hz FIR high-passed along T, same length.
+
+    AC-remove + reflect padding: zero-padding on the raw (~0.5 rad) signal
+    creates a boundary transient ~5 orders of magnitude above real jitter —
+    the loss then only "sees" that artifact (and drags chunk edges toward 0,
+    destroying L1, as the first absfir/absboth runs did).
+    """
+    B, T, A = x.shape
+    k = _FIR_TAPS.to(x.device, x.dtype)
+    x = x - x.mean(dim=1, keepdim=True)
+    xt = x.permute(0, 2, 1).reshape(B * A, 1, T)
+    pad = k.numel() // 2
+    xt = torch.nn.functional.pad(xt, (pad, pad), mode="reflect")
+    y = torch.nn.functional.conv1d(xt, k.view(1, 1, -1))
+    return y.reshape(B, A, T).permute(0, 2, 1)
+
+
+def hf_absfir_loss(refined: torch.Tensor, ref_signal: torch.Tensor,
+                   active=ACTIVE_JOINTS) -> torch.Tensor:
+    """Uniform-weight absolute high-freq loss: FIR-highpass energy of refined
+    over that of the frozen input (detached), ratio-of-sums."""
+    Er = _fir_highpass(refined)[:, :, active].pow(2).sum()
+    Ea = _fir_highpass(ref_signal)[:, :, active].pow(2).sum().detach()
+    return Er / (Ea + EPS)
+
+
 # ─── Time-domain regularizers ──────────────────────────────────────
 def l_delta_term(delta: torch.Tensor) -> torch.Tensor:
     """Residual-shrinkage / trust-region: mean |ΔA|."""
@@ -111,8 +164,8 @@ def jerk_rms(actions: torch.Tensor, dt: float = DT) -> torch.Tensor:
 
 # ─── Train / Eval loops ────────────────────────────────────────────
 def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="ACT_output",
-              zero_act_img=False):
-    """lambdas = dict(hf=..., delta=..., acc=...)."""
+              zero_act_img=False, hf_mode="fraction"):
+    """lambdas = dict(hf=..., delta=..., acc=...). hf_mode: fraction|abs."""
     model.train(train)
     n = 0
     acc = dict(  # running sums (× batch size)
@@ -124,6 +177,10 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
     hf_ref = np.zeros(len(ACTIVE_JOINTS))
     hf_act = np.zeros(len(ACTIVE_JOINTS))
     hf_cln = np.zeros(len(ACTIVE_JOINTS))
+    # absolute high-freq energy sums (active joints) → energy-weighted abs ratio
+    eh_ref_sum = 0.0; eh_act_sum = 0.0
+    # FIR (uniform-weight) absolute energy sums — no Hann edge blind spot
+    fir_ref_sum = 0.0; fir_act_sum = 0.0
 
     grad_context = torch.enable_grad() if train else torch.no_grad()
     with grad_context:
@@ -148,7 +205,17 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
             )
 
             l_bc = nn.functional.l1_loss(refined, A_clean)
-            l_hf = hf_fraction_loss(refined)
+            if hf_mode == "abs":
+                l_hf = hf_abs_loss(refined, act_output)
+            elif hf_mode == "absfir":
+                l_hf = hf_absfir_loss(refined, act_output)
+            elif hf_mode == "absboth":
+                # Hann-FFT(频率尖锐/边缘盲) + FIR(时间均匀/过渡带软) 盲区互补,
+                # 模型无法把高频垃圾倒进任一盲区
+                l_hf = 0.5 * (hf_abs_loss(refined, act_output)
+                              + hf_absfir_loss(refined, act_output))
+            else:
+                l_hf = hf_fraction_loss(refined)
             l_dl = l_delta_term(delta)
             l_ac = l_acc_term(refined)
             loss = (l_bc
@@ -175,6 +242,11 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
                 fr = hf_fraction_per_joint(refined).mean(dim=0).cpu().numpy()
                 fa = hf_fraction_per_joint(act_output).mean(dim=0).cpu().numpy()
                 fc = hf_fraction_per_joint(A_clean).mean(dim=0).cpu().numpy()
+                eh_r, _ = hf_power(refined); eh_a, _ = hf_power(act_output)
+                eh_ref_sum += eh_r[:, ACTIVE_JOINTS].sum().item()
+                eh_act_sum += eh_a[:, ACTIVE_JOINTS].sum().item()
+                fir_ref_sum += _fir_highpass(refined)[:, :, ACTIVE_JOINTS].pow(2).sum().item()
+                fir_act_sum += _fir_highpass(act_output)[:, :, ACTIVE_JOINTS].pow(2).sum().item()
             hf_ref += fr[ACTIVE_JOINTS] * B
             hf_act += fa[ACTIVE_JOINTS] * B
             hf_cln += fc[ACTIVE_JOINTS] * B
@@ -187,7 +259,10 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
     out["hf_refined"] = float((hf_ref / n).mean())   # headline metric
     out["hf_act"]     = float((hf_act / n).mean())
     out["hf_clean"]   = float((hf_cln / n).mean())
-    out["hf_ratio"]   = out["hf_refined"] / (out["hf_act"] + EPS)  # primary criterion
+    out["hf_ratio"]   = out["hf_refined"] / (out["hf_act"] + EPS)  # primary criterion (fraction)
+    out["abs_hf_ratio"] = eh_ref_sum / (eh_act_sum + EPS)          # absolute high-freq (energy-weighted); <1 = real smoothing
+    out["absfir_hf_ratio"] = fir_ref_sum / (fir_act_sum + EPS)     # FIR uniform-weight absolute; immune to Hann edge gaming
+    out["absmax_ratio"] = max(out["abs_hf_ratio"], out["absfir_hf_ratio"])  # worst-case of the two (anti-gaming selection)
     return out
 
 
@@ -201,6 +276,9 @@ def grade(ratio: float) -> str:
 # ─── Main ──────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--hf-mode", choices=["fraction", "abs", "absfir", "absboth"], default="fraction",
+                    help="fraction=招牌(E_hi/E_tot stopgrad); abs=绝对(Hann-FFT, 有边缘盲区); "
+                         "absfir=绝对(FIR 均匀权重, 无边缘盲区可倒垃圾)")
     ap.add_argument("--lambda-hf", type=float, default=0.0,
                     help="weight on active-joint hf_fraction loss (main smoothness term)")
     ap.add_argument("--lambda-delta", type=float, default=0.0,
@@ -251,6 +329,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _hsfx = ('+H' if args.use_act_hidden else '') + ('+Hattn' if args.use_act_img_attn else '')
     _hsfx += ('+zero' if args.zero_act_img else '')
+    _hsfx += {'abs': '+abs', 'absfir': '+absfir', 'absboth': '+absboth'}.get(args.hf_mode, '')
     _ssfx = '' if args.seed == 42 else f'_s{args.seed}'   # seed42 保持原 tag(兼容已有目录)
     tag = args.tag or (
         f"{args.variant}{_hsfx}_in-{args.input_signal}_hf{args.lambda_hf}_dl{args.lambda_delta}{_ssfx}"
@@ -306,6 +385,7 @@ def main():
     # ---- Save run config ----
     cfg_dump = {
         "lambda_hf": args.lambda_hf, "lambda_delta": args.lambda_delta,
+        "hf_mode": args.hf_mode,
         "lambda_acc": args.lambda_acc, "epochs": args.epochs,
         "batch_size": args.batch_size, "lr": args.lr,
         "weight_decay": args.weight_decay, "seed": args.seed,
@@ -318,14 +398,17 @@ def main():
     # ---- Training loop ----
     history = []
     # Model-selection criterion: lowest hf_ratio subject to BC guardrail.
-    # (val loss is dominated by λ choices, so select on the headline metric.)
+    # hf_mode=abs selects on abs_hf_ratio (the real absolute-smoothing objective);
+    # fraction keeps the legacy headline metric. (val loss dominated by λ choice.)
+    sel_key = {"abs": "abs_hf_ratio", "absfir": "absfir_hf_ratio",
+               "absboth": "absmax_ratio"}.get(args.hf_mode, "hf_ratio")
     best_hf_ratio = float("inf")
     t_start = time.time()
 
     for epoch in range(args.epochs):
         t_ep = time.time()
-        train_stats = run_epoch(model, train_loader, optimizer, lambdas, device, train=True, input_key=input_key, zero_act_img=args.zero_act_img)
-        val_stats = run_epoch(model, val_loader, None, lambdas, device, train=False, input_key=input_key, zero_act_img=args.zero_act_img)
+        train_stats = run_epoch(model, train_loader, optimizer, lambdas, device, train=True, input_key=input_key, zero_act_img=args.zero_act_img, hf_mode=args.hf_mode)
+        val_stats = run_epoch(model, val_loader, None, lambdas, device, train=False, input_key=input_key, zero_act_img=args.zero_act_img, hf_mode=args.hf_mode)
         scheduler.step()
 
         elapsed_ep = time.time() - t_ep
@@ -343,13 +426,14 @@ def main():
                   f"hf_ref={val_stats['hf_refined']:.4f} hf_act={val_stats['hf_act']:.4f} "
                   f"hf_cln={val_stats['hf_clean']:.4f}  "
                   f"ratio={val_stats['hf_ratio']:.3f} [{grade(val_stats['hf_ratio'])}]  "
+                  f"abs={val_stats['abs_hf_ratio']:.3f} fir={val_stats['absfir_hf_ratio']:.3f}  "
                   f"[{elapsed_ep:.1f}s, tot {elapsed_total/60:.1f}m]")
 
         # Save best ckpt by headline metric, with BC guardrail
         # (refined BC must not exceed the ACT-baseline BC by more than 10%).
         bc_ok = val_stats["l_bc"] <= 1.1 * val_stats["l_bc_act"]
-        if bc_ok and val_stats["hf_ratio"] < best_hf_ratio:
-            best_hf_ratio = val_stats["hf_ratio"]
+        if bc_ok and val_stats[sel_key] < best_hf_ratio:
+            best_hf_ratio = val_stats[sel_key]
             torch.save({
                 "epoch": epoch, "model_state": model.state_dict(),
                 "state_mean": state_mean, "state_std": state_std,

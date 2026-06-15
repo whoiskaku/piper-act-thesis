@@ -54,7 +54,8 @@ class RefinePhase1Dataset(Dataset):
             self.A_noisy = grp["A_noisy"][:].astype(np.float32)  # #62 输入信号对照用
             self.act_hidden_enc = (grp["act_hidden_enc"][:].astype(np.float32)
                                    if "act_hidden_enc" in grp else None)  # #63 ACT encoder 摘要
-            self.act_img_tokens = (grp["act_img_tokens"][:].astype(np.float32)
+            # 保持 fp16(磁盘原格式)省一半内存; RefineNet forward 里 img_proj(act_img.float()) 自行转换
+            self.act_img_tokens = (grp["act_img_tokens"][:]
                                    if "act_img_tokens" in grp else None)  # #63(a) ACT image tokens
             self.history_action = grp["history_action"][:].astype(np.float32)
             self.history_imu = grp["history_imu"][:].astype(np.float32)
