@@ -257,17 +257,21 @@ def record(
     # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, cfg.device, ds_meta=dataset.meta)
 
-    # Stage 5 RefineNet 部署(默认关，env 门控)：设 REFINE_CKPT=<ckpt.pt> 即在 ACT 之后
-    # 接入 RefineNet 残差精修 + 边界 blend(B 条件)；不设则纯 ACT(A 条件)。
-    # 包装后 .config 仍指向 ACT，故下方 HistoryBuffer 构建不受影响。
+    # Stage 5 RefineNet 部署(默认关,env 门控)。三方 A/B 协议(blend/残差已解耦):
+    #   A 裸 ACT:     不设 REFINE_CKPT(或 REFINE_MODE=off)
+    #   B 纯 blend:   REFINE_CKPT=<ckpt> REFINE_MODE=blend
+    #   C blend+残差: REFINE_CKPT=<ckpt> REFINE_MODE=full   (用 absboth ckpt)
+    # 包装后 .config 仍指向 ACT,故下方 HistoryBuffer 构建不受影响。
     _refine_ckpt = os.environ.get("REFINE_CKPT")
     if policy is not None and _refine_ckpt:
         from lerobot.common.policies.act.refine_deploy import build_refine_deploy_policy
-        _enabled = os.environ.get("REFINE_ENABLED", "1") != "0"
+        _mode = os.environ.get("REFINE_MODE", "full")
+        if os.environ.get("REFINE_ENABLED") == "0":   # 兼容旧开关
+            _mode = "off"
         policy = build_refine_deploy_policy(policy, _refine_ckpt, cfg.device,
                                             blend_m=int(os.environ.get("REFINE_BLEND_M", "10")),
-                                            refine_enabled=_enabled)
-        logging.info(f"RefineNet deploy wrapper active (enabled={_enabled}, ckpt={_refine_ckpt})")
+                                            mode=_mode)
+        logging.info(f"RefineNet deploy wrapper active (mode={_mode}, ckpt={_refine_ckpt})")
 
     # Build a HistoryBuffer when the loaded policy was trained with autoregressive
     # history inputs. The buffer survives across episodes and is the runtime mirror

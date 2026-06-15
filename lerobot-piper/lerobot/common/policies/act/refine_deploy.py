@@ -1,27 +1,34 @@
-"""Stage 5 — RefineNet 真机部署 wrapper（ACT → RefineNet → 边界 blend）。
+"""Stage 5 — RefineNet 真机部署 wrapper(ACT → [残差精修] → [边界 blend])。
 
-把已加载的 frozen ACTPolicy 包一层：在 ACT 生成动作 chunk 的时刻插入 RefineNet 残差
-精修 + chunk 边界续接 blend，再按 receding-horizon 逐步下发。接口与 ACTPolicy 一致
-（select_action / reset / .config），可直接 drop-in 进 control_robot 的 record loop。
+把已加载的 frozen ACTPolicy 包一层,在 chunk 生成时刻插入两个 **独立开关** 的步骤:
+  - residual_enabled: RefineNet 残差精修(学到的 Δ)
+  - blend_enabled:    chunk 边界续接 blend(确定性,无需学习)
+接口与 ACTPolicy 一致(select_action / reset / .config),drop-in 进 control_robot。
 
-集成（control_robot 里 policy 加载之后，一行包起来）：
+⚠️ 设计修正(2026-06-11):旧版用单一 refine_enabled 同时开关 blend+残差,导致
+Stage 5 真机 A/B 把两者的贡献混在一起(部署分解证明旧 fraction 残差实为有害、
+收益全来自 blend)。现解耦,支持真机三方 A/B:
+    A 裸 ACT:        REFINE_MODE=off   (或不设 REFINE_CKPT)
+    B 纯 blend:      REFINE_MODE=blend
+    C blend+残差:    REFINE_MODE=full  (用 #64/#65 的 absboth ckpt!)
+    (诊断用: REFINE_MODE=residual 仅残差无 blend)
+
+架构按 ckpt['args'] 自动复原(variant=S0 等; use_act_img_attn 时在 frozen ACT 的
+transformer encoder 上挂 hook,部署时取 image tokens 喂 RefineNet 注意力读出,
+与 sim/precompute_act_img.py 的 offset 逻辑一致)。
+
+集成(control_robot 里 policy 加载之后):
     from lerobot.common.policies.act.refine_deploy import build_refine_deploy_policy
-    policy = build_refine_deploy_policy(
-        policy,                                   # 已加载的 frozen ACTPolicy
-        refine_ckpt="outputs/train/refine_net/phase1_runB_hf0.10_dl0.1_lr0.0003_bs64_ep200/ckpt_best.pt",
-        device=device, refine_enabled=True)       # A/B: True=ACT+RefineNet, False=纯ACT
+    policy = build_refine_deploy_policy(policy, refine_ckpt=..., device=...,
+                                        mode="full", blend_m=10)
 
-A/B 协议（Stage 5 第一实验）：
-    A(baseline): refine_enabled=False（= 纯 ACT，等价不包 wrapper）
-    B(method):   refine_enabled=True
-    两者各录若干 episode → eval_smoothness_realrobot.py 比真机 IMU hf/RMS。
+复用部署侧 history:control_utils 已把 observation.history_action/history_imu/
+history_pad_mask 注入 observation,RefineNet 直接取用。唯一需转换的是
+current_state(obs.state mdeg → rad → z-score)。
 
-复用部署侧 history：control_utils 已把 observation.history_action/history_imu/
-history_pad_mask 注入 observation（history_buffer），RefineNet 直接取用，与训练分布一致。
-唯一需转换的是 current_state（obs.state 单位假设为 dataset 的 mdeg → 转 rad 再 z-score）。
-
-⚠️ 真机首跑务必核对：(1) obs.state 单位确为 mdeg；(2) 打印的 z-scored state 量级正常
-（|z|≲5）；(3) RefineNet ckpt 的 state_mean/std 与本任务一致。否则 current_state 会喂错。
+⚠️ 真机首跑务必核对:(1) obs.state 单位确为 mdeg;(2) 打印的 z-scored state 量级
+正常(|z|≲5);(3) ckpt 的 state_mean/std 与本任务一致;(4) Hattn ckpt 时启动日志
+有 "act_img hook" 行且 n_img=300。
 """
 from __future__ import annotations
 
@@ -33,17 +40,23 @@ import torch
 
 from lerobot.common.policies.act.refine_net import RefineNet
 
-# 与 sim/replay_demo_validation 一致的状态单位换算（训练 current_state 用 rad）。
+# 与 sim/replay_demo_validation 一致的状态单位换算(训练 current_state 用 rad)。
 _MDEG_TO_RAD = math.pi / 180.0 / 1000.0
 _GRIPPER_SCALE = 1.0 / 800000.0
 _ACTIVE_JOINTS = (0, 1, 2, 6)
 
+_VARIANTS = {"S0": (False, False, False), "S1": (False, True, True),
+             "S2": (True, True, False), "S3": (True, False, False),
+             "full": (True, True, True)}
+
 
 class RefineNetDeployWrapper:
-    """Drop-in policy: frozen ACT + RefineNet residual + boundary blend。"""
+    """Drop-in policy: frozen ACT + [RefineNet residual] + [boundary blend]。"""
 
     def __init__(self, act_policy, refine_model, state_mean, state_std,
-                 device, blend_m: int = 10, refine_enabled: bool = True,
+                 device, blend_m: int = 10,
+                 residual_enabled: bool = True, blend_enabled: bool = True,
+                 use_act_img: bool = False,
                  state_is_mdeg: bool = True, verbose: bool = True):
         self.act = act_policy
         self.refine = refine_model.eval()
@@ -52,7 +65,8 @@ class RefineNetDeployWrapper:
         self.state_mean = torch.as_tensor(state_mean, dtype=torch.float32, device=self.device)
         self.state_std = torch.as_tensor(state_std, dtype=torch.float32, device=self.device)
         self.blend_m = blend_m
-        self.refine_enabled = refine_enabled
+        self.residual_enabled = residual_enabled
+        self.blend_enabled = blend_enabled
         self.state_is_mdeg = state_is_mdeg
         self.verbose = verbose
         self.n_action_steps = act_policy.config.n_action_steps
@@ -60,9 +74,30 @@ class RefineNetDeployWrapper:
         self._last_action = None                   # 上一步下发的动作(用于边界 blend)
         self._warned_state = False
 
+        # ---- Hattn: 挂 ACT encoder hook 取 image tokens(同 precompute_act_img) ----
+        self.use_act_img = use_act_img
+        self._enc_cap = {}
+        self._img_offset = None
+        if use_act_img:
+            p = act_policy.config
+            n_prefix = 1
+            n_prefix += int(getattr(p, "robot_state_feature", None) is not None)
+            n_prefix += int(getattr(p, "env_state_feature", None) is not None)
+            n_prefix += int(getattr(p, "enable_imu_input", False)
+                            and getattr(p, "imu_feature", None) is not None)
+            hL = getattr(p, "history_max_length", 0)
+            n_hist = ((hL if getattr(p, "history_use_action", False) else 0)
+                      + (hL if getattr(p, "history_use_imu", False) else 0))
+            self._img_offset = n_prefix + n_hist
+            act_policy.model.encoder.register_forward_hook(
+                lambda m, i, o: self._enc_cap.__setitem__("e", o))
+            if verbose:
+                print(f"[refine_deploy] act_img hook installed "
+                      f"(n_prefix={n_prefix} n_hist={n_hist} → image tokens 从 {self._img_offset} 起)")
+
     def __getattr__(self, name):
         """未定义的属性/方法委托给内部 frozen ACTPolicy
-        (如 normalize_targets / normalize_inputs / unnormalize_outputs，
+        (如 normalize_targets / normalize_inputs / unnormalize_outputs,
         供 HistoryBuffer / control_robot 等沿用 ACT 接口)。"""
         act = self.__dict__.get("act")
         if act is None:
@@ -106,13 +141,13 @@ class RefineNetDeployWrapper:
         return z
 
     # ---- 在线边界 blend: 新 chunk 前 m 步从上一动作续接 ----
-    def _blend(self, refined):
+    def _blend(self, chunk):
         if self._last_action is None:
-            return refined
-        r = refined.clone()
-        offset = self._last_action.to(refined.device) - refined[:, 0]    # (1,7)
-        for i in range(min(self.blend_m, refined.shape[1])):
-            r[:, i] = refined[:, i] + offset * (1.0 - i / self.blend_m)
+            return chunk
+        r = chunk.clone()
+        offset = self._last_action.to(chunk.device) - chunk[:, 0]    # (1,7)
+        for i in range(min(self.blend_m, chunk.shape[1])):
+            r[:, i] = chunk[:, i] + offset * (1.0 - i / self.blend_m)
         return r
 
     @torch.no_grad()
@@ -126,36 +161,62 @@ class RefineNetDeployWrapper:
                     [b[k] for k in self.act.config.image_features], dim=-4)
             act_chunk = self.act.model(b)[0][:, : self.n_action_steps]    # (1,T,7) normalized
             act_chunk = self.act.unnormalize_outputs({"action": act_chunk})["action"]  # raw
+            chunk = act_chunk
 
-            if self.refine_enabled and "observation.history_action" in batch:
+            # 2) 残差精修(独立开关)
+            if self.residual_enabled and "observation.history_action" in batch:
                 ha = batch["observation.history_action"].to(self.device).float()
                 hi = batch["observation.history_imu"].to(self.device).float()
                 hp = batch.get("history_pad_mask")
                 hp = hp.to(self.device) if hp is not None else None
                 state = self._current_state(batch)
-                refined, _ = self.refine(act_chunk.to(self.device), ha, hi, state,
-                                         history_pad_mask=hp)
-                refined = self._blend(refined)
-            else:
-                refined = act_chunk
+                act_img = None
+                if self.use_act_img:
+                    enc = self._enc_cap.get("e")
+                    assert enc is not None, "act_img hook 未捕获 encoder 输出"
+                    act_img = enc[self._img_offset:].permute(1, 0, 2)    # (1, n_img, 512)
+                chunk, _ = self.refine(chunk.to(self.device), ha, hi, state,
+                                       history_pad_mask=hp, act_img=act_img)
 
-            self._queue.extend(refined.transpose(0, 1))
+            # 3) 边界 blend(独立开关)
+            if self.blend_enabled:
+                chunk = self._blend(chunk)
+
+            self._queue.extend(chunk.transpose(0, 1))
         a = self._queue.popleft()
         self._last_action = a.detach()
         return a
 
 
 def build_refine_deploy_policy(act_policy, refine_ckpt, device,
-                               blend_m: int = 10, refine_enabled: bool = True,
+                               blend_m: int = 10, mode: str = "full",
                                state_is_mdeg: bool = True):
-    """加载 RefineNet ckpt 并包住已加载的 frozen ACTPolicy。"""
+    """加载 RefineNet ckpt(架构按 ckpt['args'] 复原)并包住 frozen ACTPolicy。
+
+    mode: off=裸ACT直通 | blend=纯边界blend | residual=仅残差 | full=残差+blend
+    """
+    assert mode in ("off", "blend", "residual", "full"), f"未知 mode: {mode}"
     ckpt = torch.load(Path(refine_ckpt), map_location=device, weights_only=False)
-    refine = RefineNet().to(device)
-    refine.load_state_dict(ckpt["model_state"])
+    targs = ckpt.get("args", {}) or {}
+    use_state, use_ha, use_hi = _VARIANTS.get(targs.get("variant", "full"), (True, True, True))
+    use_img = bool(targs.get("use_act_img_attn", False))
+    refine = RefineNet(use_state=use_state, use_history_action=use_ha,
+                       use_history_imu=use_hi,
+                       use_act_hidden=bool(targs.get("use_act_hidden", False)),
+                       use_act_img_attn=use_img).to(device)
+    sd = ckpt["model_state"]
+    te = sd.get("type_embed.weight")
+    if te is not None and te.shape[0] < refine.type_embed.weight.shape[0]:
+        sd["type_embed.weight"] = torch.cat(
+            [te, refine.type_embed.weight.data[te.shape[0]:].clone()], 0)
+    refine.load_state_dict(sd)
     refine.eval()
-    print(f"[refine_deploy] RefineNet ckpt ep{ckpt.get('epoch')} loaded; "
-          f"refine_enabled={refine_enabled} blend_m={blend_m}")
+    print(f"[refine_deploy] ckpt ep{ckpt.get('epoch')} "
+          f"variant={targs.get('variant', 'full(legacy)')} hf_mode={targs.get('hf_mode', 'fraction')} "
+          f"img_attn={use_img} | mode={mode} blend_m={blend_m}")
     return RefineNetDeployWrapper(
         act_policy, refine, ckpt["state_mean"], ckpt["state_std"],
-        device=device, blend_m=blend_m, refine_enabled=refine_enabled,
-        state_is_mdeg=state_is_mdeg)
+        device=device, blend_m=blend_m,
+        residual_enabled=mode in ("residual", "full"),
+        blend_enabled=mode in ("blend", "full"),
+        use_act_img=use_img, state_is_mdeg=state_is_mdeg)

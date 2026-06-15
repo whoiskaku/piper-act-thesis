@@ -179,6 +179,15 @@ def blend_boundaries(traj_7, chunk: int = CHUNK, m: int = 10) -> np.ndarray:
 
 # ─── main ──────────────────────────────────────────────────────────
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--refine-ckpt", type=Path, default=REFINE_CKPT,
+                    help="RefineNet ckpt; 架构 flags 从 ckpt['args'] 复原(variant/S0 等)")
+    ap.add_argument("--out-tag", type=str, default="",
+                    help="输出 json 后缀: deploy_eval{tag}.json (避免覆盖)")
+    cli = ap.parse_args()
+    refine_ckpt_path = cli.refine_ckpt
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[device] {DEVICE}")
     print(f"[load] ACT  {C1_CKPT.parent.parent.name}")
@@ -187,19 +196,34 @@ def main():
     ep_from = dataset.episode_data_index["from"].numpy()
     ep_to = dataset.episode_data_index["to"].numpy()
 
-    print(f"[load] RefineNet {REFINE_CKPT.parent.name}")
-    ckpt = torch.load(REFINE_CKPT, map_location=DEVICE, weights_only=False)
-    refine = RefineNet().to(DEVICE).eval()
-    refine.load_state_dict(ckpt["model_state"])
+    print(f"[load] RefineNet {refine_ckpt_path.parent.name}")
+    ckpt = torch.load(refine_ckpt_path, map_location=DEVICE, weights_only=False)
+    # 按训练时 args 复原架构(S0 等变体关掉 state/history 分支); 旧 ckpt 无 args → full 默认
+    _VARIANTS = {"S0": (False, False, False), "S1": (False, True, True),
+                 "S2": (True, True, False), "S3": (True, False, False),
+                 "full": (True, True, True)}
+    targs = ckpt.get("args", {}) or {}
+    use_state, use_ha, use_hi = _VARIANTS.get(targs.get("variant", "full"), (True, True, True))
+    refine = RefineNet(use_state=use_state, use_history_action=use_ha, use_history_imu=use_hi,
+                       use_act_hidden=targs.get("use_act_hidden", False),
+                       use_act_img_attn=targs.get("use_act_img_attn", False)).to(DEVICE).eval()
+    print(f"  arch: variant={targs.get('variant','full(legacy)')} hf_mode={targs.get('hf_mode','fraction')}")
+    _sd = ckpt["model_state"]; _te = _sd["type_embed.weight"]   # 旧 ckpt type_embed (4,256) → 补到 (5,256)
+    if _te.shape[0] < refine.type_embed.weight.shape[0]:
+        _sd["type_embed.weight"] = torch.cat(
+            [_te, refine.type_embed.weight.data[_te.shape[0]:].clone()], 0)
+    refine.load_state_dict(_sd)
     smean = np.asarray(ckpt["state_mean"], dtype=np.float32)
     sstd = np.asarray(ckpt["state_std"], dtype=np.float32)
     print(f"  loaded ckpt epoch {ckpt['epoch']}  "
-          f"(train val hf_ratio={ckpt['val_stats']['hf_ratio']:.3f})")
+          f"(train val hf_ratio={ckpt['val_stats']['hf_ratio']:.3f} "
+          f"abs={ckpt['val_stats'].get('abs_hf_ratio', float('nan')):.3f})")
 
     sim = NoisyPiperSim(MODEL_XML, NOISE_PARAMS, seed=SIM_SEED)
 
     # accumulators: condition -> list of per-episode (hf_cmd, hf_exec, bnd, fid)
-    conds = ["demo", "ACT", "refined_real", "refined_cl", "blend5", "blend10", "blend20"]
+    # ACT_blend10 = 纯边界blend作用在裸ACT(无残差) → 隔离 blend vs residual (2026-06-10)
+    conds = ["demo", "ACT", "ACT_blend10", "refined_real", "refined_cl", "blend5", "blend10", "blend20"]
     keys = ["hf_aln", "hp_rms_cmd", "hp_rms_exec", "hf_rms_cmd", "bnd", "fid"]
     agg = {c: {k: [] for k in keys} for c in conds}
 
@@ -264,9 +288,11 @@ def main():
         traj_b5 = blend_boundaries(traj_rr, m=5)
         traj_b10 = blend_boundaries(traj_rr, m=10)
         traj_b20 = blend_boundaries(traj_rr, m=20)
+        traj_ab10 = blend_boundaries(traj_act, m=10)   # blend on bare ACT (no residual)
 
         # ---- execute all conditions through sim (executed hf) ----
         exec_act, _ = execute_traj(sim, qpos0_8, traj_act)
+        exec_ab10, _ = execute_traj(sim, qpos0_8, traj_ab10)
         exec_rr, _ = execute_traj(sim, qpos0_8, traj_rr)
         exec_cl, _ = execute_traj(sim, qpos0_8, traj_cl)
         exec_b5, _ = execute_traj(sim, qpos0_8, traj_b5)
@@ -276,6 +302,7 @@ def main():
 
         for c, cmd, ex in [("demo", demo_7, exec_demo),
                            ("ACT", traj_act, exec_act),
+                           ("ACT_blend10", traj_ab10, exec_ab10),
                            ("refined_real", traj_rr, exec_rr),
                            ("refined_cl", traj_cl, exec_cl),
                            ("blend5", traj_b5, exec_b5),
@@ -330,11 +357,27 @@ def main():
     for c in conds:
         print(f"  {c:>13}: " + " ".join(f"{x:.5f}" for x in mean_joints(c, "hp_rms_cmd")))
 
-    (OUT_DIR / "deploy_eval.json").write_text(json.dumps({
-        "refine_ckpt": str(REFINE_CKPT), "refine_epoch": int(ckpt["epoch"]),
+    # ---- blend vs residual 分解 (2026-06-10 边界-blend 假设验证) ----
+    print(f"\n{'='*96}")
+    print("边界-blend 假设验证: deploy-stream 绝对 hp_rms_cmd 的下降归 blend 还是 residual?")
+    print(f"{'='*96}")
+    A = report["ACT"]["hp_rms_cmd_mean"]
+    Ab = report["ACT_blend10"]["hp_rms_cmd_mean"]
+    R = report["refined_real"]["hp_rms_cmd_mean"]
+    Rb = report["blend10"]["hp_rms_cmd_mean"]
+    print(f"  裸 ACT                      = {A:.5f}  (1.000)")
+    print(f"  ACT + 纯blend(无残差)       = {Ab:.5f}  ({Ab/A:.3f})   ← blend 单独贡献 {100*(A-Ab)/A:.0f}%")
+    print(f"  ACT + 残差(refined,无blend) = {R:.5f}  ({R/A:.3f})   ← 残差单独贡献 {100*(A-R)/A:.0f}%")
+    print(f"  ACT + 残差 + blend          = {Rb:.5f}  ({Rb/A:.3f})   ← 合计 {100*(A-Rb)/A:.0f}%")
+    print(f"  → 若 blend≈合计、残差≈0 → 真机平滑主要来自边界blend(支持假设)")
+    print(f"  → 若残差贡献显著 → chunk内精修在deploy流上仍有用(部分反驳)")
+
+    out_json = OUT_DIR / f"deploy_eval{cli.out_tag}.json"
+    out_json.write_text(json.dumps({
+        "refine_ckpt": str(refine_ckpt_path), "refine_epoch": int(ckpt["epoch"]),
         "val_eps": VAL_EPS, "report": report,
     }, indent=2))
-    print(f"\n[done] saved {OUT_DIR/'deploy_eval.json'}")
+    print(f"\n[done] saved {out_json}")
 
 
 if __name__ == "__main__":
