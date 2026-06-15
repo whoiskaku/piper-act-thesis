@@ -313,6 +313,176 @@ ACT 观测 teacher-force 真机 episode（sim 无物体→ACT 不能跑 sim 渲�
 
 ---
 
+## ⚠️ 重大 caveat — 招牌 hf_ratio 是 fraction,不等于绝对平滑(2026-06-10 发现)
+
+应"画 ACT vs refined 输出对比图"的需求,逐样本核对时发现的**口径问题,影响 Stage 3b 全部 hf_ratio 数字的解读**:
+
+**`hf_ratio`(训练损失 `hf_fraction_loss` + 模型选择 + 上文所有表格)用的是 fraction = E_high/E_total(>5Hz 能量*占比*,Hann-FFT,`train_refine_net.py:70-84,190`),不是绝对高频量。** 这与方法描述里宣称的"以 5Hz Butterworth 高通后 hp_rms 作权威绝对指标"**不一致**——实际跑的全程是 fraction。
+
+全 val(240, active joints)三度量对照(S0 best ckpt):
+
+| 度量 | ACT | S0 | S0+Hattn | refined/ACT |
+|---|---|---|---|---|
+| fraction(招牌口径) | 0.0322 | 0.0077 | 0.0066 | **0.24× / 0.20×** |
+| 绝对 E_high(Hann-FFT,能量加权) | 6.0e-3 | 6.4e-3 | 6.0e-3 | **1.07× / 1.00×** |
+| 绝对 hp_rms(filtfilt 5Hz, rad) | 0.00122 | 0.00131 | 0.00128 | **1.08× / 1.05×** |
+
+**结论:在 sim 开环 chunk 内,RefineNet 并不降低绝对高频抖动(两个独立绝对度量一致 ~1.05–1.08×,甚至略升)。** 模型输出本身正常(std≈ACT、各关节 E_total refined/ACT=0.98–1.00、\|Δ\|仅 0.0036 rad、L1(refined,clean)<L1(ACT,clean)),Δ 把 chunk 整体往 clean 拉但**没有专门抵消高频**。
+
+机制(高/低运动分组证实):fraction 改善是 **mean-of-ratios** 在**低运动 chunk**(fraction 高、绝对值微小)上撑出来的;主导绝对抖动的**高运动 chunk 上 refined≈ACT(E_high ratio 1.08,不降)**。即 `hf_ratio` 踩进了本仓库一直警告的**"分母陷阱"**。
+
+**与真机 Stage 5 "-40%" 的关系(假设,未证)**:真机指令 action hp 绝对值确实降了,但 sim 开环 chunk 内不降 → 真机收益最可能来自**部署时 chunk 边界 blend + temporal ensembling(跨 chunk 连续性)**,而非学到的 chunk 内残差。需"纯边界 blend vs RefineNet 残差"对照证实。**在证实前,不应把真机平滑全归功于 RefineNet 残差。**
+
+**待办(等"回到研究")**:① 验证边界-blend 假设;② 考虑把损失/模型选择改成绝对 hp_rms 重训。诚实绝对对比图(样本 27,abs-hp 选)已存 `outputs/eval/out_cmp_ACT_vs_S0.png` / `out_cmp_ACT_S0_S0Hattn.png`——绝对高通分量上 ACT/refined **基本重叠**(与本节一致)。
+> 注:S0+Hattn 的 fraction 相对 S0 仍稳定更低(#63a 的 image-信息结论在 fraction 口径内成立),但**同样不蕴含绝对高频下降**。
+
+---
+
+## 🔨 定论 — 绝对高频不可监督消除(2026-06-10 决定性实验)
+
+接上节待办②:给 `train_refine_net.py` 加 **`--hf-mode abs`** 直接优化绝对高频 `L_abs = E_high(refined)/E_high(ACT).detach()`(ratio-of-sums **能量加权**,分母固定输入 ACT → 非分母陷阱;模型选择改按 `abs_hf_ratio`)。S0,λ∈{0.5,1,2,5},200ep。
+
+**坑中坑**:第一版 `L_abs` 误写成 mean-of-ratios `(E_high_r/E_high_a).mean()`,被近静止关节(分母≈0)主导(init 时 loss=12117!),只压低运动样本、高能量 j2 不动 → abs 卡 0.99(假平)。改 ratio-of-sums 后才暴露真相。
+
+**train vs val 绝对高频轨迹(λ=2.0,`abs_hf_ratio`)**:
+
+| epoch | 10 | 30 | 60 | 100 | 199 |
+|---|---|---|---|---|---|
+| **train_abs** | 1.01 | 0.71 | **0.23** | **0.085** | **0.036** |
+| **val_abs**   | 1.03 | 1.04 | 1.21 | 1.28 | **1.36** |
+
+**train 绝对高频 → 0.036(砍 96%),val → 1.36(比不精修还差 36%)。** 所有 λ 一致;ckpt_best(选 val 最优 + BC 护栏)的独立 val 评估 absE_high/ACT≈1.0、hp_rms 1.2–1.3。图:`outputs/eval/abs_overfitting_trainval.png`。
+
+**结论(一锤定音)**:
+1. **模型有能力消除高频(train→0.04),但纯靠记忆**;**该消除不泛化**(val 反升)。映射 ACT→clean 的 **>5Hz 残差不是可泛化函数**——clean 的高频与 ACT 的高频互不相关,唯一可泛化的信号是低频轨迹形状(L1 学到的)。
+2. **绝对高频对监督式残差精修是不可降的(val 最优≈1.0,优化只会更糟)**,与损失口径无关(fraction 与正确的绝对目标都败)。呼应 #62「A_noisy 白噪声不可学 ratio0.95」——**高频本质是样本特有噪声**。
+3. → **Stage 3b 招牌 fraction hf_ratio 0.25× 是度量产物**(mean-of-ratios×低运动加权),**不是真平滑**。
+4. → 真机 Stage 5「指令 hp −40%」**不可能来自 chunk 内精修** → 几乎必然来自**部署时 chunk 边界 blend + temporal ensembling(跨 chunk 连续性)**。**边界-blend 假设从"待验证"升级为"强证据支持的主因"**。
+
+**对论文叙事的影响(重大)**:RefineNet 的**贡献不在 chunk 内监督平滑**(已证无效)。真正的杠杆在:(a) **部署时跨 chunk 连续化**(边界 blend + TE),(b) **控制器层**(Stage 5,力矩/高带宽)。下一步优先级:**验证边界-blend 假设**(纯 blend vs RefineNet 残差,在 sim/真机部署流上量绝对 hp)以定位真机收益来源。
+> caveat:本结论基于 960 个 sim chunk;"更多数据能否让高频抵消泛化"未测,但 train/val 鸿沟表明目标高频近噪声、希望渺茫。新代码:`--hf-mode abs`、`hf_abs_loss`、val stats 增 `abs_hf_ratio`、模型选择 `sel_key`。
+
+### 边界-blend 假设验证(2026-06-10,`deploy_eval_phase1.py` 加 `ACT_blend10` 态)
+
+deploy-stream(整 episode 跨 chunk 拼接)绝对 hp_rms_cmd 三方分解,图 `outputs/eval/blend_vs_residual.png`:
+
+| 条件 | hp_rms_cmd | vs ACT | 边界跳变 |
+|---|---|---|---|
+| 裸 ACT | 0.00163 | 1.000 | 0.0105 |
+| **ACT + 纯 blend(无残差)** | 0.00145 | **0.886 (−11%)** | **0.0000** |
+| ACT + 残差(refined,无 blend) | 0.00171 | **1.046 (+5% 更差)** | 0.0111 |
+| ACT + 残差 + blend | 0.00151 | 0.927 (−7%) | 0.0000 |
+
+**部署流上全部平滑来自确定性边界 blend;学到的残差零贡献、甚至略有害**(残差单独 +5%;残差+blend 的 −7% 还不如纯 blend 的 −11%)。executed 流同(blend 0.939、残差 1.009)。残差不碰边界跳变(0.0111),blend 清零。
+
+**→ 真机 Stage 5 的 A/B(wrapper-on=blend+残差 vs wrapper-off=裸 ACT)所测"RefineNet 收益"实为"边界-blend 收益"**;`refine_enabled` 同时开关了 blend 与残差(`refine_deploy.py:138/140`),二者一直被混淆。**学到的残差(本工作主贡献)在任何层面都不提供绝对平滑增益。** 唯一有效的是无需学习的边界 blend + 控制器低通(Stage 5)。
+
+### abs 残差的部署消融(2026-06-10,封死"换损失能救"的退路)
+
+用**正确绝对损失(ratio-of-sums)训出的 abs 残差**(各 λ 的 ckpt_best,val abs≈1.0)重复上面的部署分解(`--refine-ckpt`/`--out-tag` 已参数化;json: `deploy_eval_abs{λ}.json`):
+
+| 残差来源 | 残差单独(无blend) | 残差+blend | 纯blend(无残差) |
+|---|---|---|---|
+| runB fraction λ=0.10 | 1.046 (−5%) | 0.927 | 0.886 |
+| abs λ=0.5 | 1.092 (−9%) | 0.988 | 0.891 |
+| abs λ=1.0 | 1.124 (−12%) | 1.024 | 0.887 |
+| abs λ=2.0 | 1.128 (−13%) | 1.022 | 0.889 |
+| abs λ=5.0 | 1.166 (−17%) | 1.060 | 0.893 |
+
+1. **abs 残差在部署流上一致有害(−9%~−17%),且随 λ 单调恶化**——λ 越大、对(不可学的)train 噪声抵消越激进,部署时注入的伪高频越多。val abs≈1.0 的 ckpt 到部署流恶化到 1.09–1.17,因 deploy chunk 起点错位 = 额外分布漂移。
+2. **残差+blend 全线 ≤ 纯 blend**——加残差只会拖累。**纯 blend 严格占优**(0.886–0.893,五行几乎不变,因为 blend 不依赖残差)。
+3. → **"换正确损失重训"不能救残差**(chunk 内过拟合 + 部署有害,双重证据);残差无贡献的结论与训练口径无关,**消融闭环**。
+> 基建注:循环连跑多次 deploy_eval 会触发已知的 dataloader 退出期 `double free`(同 Stage 3a),偶发静默失败;单独跑稳定,json 均已生成。
+
+### S0 / S0+Hattn 的 fraction 增益到底是什么(2026-06-10 收尾分析)
+
+val 按运动量对半分组(motion = active-joint AC 能量):
+
+| 组 | 模型 | fraction ratio | 绝对 E_high ratio |
+|---|---|---|---|
+| LOW(近静止) | S0 | 0.214 | 1.051 |
+| LOW(近静止) | S0+Hattn | **0.168** | 0.998 |
+| HIGH(运动) | S0 | 0.384 | 1.079 |
+| HIGH(运动) | S0+Hattn | 0.395 | 1.006 |
+
+Hattn−S0 的 fraction 改善:LOW **+0.0025(全部)**,HIGH −0.0001(零)。
+
+1. 模型学到的唯一可泛化平滑 = **"近静止段输出平线"**(clean 在静止段本来就平,"保持不动"可预测,不需要预测噪声;运动段高频=样本噪声不可学,fraction 卡 0.38-0.40)。
+2. **#63a 的 Hattn 增益全部来自 image 信息帮模型识别任务阶段(静止 vs 运动)** → 机制结论"RLT 式 attention 读出能有效利用 ACT image 信息"**保留**(零-image 对照逻辑仍自洽);"破 hf 地板"的解读**作废**——压的是静止段 fraction,绝对能量可忽略。
+3. 小真发现:Hattn 绝对 E_high≈1.00 vs S0 1.05-1.08——image 信息让残差至少不注入伪高频(不帮倒忙≠增益)。
+4. fraction 掉 5× 而绝对不动 = mean-of-ratios 给静止段样本同权,大比值改善撑起招牌数字(同一度量陷阱在分组内递归出现)。
+
+---
+
+## 🔄 #64 大数据重训 — 可泛化绝对平滑涌现,残差复活(2026-06-10/11)
+
+### 数据
+原 960 train 实为 **240 唯一起点 × 4 扰动变体**(ACT_output/act_img 由观测决定,4 变体共享输入)。`sim/generate_dense_act_pairs.py`:stride 50→5 → **train 2339 / val 568 唯一输入(9.7×)**;无扰动变体(消除"同输入4目标"标签噪声);A_clean=raw demo 切片(无 sim);history 填零(S0/Hattn 不读);一次 ACT 前向同取 ACT_output+act_img → `phase1_dense.h5`。
+> 副发现:ACT 推理输出含 dataset history 随机采样驱动的抖动(同帧两次 history 差 4.0 → ACT_output 差 0.026 rad);模型本身确定(同张量 diff=0)。
+
+### 损失-度量军备竞赛(每代博弈与修复,论文素材)
+| 代 | 损失 | 模型学到的博弈 | 修复 |
+|---|---|---|---|
+| 1 | fraction(Hann) | 压静止段占比(分母+加权陷阱) | → 绝对口径 |
+| 2 | abs(Hann-FFT) | **边缘倾倒**:Hann 窗 t[0:5]/t[95:100] 权重≈0,垃圾倒边缘(9.3×/1.8×),内核真降 0.80-0.86 | → FIR 均匀权重 |
+| 3 | absfir(FIR) | ①实现 bug:零填充+未去均值 → 边界瞬态比抖动大 5 个量级,损失只看伪迹(L1 崩);②修 bug 前还会塞 FIR 过渡带(5-7Hz) | → AC去均值+reflect 填充;Hann+FIR 组合 |
+| 4 | **absboth**(0.5·Hann-abs + 0.5·FIR) | 盲区互补(频率尖锐×时间均匀),无处可倒;选模型用 absmax(两口径 worst-case) | ✅ 终版 |
+
+### chunk 级结果(dense val 568, ckpt_best, BC-guarded)
+| 模型 | Hann-abs | FIR | hp_rms | L1 |
+|---|---|---|---|---|
+| ACT | 1.000 | 1.000 | 1.000 | 0.00839 |
+| dense S0 (fraction) | 1.040 | 1.087 | 1.089 | 0.00631 |
+| dense Hattn (fraction) | 1.048 | 1.248 | 1.137 | 0.00640 |
+| **dense S0 (absboth λ1.0)** | **0.789** | **0.722** | **0.946** | 0.00790 |
+| **dense Hattn (absboth λ1.0)** | **0.761** | **0.712** | **0.940** | 0.00790 |
+| clean(天花板) | 0.591 | 0.620 | 0.771 | — |
+
+- **三个独立绝对口径全 <1**,per-step profile 无边缘伪影(边缘 1.14-1.17,内核 0.77-0.79),L1 优于 ACT。对 λ(0.3/1/2)不敏感。
+- abs(Hann) 单独训也给出 val 0.80@ep49 的真泛化(train/val U 形,数据假设的第一证据),但有边缘倾倒 → absboth 是诚实版。
+- **Hattn 在每个绝对口径都略优于 S0**(0.761/0.712/0.940 vs 0.789/0.722/0.946)→ #63a 的 image 信息增益**首次在诚实口径成立**。
+- fraction 目标即使大数据也无绝对增益(1.04-1.25)→ **数据量与目标函数都曾是瓶颈,缺一不可**。
+
+### 部署流分解(deploy_eval_abs… vs deploy_eval_dense_absboth)
+| 条件 | hp_rms_cmd vs ACT |
+|---|---|
+| 纯 blend | 0.894 |
+| 旧残差+blend(fraction, 最好) | 0.927 |
+| **新 absboth 残差单独** | **0.942(首个为正的残差贡献)** |
+| **新 absboth 残差+blend** | **0.821(显著超纯 blend)** |
+
+**「纯 blend 严格占优 / 残差任何层面无贡献」的旧定论被推翻**——前提是 ①唯一输入 ~10×、②无博弈绝对损失。blend(11%)+残差(6%)≈ 合计(18%),近似可加。
+
+### 结论与 caveat
+1. ACT→clean 的高频残差**在小数据下表现为不可学噪声,在大数据+诚实损失下部分可学**(chunk 内核 ~20-28% 能量,部署 −6% 单独/−18% 合血)。此前"本质不可学"的判断是**数据饥饿的伪影**——abs 实验当时已留 caveat,现兑现。
+2. 仍未到天花板(0.59-0.77),且 hp_rms 口径(逐样本等权)只到 0.94 → 大头改善在高能量样本。
+3. caveat:仍 sim/teacher-forced;真机收益依旧受控制器低通封顶(Stage 5);新残差的真机 A/B 未做;dense 目标定义(raw demo)与原(sim 干净执行)略异。
+4. 工件:`--hf-mode absboth`、`hf_absfir_loss`/`_fir_highpass`(AC+reflect)、`absmax_ratio` 选模型;图 `outputs/eval/dense_retrain_summary.png`。
+
+### #65 多 seed 稳健性 + K-实现增广(2026-06-11)
+
+**A. 多 seed(dense K1, absboth λ1.0, 3 seeds, BC-guarded best absmax)**:
+
+| 变体 | s42 | s43 | s44 | mean [min,max] |
+|---|---|---|---|---|
+| S0 | 0.789 | 0.776 | 0.792 | 0.786 [0.776,0.792] |
+| **Hattn** | 0.761 | 0.765 | 0.736 | **0.754 [0.736,0.765]** |
+
+range 不重叠(0.765<0.776) → **#64 两核心结论过 seed 检验**:绝对平滑可泛化(±0.01);Hattn image 增益稳定(−0.03)。(s43 S0 的 history.json 被退出期 double-free 吞掉,从 ckpt_best 的 val_stats 恢复。)
+
+**B. K-实现增广(`generate_dense_act_pairs.py --k-train 4`)**:利用副发现"ACT 抖动由 dataset history 随机采样驱动"——同起点重复前向 = 同 A_clean 目标、独立噪声实现(实现间 ACT_output 差 0.007-0.016 rad,目标全同)。train 2339→**9356**,val 保持 K=1 可比。结果:
+
+| 变体 | K1 (2339) | K4 (9356) |
+|---|---|---|
+| S0 | 0.786±0.008 | 0.783(无增益) |
+| Hattn | 0.754±0.015 | 0.739(贴 seed 下沿) |
+
+**饱和**:同起点加噪声实现不再推进天花板(0.59/0.62)→ **剩余缺口绑定于场景多样性(仅 24 个 demo episode),不是噪声采样数**;要继续逼近需更多真机演示(新瓶颈=数据采集)。
+**副发现:Hattn 的 U 形过拟合显著更慢**(ep99 absmax 0.841 vs S0 1.076)——image 条件化兼具正则化效应(RLT 式读出的又一独立益处)。
+图:`outputs/eval/scaling_seeds_summary.png`(规模曲线 240→2339→9356 + K4 U 形对比)。
+
+---
+
 ## Document History
 
 | Run | 日期 | loss | 结论 |
