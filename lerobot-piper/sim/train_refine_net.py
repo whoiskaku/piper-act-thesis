@@ -202,10 +202,13 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
                        if "act_img" in batch else None)
             if zero_act_img and act_img is not None:
                 act_img = torch.zeros_like(act_img)        # 零-image 对照: 同架构无真实感知信息
+            act_rlt = (batch["act_rlt"].to(device, non_blocking=True)
+                       if "act_rlt" in batch else None)    # #69 RLT-AE 压缩 token
 
             refined, delta = model(
                 act_output, history_action, history_imu, current_state,
-                history_pad_mask=history_pad_mask, act_hidden=act_hidden, act_img=act_img,
+                history_pad_mask=history_pad_mask, act_hidden=act_hidden,
+                act_img=act_img, act_rlt=act_rlt,
             )
 
             l_bc = nn.functional.l1_loss(refined, A_clean)
@@ -310,6 +313,10 @@ def main():
                     help="#63(a) 对 ACT image tokens 做注意力读出作 context token(变体 S0+Hattn)")
     ap.add_argument("--zero-act-img", action="store_true",
                     help="#63(a) 对照: act_img 喂零(同架构无真实感知信息) → 隔离 信息 vs 参数容量")
+    ap.add_argument("--n-img-readout", type=int, default=1,
+                    help="#69 M-q: image-token 注意力读出的 query 数(1=#63a现状, >1 加容量)")
+    ap.add_argument("--use-act-rlt", action="store_true",
+                    help="#69 RLT-AE: 用重构预训练压缩器的 K 个冻结 token 作 context(需 H5 有 act_rlt_tokens)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--h5", type=Path, default=H5_PATH)
     ap.add_argument("--out-dir", type=Path,
@@ -343,6 +350,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _hsfx = ('+H' if args.use_act_hidden else '') + ('+Hattn' if args.use_act_img_attn else '')
+    _hsfx += (f'x{args.n_img_readout}' if (args.use_act_img_attn and args.n_img_readout != 1) else '')
+    _hsfx += ('+RLT' if args.use_act_rlt else '')
     _hsfx += ('+zero' if args.zero_act_img else '')
     _hsfx += {'abs': '+abs', 'absfir': '+absfir', 'absboth': '+absboth'}.get(args.hf_mode, '')
     _hsfx += ('' if args.hf_cutoff == 5.0 else f'+cut{args.hf_cutoff:g}')
@@ -379,7 +388,9 @@ def main():
     # ---- Model ----
     model = RefineNet(use_state=use_state, use_history_action=use_ha,
                       use_history_imu=use_hi, use_act_hidden=args.use_act_hidden,
-                      use_act_img_attn=args.use_act_img_attn).to(device)
+                      use_act_img_attn=args.use_act_img_attn,
+                      n_img_readout=args.n_img_readout,
+                      use_act_rlt=args.use_act_rlt).to(device)
     print(f"[variant] {args.variant}{'+H' if args.use_act_hidden else ''}: "
           f"use_state={use_state} use_hist_action={use_ha} use_hist_imu={use_hi} use_act_hidden={args.use_act_hidden}")
     n_params = model.num_parameters()

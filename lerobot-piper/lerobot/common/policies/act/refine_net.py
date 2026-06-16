@@ -52,6 +52,10 @@ class RefineNet(nn.Module):
         act_hidden_bottleneck: int = 32,
         use_act_img_attn: bool = False,
         act_img_dim: int = 512,
+        n_img_readout: int = 1,            # #69 M-q: image-token 注意力读出的 query 数(>1 加容量)
+        use_act_rlt: bool = False,         # #69 RLT-AE: 用重构预训练压缩器的 K 个冻结 token 作上下文
+        act_rlt_dim: int = 256,
+        n_rlt_tokens: int = 8,
     ) -> None:
         super().__init__()
 
@@ -66,6 +70,9 @@ class RefineNet(nn.Module):
         self.use_history_imu = use_history_imu
         self.use_act_hidden = use_act_hidden          # #63: ACT encoder 摘要作 context
         self.use_act_img_attn = use_act_img_attn      # #63(a): ACT image tokens 注意力读出
+        self.n_img_readout = n_img_readout            # #69 M-q
+        self.use_act_rlt = use_act_rlt                # #69 RLT-AE 压缩 token
+        self.n_rlt_tokens = n_rlt_tokens
 
         # ---- Tokenizers (条件构建) ----
         # A_target: per-step Linear so output alignment is per timestep. (always on)
@@ -97,14 +104,20 @@ class RefineNet(nn.Module):
             )
             self.pe_act_hidden = nn.Embedding(1, dim)
         if use_act_img_attn:
-            # RLT 式注意力读出:learned query 对 ACT image tokens 交叉注意 → 1 个 readout token
+            # RLT 式注意力读出:n_img_readout 个 learned query 对 ACT image tokens 交叉注意
+            # → n_img_readout 个 readout token(#69 M-q: >1 加容量)
             self.img_proj = nn.Linear(act_img_dim, dim)
-            self.img_readout_query = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+            self.img_readout_query = nn.Parameter(torch.randn(1, n_img_readout, dim) * 0.02)
             self.img_readout_attn = nn.MultiheadAttention(dim, nhead, batch_first=True)
+        if use_act_rlt:
+            # #69 RLT-AE: 重构预训练压缩器的 K 个冻结 token(已离线压好)→ 投影进 context
+            self.rlt_proj = nn.Linear(act_rlt_dim, dim)
+            self.pe_rlt = nn.Embedding(n_rlt_tokens, dim)
 
         # ---- Position + type embeddings ----
         self.pe_a_target = nn.Embedding(chunk_size, dim)
-        self.type_embed  = nn.Embedding(5, dim)  # 0:A_target 1:A_prev 2:I_prev 3:state 4:act_hidden
+        # type 4 复用为 "ACT 感知上下文"(readout / rlt 互斥, 同类) → 不扩 type_embed, 保 ckpt 兼容
+        self.type_embed  = nn.Embedding(5, dim)  # 0:A_target 1:A_prev 2:I_prev 3:state 4:act-percept(hidden/img/rlt)
 
         # ---- Transformer ----
         encoder_layer = nn.TransformerEncoderLayer(
@@ -145,7 +158,8 @@ class RefineNet(nn.Module):
         if self.use_history_imu:    n += self.n_patch_tokens
         if self.use_state:          n += 1
         if self.use_act_hidden:     n += 1
-        if self.use_act_img_attn:   n += 1
+        if self.use_act_img_attn:   n += self.n_img_readout
+        if self.use_act_rlt:        n += self.n_rlt_tokens
         return n
 
     def forward(
@@ -157,6 +171,7 @@ class RefineNet(nn.Module):
         history_pad_mask: torch.Tensor | None = None,
         act_hidden: torch.Tensor | None = None,
         act_img: torch.Tensor | None = None,
+        act_rlt: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -209,11 +224,16 @@ class RefineNet(nn.Module):
             mask_segs.append(torch.zeros(B, 1, dtype=torch.bool, device=device))
         if self.use_act_img_attn:
             k = self.img_proj(act_img.float())                       # (B, n_img, dim)
-            q = self.img_readout_query.expand(B, -1, -1)             # (B, 1, dim)
-            readout, _ = self.img_readout_attn(q, k, k)             # (B, 1, dim)
+            q = self.img_readout_query.expand(B, -1, -1)             # (B, M, dim)
+            readout, _ = self.img_readout_attn(q, k, k)             # (B, M, dim)
             readout = readout + self.type_embed.weight[4]
             toks.append(readout)
-            mask_segs.append(torch.zeros(B, 1, dtype=torch.bool, device=device))
+            mask_segs.append(torch.zeros(B, self.n_img_readout, dtype=torch.bool, device=device))
+        if self.use_act_rlt:
+            r = self.rlt_proj(act_rlt.float())                       # (B, K, dim)
+            r = r + self.pe_rlt.weight.unsqueeze(0) + self.type_embed.weight[4]
+            toks.append(r)
+            mask_segs.append(torch.zeros(B, self.n_rlt_tokens, dtype=torch.bool, device=device))
 
         memory_tokens = torch.cat(toks, dim=1)
         # 只有存在 history 且给了 pad mask 才需要 key_padding_mask

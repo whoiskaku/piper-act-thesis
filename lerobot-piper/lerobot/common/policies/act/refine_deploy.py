@@ -57,6 +57,7 @@ class RefineNetDeployWrapper:
                  device, blend_m: int = 10,
                  residual_enabled: bool = True, blend_enabled: bool = True,
                  use_act_img: bool = False,
+                 rlt_compressor=None, rlt_mean=None, rlt_std=None,
                  state_is_mdeg: bool = True, verbose: bool = True):
         self.act = act_policy
         self.refine = refine_model.eval()
@@ -74,11 +75,19 @@ class RefineNetDeployWrapper:
         self._last_action = None                   # 上一步下发的动作(用于边界 blend)
         self._warned_state = False
 
-        # ---- Hattn: 挂 ACT encoder hook 取 image tokens(同 precompute_act_img) ----
+        # ---- #69 RLT-AE: 部署时实时跑压缩器(image tokens → K 个 RLT token)----
+        self.rlt_compressor = rlt_compressor.eval() if rlt_compressor is not None else None
+        self.use_act_rlt = rlt_compressor is not None
+        if self.use_act_rlt:
+            self.rlt_mean = torch.as_tensor(rlt_mean, dtype=torch.float32, device=self.device)
+            self.rlt_std = torch.as_tensor(rlt_std, dtype=torch.float32, device=self.device)
+
+        # ---- 挂 ACT encoder hook 取 image tokens(Hattn 直接用 / RLT 经压缩器)----
+        # 同 precompute_act_img: offset=n_prefix+n_history
         self.use_act_img = use_act_img
         self._enc_cap = {}
         self._img_offset = None
-        if use_act_img:
+        if use_act_img or self.use_act_rlt:
             p = act_policy.config
             n_prefix = 1
             n_prefix += int(getattr(p, "robot_state_feature", None) is not None)
@@ -170,13 +179,18 @@ class RefineNetDeployWrapper:
                 hp = batch.get("history_pad_mask")
                 hp = hp.to(self.device) if hp is not None else None
                 state = self._current_state(batch)
-                act_img = None
-                if self.use_act_img:
+                act_img = act_rlt = None
+                if self.use_act_img or self.use_act_rlt:
                     enc = self._enc_cap.get("e")
-                    assert enc is not None, "act_img hook 未捕获 encoder 输出"
-                    act_img = enc[self._img_offset:].permute(1, 0, 2)    # (1, n_img, 512)
+                    assert enc is not None, "encoder hook 未捕获输出"
+                    img = enc[self._img_offset:].permute(1, 0, 2).float()  # (1, n_img, 512)
+                    if self.use_act_rlt:                                   # #69 实时压缩 → K 个 RLT token
+                        img_n = (img - self.rlt_mean) / self.rlt_std
+                        act_rlt = self.rlt_compressor.encode(img_n)        # (1, K, d)
+                    else:
+                        act_img = img
                 chunk, _ = self.refine(chunk.to(self.device), ha, hi, state,
-                                       history_pad_mask=hp, act_img=act_img)
+                                       history_pad_mask=hp, act_img=act_img, act_rlt=act_rlt)
 
             # 3) 边界 blend(独立开关)
             if self.blend_enabled:
@@ -190,20 +204,44 @@ class RefineNetDeployWrapper:
 
 def build_refine_deploy_policy(act_policy, refine_ckpt, device,
                                blend_m: int = 10, mode: str = "full",
-                               state_is_mdeg: bool = True):
+                               state_is_mdeg: bool = True, rlt_compressor_path=None):
     """加载 RefineNet ckpt(架构按 ckpt['args'] 复原)并包住 frozen ACTPolicy。
 
     mode: off=裸ACT直通 | blend=纯边界blend | residual=仅残差 | full=残差+blend
+    支持 #63a Hattn(n_img_readout)/#69 M-q/#69 RLT-AE(需 rlt_compressor_path, 默认按 ckpt 旁找)。
     """
     assert mode in ("off", "blend", "residual", "full"), f"未知 mode: {mode}"
     ckpt = torch.load(Path(refine_ckpt), map_location=device, weights_only=False)
     targs = ckpt.get("args", {}) or {}
     use_state, use_ha, use_hi = _VARIANTS.get(targs.get("variant", "full"), (True, True, True))
     use_img = bool(targs.get("use_act_img_attn", False))
+    n_readout = int(targs.get("n_img_readout", 1))            # #69 M-q
+    use_rlt = bool(targs.get("use_act_rlt", False))           # #69 RLT-AE
+
+    # RLT-AE: 加载重构预训练压缩器(部署时实时把 image tokens 压成 K 个 RLT token)
+    comp = comp_mean = comp_std = None
+    n_rlt = 8; rlt_d = 256
+    if use_rlt:
+        import sys
+        repo = Path(__file__).resolve().parents[4]
+        if str(repo) not in sys.path:
+            sys.path.insert(0, str(repo))
+        from sim.train_rlt_compressor import RLTCompressor
+        cpath = Path(rlt_compressor_path) if rlt_compressor_path else \
+            repo / "outputs/sim/rlt_compressor_k8_d256.pt"
+        cc = torch.load(cpath, map_location=device, weights_only=False)
+        n_rlt, rlt_d = cc["k"], cc["d"]
+        comp = RLTCompressor(k=n_rlt, d=rlt_d).to(device)
+        comp.load_state_dict(cc["model_state"]); comp.eval()
+        comp_mean, comp_std = cc["mean"], cc["std"]
+        print(f"[refine_deploy] RLT 压缩器 {cpath.name} 加载(K={n_rlt} d={rlt_d} "
+              f"explained_var={cc.get('val_explained_var', float('nan')):.3f})")
+
     refine = RefineNet(use_state=use_state, use_history_action=use_ha,
                        use_history_imu=use_hi,
                        use_act_hidden=bool(targs.get("use_act_hidden", False)),
-                       use_act_img_attn=use_img).to(device)
+                       use_act_img_attn=use_img, n_img_readout=n_readout,
+                       use_act_rlt=use_rlt, n_rlt_tokens=n_rlt, act_rlt_dim=rlt_d).to(device)
     sd = ckpt["model_state"]
     te = sd.get("type_embed.weight")
     if te is not None and te.shape[0] < refine.type_embed.weight.shape[0]:
@@ -213,10 +251,11 @@ def build_refine_deploy_policy(act_policy, refine_ckpt, device,
     refine.eval()
     print(f"[refine_deploy] ckpt ep{ckpt.get('epoch')} "
           f"variant={targs.get('variant', 'full(legacy)')} hf_mode={targs.get('hf_mode', 'fraction')} "
-          f"img_attn={use_img} | mode={mode} blend_m={blend_m}")
+          f"img_attn={use_img}x{n_readout} rlt={use_rlt} | mode={mode} blend_m={blend_m}")
     return RefineNetDeployWrapper(
         act_policy, refine, ckpt["state_mean"], ckpt["state_std"],
         device=device, blend_m=blend_m,
         residual_enabled=mode in ("residual", "full"),
         blend_enabled=mode in ("blend", "full"),
-        use_act_img=use_img, state_is_mdeg=state_is_mdeg)
+        use_act_img=use_img, rlt_compressor=comp, rlt_mean=comp_mean, rlt_std=comp_std,
+        state_is_mdeg=state_is_mdeg)

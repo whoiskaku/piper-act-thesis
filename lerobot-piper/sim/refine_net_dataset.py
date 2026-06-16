@@ -57,6 +57,10 @@ class RefinePhase1Dataset(Dataset):
             # 保持 fp16(磁盘原格式)省一半内存; RefineNet forward 里 img_proj(act_img.float()) 自行转换
             self.act_img_tokens = (grp["act_img_tokens"][:]
                                    if "act_img_tokens" in grp else None)  # #63(a) ACT image tokens
+            self.act_rlt_tokens = (grp["act_rlt_tokens"][:]
+                                   if "act_rlt_tokens" in grp else None)  # #69 RLT-AE 压缩 token
+            self.act_rlt_tokens = (grp["act_rlt_tokens"][:]
+                                   if "act_rlt_tokens" in grp else None)  # #69 RLT-AE 压缩 token
             self.history_action = grp["history_action"][:].astype(np.float32)
             self.history_imu = grp["history_imu"][:].astype(np.float32)
             self.history_pad_mask = grp["history_pad_mask"][:].astype(bool)
@@ -89,6 +93,8 @@ class RefinePhase1Dataset(Dataset):
             out["act_hidden"] = torch.from_numpy(self.act_hidden_enc[i])
         if self.act_img_tokens is not None:
             out["act_img"] = torch.from_numpy(self.act_img_tokens[i])
+        if self.act_rlt_tokens is not None:
+            out["act_rlt"] = torch.from_numpy(self.act_rlt_tokens[i])
         return out
 
     def compute_state_stats(
