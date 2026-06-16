@@ -50,11 +50,15 @@ ACTIVE_JOINTS = [0, 1, 2, 6]   # j1, j2, j3, grip(j7)
 
 
 # ─── Spectral helpers ──────────────────────────────────────────────
-def hf_power(actions: torch.Tensor, fs: float = FPS, cutoff: float = HF_CUTOFF):
+def hf_power(actions: torch.Tensor, fs: float = FPS, cutoff: float = None):
     """Per-(B, joint) high-freq power and total AC power. actions: (B, T, A).
 
     Returns (E_high, E_total), each shaped (B, A). DC removed, Hann-windowed.
+    cutoff=None → 读当前模块全局 HF_CUTOFF(支持 --hf-cutoff 运行时覆盖;
+    默认参数在 import 时绑定, 不能直接写 =HF_CUTOFF)。
     """
+    if cutoff is None:
+        cutoff = HF_CUTOFF
     B, T, A = actions.shape
     x_ac = actions - actions.mean(dim=1, keepdim=True)
     w = torch.hann_window(T, device=actions.device).view(1, T, 1)
@@ -285,6 +289,9 @@ def main():
                     help="weight on |ΔA| residual-shrinkage / trust-region")
     ap.add_argument("--lambda-acc", type=float, default=0.0,
                     help="weight on |2nd-diff| (optional, weak; default off)")
+    ap.add_argument("--hf-cutoff", type=float, default=5.0,
+                    help="平滑损失/度量的高频截止(Hz); #66 发现 5Hz 截止留 2-4.5Hz 放大盲区, "
+                         "降到 ~2.5 贴任务带宽(0.6Hz)可纳入该带惩罚")
     ap.add_argument("--tag", type=str, default=None,
                     help="run name suffix; auto-built from λ if omitted")
     ap.add_argument("--epochs", type=int, default=200)
@@ -311,6 +318,14 @@ def main():
 
     lambdas = {"hf": args.lambda_hf, "delta": args.lambda_delta, "acc": args.lambda_acc}
 
+    # #66: 运行时覆盖高频截止(影响 hf_power 的 freq mask + FIR taps + 全部 hf 度量)
+    global HF_CUTOFF, _FIR_TAPS
+    if args.hf_cutoff != HF_CUTOFF:
+        HF_CUTOFF = args.hf_cutoff
+        _FIR_TAPS = torch.from_numpy(
+            _firwin(31, HF_CUTOFF / (FPS / 2.0), pass_zero=False).astype(np.float32))
+        print(f"[#66] HF_CUTOFF 覆盖为 {HF_CUTOFF}Hz(FIR taps 已重算)")
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -330,6 +345,7 @@ def main():
     _hsfx = ('+H' if args.use_act_hidden else '') + ('+Hattn' if args.use_act_img_attn else '')
     _hsfx += ('+zero' if args.zero_act_img else '')
     _hsfx += {'abs': '+abs', 'absfir': '+absfir', 'absboth': '+absboth'}.get(args.hf_mode, '')
+    _hsfx += ('' if args.hf_cutoff == 5.0 else f'+cut{args.hf_cutoff:g}')
     _ssfx = '' if args.seed == 42 else f'_s{args.seed}'   # seed42 保持原 tag(兼容已有目录)
     tag = args.tag or (
         f"{args.variant}{_hsfx}_in-{args.input_signal}_hf{args.lambda_hf}_dl{args.lambda_delta}{_ssfx}"
