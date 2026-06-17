@@ -160,16 +160,22 @@ def write_object_model(cfg: dict, ring_center, table_top_z: float, out_path: Pat
 
 
 def derive_placement(base_xml: Path, demo: dict, cfg: dict):
-    """环心 = 指垫汇聚点 + mean_radius·(夹爪水平前向)；table_top = pinch_z − H/2。"""
+    """环心 = 触桌指垫 xy + mean_radius·(夹爪水平前向)；table_top = 触桌 pinch_z − H/2。
+
+    bug 修(2026-06-17): 原用 detect_grasp_frames 的 grip 事件帧, 但 (1) 该帧在抬起中段
+    (指垫 z≈0.16, 底座在 z=0)→ 物体被放到 ~16cm 悬空; (2) 本数据 grip 通道整段≈0
+    (范围[0,0]), grip 突变检测全是噪声伪事件, 不可靠。物体静置于桌面, 接触高度 =
+    **拾取段(前半)指垫最低点**(触桌, z≈0, 与底座共面), 不依赖 grip 通道。"""
     from sim.replay_demo_validation import state_mdeg_to_rad
     o = cfg["object"]
     H = o["height_mm"] / 1000.0
     r_mean = (o["d_outer_mm"] + o["d_inner_mm"]) / 4000.0
 
-    gf = detect_grasp_frames(demo)
-    gframe = gf[0] if gf else len(demo["action"]) // 2
-    qpos8 = state_mdeg_to_rad(demo["state_mdeg"][gframe])
-    pinch, fwd = fk_grasp(base_xml, qpos8)
+    sm = demo["state_mdeg"]
+    win = list(range(0, max(len(sm) // 2, 2)))              # 拾取段(前半, 避开 place 下探)
+    fks = [fk_grasp(base_xml, state_mdeg_to_rad(sm[t])) for t in win]
+    ci = int(np.argmin([p[2] for p, _ in fks]))             # 指垫最低点 = 触桌帧
+    pinch, fwd = fks[ci]
 
     fwd_h = np.array([fwd[0], fwd[1], 0.0])                 # 水平前向
     fwd_h = fwd_h / (np.linalg.norm(fwd_h) + 1e-9)
@@ -177,7 +183,7 @@ def derive_placement(base_xml: Path, demo: dict, cfg: dict):
     if cfg["table"].get("override_top_z") is not None:
         table_top_z = float(cfg["table"]["override_top_z"])
     else:
-        table_top_z = float(pinch[2] - H / 2.0)
+        table_top_z = float(pinch[2] - H / 2.0)             # 触桌指垫 z − H/2
     ring_center = np.array([ring_xy[0], ring_xy[1], table_top_z + H / 2.0])
     return ring_center, table_top_z
 
