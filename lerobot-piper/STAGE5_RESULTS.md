@@ -105,6 +105,43 @@ A 裸 ACT / B 纯 blend(无残差) / C blend+absboth 残差。分析 `scripts/st
 
 ---
 
+## #69-real 真机四方 token 对比(residual-only)— 残差无 blend 有害(2026-06-17)
+
+录 A(裸ACT)/ 1q(Hattn)/ M-q / RLT-AE 各 12 集,`REFINE_MODE=residual`(无 blend,= 用户"主对比 ACT vs ACT+残差"框架)。S0 未录。分析 drop 各块 ep0(冷启动),N=11。图 `outputs/eval/stage5_token_real.png`,数据 `stage5_token_real.json`。
+
+| 指标 | A | 1q | M-q | RLT-AE |
+|---|---|---|---|---|
+| 指令 hp_rms | 0.0027 | +57% | +31% | +25% |
+| IMU accel hp(5Hz) | 0.717 | +26% | +17% | +15% |
+| IMU gyro hp(5Hz) | 0.073 | +28% | +20% | +13% |
+| IMU accel 2–4.5Hz | 0.392 | +31% | +21% | +8% |
+| IMU gyro 2–4.5Hz | 0.057 | +32% | +23% | +3% |
+
+**核心结论**:
+1. **无一残差变体改善 IMU;全部中性到更差**(+3~+32%)。指令 hp 也升(+25~57%)——残差在**部署流**上增加高频而非降低。
+2. **变体排序 RLT-AE(伤害最小,≈裸ACT,gyro 2–4.5Hz 仅 +3% 在噪声内)< M-q < 1q(伤害最大)= 精确匹配 sim 的"保守↔激进"权衡线**:残差改动越大,真机越糟;RLT-AE 近恒等→几乎不动 IMU。
+3. **根因 = 无 blend → 残差搞坏 chunk 边界**:sim 所有评估是逐 100 步 chunk 内(无边界);真机 residual-only 让相邻 chunk 边界跳变更大(smoke: 0.08–0.10 vs 裸 ACT 0.06),拼接后边界注入宽带高频**压倒** chunk 内平滑 → 净 hp 升。**坐实 blend 不是可选而是残差落地前提**(呼应 #67)。可能叠加 sim→real 输入分布漂移。
+4. **方法学**:per-chunk sim 指标(#64–#69)**不预测部署流真机 IMU**;公平的"残差是否有用"必须 **blend 持平对照**(ACT+blend vs ACT+blend+残差),本批未录。
+5. **任务成功率(用户手记,12 集/条件)**:**A 裸ACT 12/12(满分基线)** = RLT-AE **12/12** > M-q 11/12(失1) > 1q 10/12(失2)。**对满分基线: RLT-AE 不伤任务但近恒等无收益; M-q/1q 主动拉低抓取(且 IMU 同时恶化)。****第三根轴,排序与 sim 激进度、真机 IMU 伤害完全一致**(RLT<M-q<1q)→ **残差改动越大,IMU 越糟 + 抓取越易失败,单调耦合;residual-only 无"既降IMU又保任务"的工作点**。RLT-AE 安全(12/12+IMU近裸ACT)因近恒等几乎不干活。**token 价值重定义:RLT 重构 token→保守保任务残差(真实贡献),但不带来 IMU 平滑;1q 在真机最差**。(裸 ACT 基线成功率待补。)三轴收敛是核心证据。
+
+**caveat**:N=11 单块非交错(各变体 std 0.08–0.20,1q/M-q 与 A 差异部分超噪声、RLT-AE 多在噪声内);未含 blend 持平对照;S0 未录。
+
+## #70 改进 I 部署流训练 — 残差从"有害"变"安全"但非"更好";边界需跨chunk状态(2026-06-17)
+
+针对 #69-real(per-chunk 残差真机搞坏边界)的改进 I:`sim/train_refine_stream.py` 把损失从 per-chunk 改为相邻两 chunk(K=2, deploy cadence)拼成 200 步流(含边界),absboth 在流上算。Hattn 1q cut2.0,1859 train/448 val 对。val 部署流对比:
+
+| 模型 | 边界跳变/ACT | stream_hp/ACT | within-chunk hp/ACT | L1 |
+|---|---|---|---|---|
+| per-chunk Hattn(#69-real) | **2.92** | **1.42** | 0.935 | 0.0087 |
+| stream Hattn(改进I) | **0.97** | **1.03** | 1.045 | 0.0092 |
+| 裸 ACT | 1.0 | 1.0 | 1.0 | 0.0084 |
+
+1. **量化了 #69-real 的根因**:per-chunk 残差让边界跳变恶化 **2.92×**、部署流 hp **+42%** → 这就是真机 IMU +13~31% 变差之源。
+2. **改进 I 修好了"有害"**:stream 训练把边界拉回 0.97(≈ACT)、stream_hp 1.42→1.03 → **残差从有害变无害/安全**。
+3. **但没变"更好"**:net ≈ 裸 ACT(stream_hp 1.03),且为修边界**牺牲了 chunk 内平滑**(0.935→1.045)。训练轨迹: 边界比/stream_hp 在 ep40 触底(0.94)后随 L1 暴涨(0.0095→0.0148)回升 = 过拟合,BC-guard best 落在 ep4。
+4. **根本机制**:per-chunk 残差**看不到上一 chunk 末动作 → 架构上无法协调边界**;"不恶化边界"迫使"别动边缘"→ 连带丢 chunk 内平滑 → 净≈恒等。**边界连续性本质需跨 chunk 状态(上一步动作)= 确定性 blend 用 `_last_action` 免费提供**。
+5. **闭环结论**:残差只该管 chunk 内平滑,边界交给 blend;**学到的 per-chunk 残差打不过确定性 blend**(改进I是blend的劣质学习替代)。要让残差net-helpful须加"上一步动作"输入(=学习版blend),但其相对"blend+残差"(#67已测≈blend)上限很小,ROI低。
+
 ## Document History
 | 日期 | 内容 |
 |---|---|
