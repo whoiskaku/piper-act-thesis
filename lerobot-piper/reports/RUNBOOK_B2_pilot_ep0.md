@@ -1,6 +1,8 @@
 # B′ ep0 4 mrad pilot 上机手册（2026-07-28）
 
-**放行范围**：仅 ep0、仅 4 mrad、逐条执行。
+**状态：正式放行**（2026-07-28）。范围：仅 ep0、仅 4 mrad、逐条执行。
+**冻结版本**：`b2_ep0_pilot` @ commit `9d7136c`（develop，工作树 clean）。
+注入窗 j2@[170,280] / j3@[170,320]，跟踪源 `eval_pickplace2_100k ep0`。
 **4 mrad 的用途**：安全、记录完整性、奇对称性。
 **4 mrad 不能做的事**：验证幅值线性度（必须 4 vs 8 mrad 对比）；下相位/增益/时延结论。
 分析器会输出这些数字，**只作观察**。
@@ -11,6 +13,7 @@
 
 ```bash
 cd ~/claude-test-2/lerobot-piper
+python sim/freeze_manifest.py --tag b2_ep0_pilot   # 冻结(已做; 需重冻结时再跑)
 python sim/analyze_probe_b2.py --self-test      # 估计器 + CI 覆盖率（~6 min）
 python sim/analyze_probe_b2.py --e2e            # 端到端（四臂独立时钟）
 python sim/test_probe_b2_gate.py                # 门禁自身的反向测试
@@ -57,18 +60,30 @@ CI 覆盖率在 2 窗下重测仍通过（92–94%）。
 
 每条一个命令，**跑完立刻检查再跑下一条**：
 
+**每条复放前**都先跑冻结校验 —— 六条期间代码或序列漂移会让 A 与 B 不再可比，整批作废：
+
 ```bash
-python sim/probe_b2_gate.py --ep 0 --margin            # ⓪ 上机前预估(历史跟踪误差)
+F="python sim/freeze_manifest.py --tag b2_ep0_pilot --check"
 
-python sim/replay_probe.py --b2 --ep 0 --arm A1
+$F && python sim/replay_probe.py --b2 --ep 0 --arm A1
 python sim/probe_b2_gate.py --ep 0 --only A1           # 记录质量
-python sim/probe_b2_gate.py --ep 0 --margin            # ⓪ 改用 **A1 实测** 跟踪误差 + 削顶检查
-                                                       # ← 任一 B 配置上机前必须过这一关
+python sim/probe_b2_gate.py --ep 0 --margin            # ⓪ 改用 **A1 实测** 跟踪误差 + 削顶
+                                                       # ← 任一 B 上机前必须过这一关
 
-python sim/replay_probe.py --b2 --ep 0 --arm j2_4mrad_p
+$F && python sim/replay_probe.py --b2 --ep 0 --arm j2_4mrad_p
 python sim/probe_b2_gate.py --ep 0 --only j2_4mrad_p
-# ... 依次 j2_4mrad_m / j3_4mrad_m / j3_4mrad_p / A2
+$F && python sim/replay_probe.py --b2 --ep 0 --arm j2_4mrad_m
+python sim/probe_b2_gate.py --ep 0 --only j2_4mrad_m
+$F && python sim/replay_probe.py --b2 --ep 0 --arm j3_4mrad_m
+python sim/probe_b2_gate.py --ep 0 --only j3_4mrad_m
+$F && python sim/replay_probe.py --b2 --ep 0 --arm j3_4mrad_p
+python sim/probe_b2_gate.py --ep 0 --only j3_4mrad_p
+$F && python sim/replay_probe.py --b2 --ep 0 --arm A2
+python sim/probe_b2_gate.py --ep 0 --only A2
 ```
+
+⓪ 用 A1 实测重算后，**任一窗 residual margin < 0.5° 就禁用该关节的该窗**，
+不沿用历史预估。改窗要重新生成序列 + **重新冻结**。
 
 ⓪ 若有任何窗 residual ≤ 0 或发现削顶：**不得注入该窗**。改 `make_probe_b2.py` 的
 `need` 或剔窗后重新生成，不要靠人工观察放行。
@@ -137,12 +152,19 @@ SNR_p = E_odd,tones / E_noise,tones,  与相干度的对应 γ² = SNR_p/(1+SNR_
 
 ---
 
+## 4b. 本轮**只允许**得出的三类结论
+
+1. 100 Hz 记录与统一时钟链路是否可靠；
+2. 4 mrad 响应是否可见、是否奇对称；
+3. 是否存在削顶、明显非线性或安全余量问题。
+
+**不得**用本轮两窗的结果单独宣称 6–8 Hz 相位或时延已验证 ——
+有色噪声下 40° 的不确定度不支持该结论。分析器仍会打印这些数字，只作观察。
+
 ## 5. 六项全过之后
 
-**不是自动开放 8 mrad** —— 拿门禁输出回来一起看，再决定。
-
-4 mrad 只验证**奇对称**。开放 8 mrad 还需要：偶分量与噪声相容、无削顶、
-响应峰值留有余量。届时才谈幅值线性度（4 vs 8 对比）、Ĝ 校准、相位/增益/时延结论。
+**8 mrad 门保持关闭。** 等 ep0 的偶分量、削顶、响应峰值、安全余量**全部通过后重新裁决**，
+不自动开放。届时才谈幅值线性度（4 vs 8 对比）、Ĝ 校准、相位/增益/时延结论。
 
 ---
 
