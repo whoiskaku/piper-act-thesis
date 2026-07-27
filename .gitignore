@@ -69,3 +69,6 @@ outputs/eval/d2_imu_reward_computer*.pkl
 
 # MuJoCo mesh files (large STL/DAE, copied from external piper_ros repo)
 lerobot-piper/sim/meshes/
+
+# 冻结/运行记录(内含 commit hash, 提交会使其自指失效; 代码 commit 才是溯源锚点)
+lerobot-piper/reports/FREEZE_*.json
