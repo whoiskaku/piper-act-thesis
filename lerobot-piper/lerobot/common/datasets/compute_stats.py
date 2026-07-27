@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+
 import numpy as np
 
 from lerobot.common.datasets.utils import load_image_as_numpy
@@ -57,19 +59,22 @@ def auto_downsample_height_width(img: np.ndarray, target_size: int = 150, max_si
 def sample_images(image_paths: list[str]) -> np.ndarray:
     sampled_indices = sample_indices(len(image_paths))
 
-    images = None
-    for i, idx in enumerate(sampled_indices):
+    # Flaky USB cameras occasionally emit a corrupt frame that PIL cannot decode.
+    # Skip such frames when computing stats rather than crashing the whole recording
+    # session (ffmpeg already tolerates them when encoding the episode video).
+    images = []
+    for idx in sampled_indices:
         path = image_paths[idx]
-        # we load as uint8 to reduce memory usage
-        img = load_image_as_numpy(path, dtype=np.uint8, channel_first=True)
+        try:
+            # we load as uint8 to reduce memory usage
+            img = load_image_as_numpy(path, dtype=np.uint8, channel_first=True)
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"sample_images: skipping unreadable frame {path}: {e}")
+            continue
         img = auto_downsample_height_width(img)
+        images.append(img)
 
-        if images is None:
-            images = np.empty((len(sampled_indices), *img.shape), dtype=np.uint8)
-
-        images[i] = img
-
-    return images
+    return np.stack(images, axis=0)
 
 
 def get_feature_stats(array: np.ndarray, axis: tuple, keepdims: bool) -> dict[str, np.ndarray]:

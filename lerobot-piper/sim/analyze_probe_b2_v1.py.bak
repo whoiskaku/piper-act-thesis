@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""B′ 分析器（2026-07-27, D 方案）— 6-8Hz 复频响辨识。
+
+奇/偶分解（用户设计）:
+    Δy_odd  = (y_B+ − y_B−)/2                      线性增量响应, 噪声方差 0.5σ²(vs 1.5σ²)
+    Δy_even = (y_B+ + y_B−)/2 − (y_A1 + y_A2)/2    应≈0; 不为零 = 非线性/漂移/复放不一致
+
+复频响（每关节 × 频点 × 幅值）:
+    H(f) = Σ_win DFT[Δy_odd](f) / Σ_win DFT[δa](f)     跨窗相干平均(复数域, 非幅值平均)
+    报告: 增益 |H|、相位 ∠H、等效时延 τ = −dφ/dω、相干度 γ²、bootstrap CI
+    与 Ĝ 对比: 增益比 |H_real|/|H_Ĝ|、相位误差 ∠H_real − ∠H_Ĝ
+
+相位约定: **注入窗起点 t=win 为相位零点**（δa 与 y 用同一窗、同一零点）→ 相位差即物理时延。
+时间戳: 100Hz IMU 用 host_t 对齐到 20Hz 指令帧（win 的 host_t 为基准）。
+
+用法:
+  python sim/analyze_probe_b2.py --self-test          # 合成数据验证估计器(必先跑)
+  python sim/analyze_probe_b2.py --eps 0              # 分析真机 ep0
+"""
+from __future__ import annotations
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+PB = ROOT / "outputs/probe_b2"
+FIG = ROOT / "reports/figures"
+FPS = 20.0
+NEXC = 40
+JOINTS = {"j2": 1, "j3": 2}
+AMPS = ("4mrad", "8mrad")
+
+
+# ---------------------------------------------------------------- 估计器
+def lockin(x, f, n=NEXC, fps=FPS):
+    """单频复数锁相: X(f) = (2/n) Σ x[k] e^{−j2πfk/fps}。窗起点为相位零点。"""
+    x = np.asarray(x)
+    k = np.arange(len(x))
+    w = np.exp(-2j * np.pi * f * k / fps)
+    if x.ndim > 1:
+        w = w[:, None]                    # (n,) → (n,1) 广播到 (n,3)
+    return (2.0 / n) * np.sum(x * w, axis=0)
+
+
+def freq_response(segs_u, segs_y, segs_n, freqs, fps=FPS):
+    """跨窗相干平均的复频响 + 相干度 + bootstrap CI。
+
+    segs_u/y/n: list of (n,) / (n,3) / (n,3) —— 每个注入窗一段。
+    返回 dict[f] = {H(3,), gamma2(3,), ci_gain, ci_phase_deg, n_win}
+    """
+    out = {}
+    nw = len(segs_u)
+    for f in freqs:
+        U = np.array([lockin(u, f) for u in segs_u])                 # (nw,)
+        Y = np.array([lockin(y, f) for y in segs_y])                 # (nw,3)
+        N = np.array([lockin(n_, f) for n_ in segs_n])               # (nw,3)
+        # 相干平均: H = Σ(Y·conj(U)) / Σ|U|²  —— 复数域, 保相位
+        num = np.sum(Y * np.conj(U)[:, None], axis=0)
+        den = np.sum(np.abs(U) ** 2)
+        H = num / max(den, 1e-30)
+        # 相干度: 信号功率 / (信号+噪声)
+        sig = np.abs(H) ** 2 * den / nw
+        noi = np.mean(np.abs(N) ** 2, axis=0)
+        g2 = sig / np.maximum(sig + noi, 1e-30)
+        # bootstrap over windows(窗数少, 用 BCa 不划算; 报 percentile)
+        rng = np.random.default_rng(0)
+        bs = []
+        for _ in range(2000):
+            idx = rng.integers(0, nw, nw)
+            n_ = np.sum(Y[idx] * np.conj(U[idx])[:, None], axis=0)
+            d_ = np.sum(np.abs(U[idx]) ** 2)
+            bs.append(n_ / max(d_, 1e-30))
+        bs = np.array(bs)                                             # (2000,3)
+        gain_ci = np.percentile(np.abs(bs), [2.5, 97.5], axis=0)
+        # 相位 CI: 先旋到 H 的相位附近再取分位(避免 ±π 环绕)
+        ph = np.angle(bs * np.exp(-1j * np.angle(H))[None, :])
+        ph_ci = np.percentile(np.degrees(ph), [2.5, 97.5], axis=0)
+        out[float(f)] = {"H": H, "gamma2": g2, "n_win": nw,
+                         "gain_ci": gain_ci, "phase_ci_deg": ph_ci}
+    return out
+
+
+def group_delay(fr, freqs, ch):
+    """等效时延 τ = −dφ/dω (对频率线性拟合, 解缠绕)。返回 (τ_ms, 拟合R²)。"""
+    ph = np.unwrap([np.angle(fr[float(f)]["H"][ch]) for f in freqs])
+    w = 2 * np.pi * np.asarray(freqs)
+    A = np.vstack([w, np.ones_like(w)]).T
+    sol, res, *_ = np.linalg.lstsq(A, ph, rcond=None)
+    tau = -sol[0]
+    pred = A @ sol
+    ss = 1 - np.sum((ph - pred) ** 2) / max(np.sum((ph - ph.mean()) ** 2), 1e-30)
+    return tau * 1e3, ss
+
+
+# ---------------------------------------------------------------- 数据装配
+def segs_from(y, wins, n=NEXC):
+    return [y[w:w + n] for w in wins if w + n <= len(y)]
+
+
+def analyze_cfg(A1, A2, Bp, Bm, seq, verbose=True, label=""):
+    """一组配置(关节×幅值)的完整分析。y 为 (T,3) 陀螺。"""
+    wins = seq["wins"]
+    j = int(seq["joint"])
+    freqs = seq["freqs"]
+    da = seq["da"][:, j]
+    T = min(len(A1), len(A2), len(Bp), len(Bm), len(da))
+    A1, A2, Bp, Bm, da = A1[:T], A2[:T], Bp[:T], Bm[:T], da[:T]
+    wins = [w for w in wins if w + NEXC <= T]
+
+    odd = (Bp - Bm) / 2.0                                   # 线性增量(噪声 0.5σ²)
+    even = (Bp + Bm) / 2.0 - (A1 + A2) / 2.0                # 应≈0
+    noise = (A2 - A1) / 2.0                                 # 同 scale 的噪声参照
+
+    fr = freq_response(segs_from(da, wins), segs_from(odd, wins),
+                       segs_from(noise, wins), freqs)
+    # Ĝ 的同法估计(用同一 δa 与窗) —— pred 是 Ĝ 对 B+ 的预测, 线性故 odd 部分即 pred
+    pred = seq["pred"].mean(0)[:T]                          # (T,3) 成员均值
+    frG = freq_response(segs_from(da, wins), segs_from(pred, wins),
+                        segs_from(np.zeros_like(pred), wins), freqs)
+
+    e_odd = float(np.sqrt(np.mean(np.concatenate(segs_from(odd, wins)) ** 2)))
+    e_even = float(np.sqrt(np.mean(np.concatenate(segs_from(even, wins)) ** 2)))
+    e_noise = float(np.sqrt(np.mean(np.concatenate(segs_from(noise, wins)) ** 2)))
+    # 主导轴: 按**相干功率** |H|²·γ² 选 —— 只按 |H| 会被低相干轴的噪声抬高(自检抓到)
+    ch = int(np.argmax([np.mean([abs(fr[float(f)]["H"][c])**2 * fr[float(f)]["gamma2"][c]
+                                 for f in freqs]) for c in range(3)]))
+
+    if verbose:
+        print(f"\n── {label}  (j{j+1}, {len(wins)} 窗, 主导轴 gyro-{'xyz'[ch]}) ──")
+        print(f"  奇分量 RMS {e_odd*1e3:6.1f} mrad/s   偶分量 {e_even*1e3:5.1f}   "
+              f"噪声参照 {e_noise*1e3:5.1f}   偶/奇 = {e_even/max(e_odd,1e-12):.2f} "
+              f"{'✓线性' if e_even < 0.5*e_odd else '⚠非线性/漂移'}")
+        print(f"  {'f(Hz)':>7}{'|H|real':>10}{'|H|Ĝ':>9}{'增益比':>8}{'相位real':>10}"
+              f"{'相位Ĝ':>9}{'相位差':>8}{'γ²':>7}{'CI(增益)':>16}")
+        for f in freqs:
+            Hr, Hg = fr[float(f)]["H"][ch], frG[float(f)]["H"][ch]
+            g2 = fr[float(f)]["gamma2"][ch]
+            lo, hi = fr[float(f)]["gain_ci"][:, ch]
+            dphi = np.degrees(np.angle(Hr) - np.angle(Hg))
+            dphi = (dphi + 180) % 360 - 180
+            print(f"{f:>7.1f}{abs(Hr):>10.3f}{abs(Hg):>9.3f}{abs(Hr)/max(abs(Hg),1e-12):>8.2f}"
+                  f"{np.degrees(np.angle(Hr)):>9.0f}°{np.degrees(np.angle(Hg)):>8.0f}°"
+                  f"{dphi:>7.0f}°{g2:>7.2f}   [{lo:.3f},{hi:.3f}]")
+        tr, r2r = group_delay(fr, freqs, ch)
+        tg, r2g = group_delay(frG, freqs, ch)
+        print(f"  等效时延: 真机 {tr:+.0f} ms (拟合R²{r2r:.2f})   "
+              f"Ĝ {tg:+.0f} ms (R²{r2g:.2f})   差 {tr-tg:+.0f} ms "
+              f"({abs(tr-tg)/50:.1f} 帧)")
+    return {"fr": fr, "frG": frG, "ch": ch, "e_odd": e_odd, "e_even": e_even,
+            "e_noise": e_noise, "n_win": len(wins)}
+
+
+# ---------------------------------------------------------------- 自检
+def self_test():
+    """合成数据验证: 已知增益/相位/时延, 检查估计器能否回收 + 奇偶分解 + 符号。"""
+    print("=== 自检: 合成数据(已知真值) ===")
+    rng = np.random.default_rng(0)
+    seq = np.load(PB / "seq_ep0_j3_8mrad_p.npz", allow_pickle=True)
+    j = int(seq["joint"]); wins = seq["wins"]; freqs = seq["freqs"]
+    da = seq["da"][:, j]; T = len(da)
+    # 真实量级: Ĝ 预测响应峰 ~273 mrad/s @8mrad ⇒ 增益 ~34 (rad/s per rad)
+    # 噪声底 50 mrad/s (v2 实测)。这才是 B′ 的真实工况。
+    G_TRUE, TAU_TRUE, NL = 34.0, 0.075, 0.15
+    NOISE = 0.050
+
+    def plant(u):
+        """真值系统: 增益 G, 纯时延 τ, 加二次非线性(偶次, 用于检验 even 分量)。"""
+        d = int(round(TAU_TRUE * FPS))
+        y = np.zeros((T, 3), np.float32)
+        y[d:, 1] = G_TRUE * u[:T - d]                 # 线性项 → gyro-y
+        y[d:, 1] += NL * G_TRUE * u[:T - d] ** 2 / max(np.abs(u).max(), 1e-9)   # 偶次
+        return y
+
+    base = rng.normal(0, 0.3, (T, 3)).cumsum(0) * 0.01
+    nz = lambda: rng.normal(0, NOISE, (T, 3))
+    A1, A2 = base + nz(), base + nz()
+    Bp, Bm = base + plant(da) + nz(), base + plant(-da) + nz()
+    r = analyze_cfg(A1, A2, Bp, Bm, seq, label=f"自检(真值: 增益{G_TRUE:.0f} 时延{TAU_TRUE*1e3:.0f}ms 非线性{NL:.0%})")
+    ch = r["ch"]
+    gains = [abs(r["fr"][float(f)]["H"][ch]) for f in freqs]
+    tau, _ = group_delay(r["fr"], freqs, ch)
+    print(f"\n  回收: 增益均值 {np.mean(gains):.2f} (真值 {G_TRUE})  "
+          f"误差 {abs(np.mean(gains)-G_TRUE)/G_TRUE*100:.0f}%")
+    print(f"        时延 {tau:.0f} ms (真值 {TAU_TRUE*1e3:.0f})  误差 {abs(tau-TAU_TRUE*1e3):.0f} ms")
+    print(f"        偶/奇 {r['e_even']/r['e_odd']:.2f} (注入非线性 {NL}) — 偶分量应显著>噪声")
+    ok = (abs(np.mean(gains) - G_TRUE) / G_TRUE < 0.25
+          and abs(tau - TAU_TRUE * 1e3) < 20
+          and r["e_even"] > 0.5 * r["e_noise"])
+    # 符号检验: 反相输入应给出反相输出
+    r2 = analyze_cfg(A1, A2, Bm, Bp, seq, verbose=False)     # 交换 B+/B−
+    ph1 = np.angle(r["fr"][float(freqs[0])]["H"][ch])
+    ph2 = np.angle(r2["fr"][float(freqs[0])]["H"][ch])
+    dsign = abs((np.degrees(ph1 - ph2) + 180) % 360 - 180)
+    print(f"        相位符号检验: 交换 B±  相位翻转 {dsign:.0f}° (应≈180°)  "
+          f"{'✓' if abs(dsign-180) < 20 else '✗'}")
+    print(f"\n判决: {'✅ 估计器正确' if ok and abs(dsign-180) < 20 else '❌ 估计器有问题'}")
+    return 0 if (ok and abs(dsign - 180) < 20) else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--eps", type=int, nargs="+", default=[0])
+    a = ap.parse_args()
+    if a.self_test:
+        raise SystemExit(self_test())
+
+    def load(ep, cfg):
+        p = PB / f"replay_ep{ep}_{cfg}.json"
+        d = json.loads(p.read_text())
+        # 优先用 100Hz 记录降采到 20Hz 指令帧(host_t 对齐); 无则退回 20Hz 逐帧
+        return np.array(d["imu"], np.float32)[:, 3:6]
+
+    for ep in a.eps:
+        A1, A2 = load(ep, "A1"), load(ep, "A2")
+        for jn in JOINTS:
+            for an in AMPS:
+                try:
+                    Bp, Bm = load(ep, f"{jn}_{an}_p"), load(ep, f"{jn}_{an}_m")
+                except FileNotFoundError:
+                    continue
+                seq = np.load(PB / f"seq_ep{ep}_{jn}_{an}_p.npz", allow_pickle=True)
+                analyze_cfg(A1, A2, Bp, Bm, seq, label=f"ep{ep} {jn} {an}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

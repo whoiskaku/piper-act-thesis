@@ -273,6 +273,25 @@ def record(
                                             mode=_mode)
         logging.info(f"RefineNet deploy wrapper active (mode={_mode}, ckpt={_refine_ckpt})")
 
+    # B 校正模块部署(π v1, 默认关, env 门控)。三方 A/B:
+    #   A 裸 ACT:   不设 BCORR_CKPT
+    #   B 逆算前馈: BCORR_CKPT=<π.pt> BCORR_CALIB=<manifest.json> BCORR_MODE=ff
+    #   C 本方法:   BCORR_CKPT=<π.pt> BCORR_CALIB=<manifest.json> BCORR_MODE=full
+    # 与 RefineNet 互斥(两者都改指令流, 同时开会混淆归因)。
+    _bcorr_ckpt = os.environ.get("BCORR_CKPT")
+    if policy is not None and _bcorr_ckpt:
+        if _refine_ckpt:
+            raise ValueError("BCORR_CKPT 与 REFINE_CKPT 不可同时设置(归因会混淆)")
+        from lerobot.common.policies.act.b_correction_deploy import build_b_correction_policy
+        _bmode = os.environ.get("BCORR_MODE", "full")
+        _calib = os.environ.get("BCORR_CALIB")
+        if not _calib:
+            raise ValueError("BCORR_CALIB 未设置(需 IMU 标定 manifest.json)")
+        policy = build_b_correction_policy(policy, _bcorr_ckpt, cfg.device, _calib,
+                                           mode=_bmode,
+                                           log_path=os.environ.get("BCORR_LOG"))
+        logging.info(f"B-correction wrapper active (mode={_bmode}, ckpt={_bcorr_ckpt})")
+
     # Build a HistoryBuffer when the loaded policy was trained with autoregressive
     # history inputs. The buffer survives across episodes and is the runtime mirror
     # of the EpisodeHistoryDataset wrapper used during training.

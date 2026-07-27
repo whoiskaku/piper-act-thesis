@@ -141,6 +141,49 @@ def hf_absfir_loss(refined: torch.Tensor, ref_signal: torch.Tensor,
     return Er / (Ea + EPS)
 
 
+# ─── Controller surrogate C(·): commanded action → measured state (#71) ──
+# fit_controller_surrogate.py 拟合的实测 action→state 低通(per-joint FIR)。
+# controller-aware 训练把 HF 平滑损失搬到 C(refined) 上算 → 残差只在 2-4.5Hz 透传带
+# (实测增益~0.2)拿梯度, 不在被控制器砍光的 >5Hz(增益~0.04)白学; 且 #66 残差在
+# 2-4.5Hz 的放大(真机 IMU 变差元凶)会被直接惩罚, 因为该带 C 透传。
+_CTRL_KERNELS = None   # (7, L) torch tensor, lazy-loaded
+
+
+def load_controller(npz_path=None):
+    global _CTRL_KERNELS
+    p = Path(npz_path) if npz_path else (REPO_ROOT / "outputs/sim/controller_surrogate.npz")
+    d = np.load(p)
+    _CTRL_KERNELS = torch.from_numpy(d["kernels"].astype(np.float32))   # (7,L) 对称线性相位
+    print(f"[#71] controller surrogate loaded: {p} kernels{tuple(_CTRL_KERNELS.shape)}")
+
+
+def apply_controller(x: torch.Tensor) -> torch.Tensor:
+    """x (B,T,A) → C(x): per-channel 零相位 FIR(depthwise, reflect pad, 居中 'same')。
+    对称核 → cross-correlation=convolution, 无需翻转; 居中输出 = 零相位幅频。"""
+    B, T, A = x.shape
+    k = _CTRL_KERNELS.to(x.device, x.dtype)            # (7,L)
+    L = k.shape[1]; pad = L // 2
+    w = k[:A].unsqueeze(1)                             # (A,1,L)
+    xt = x.permute(0, 2, 1)                            # (B,A,T)
+    xt = torch.nn.functional.pad(xt, (pad, pad), mode="reflect")
+    y = torch.nn.functional.conv1d(xt, w, groups=A)    # (B,A,T)
+    return y.permute(0, 2, 1)
+
+
+def _accel(x: torch.Tensor) -> torch.Tensor:
+    """proxy IMU = 沿 T 的二阶差分(加速度)。(B,T,A)→(B,T-2,A)。"""
+    return x[:, 2:] - 2 * x[:, 1:-1] + x[:, :-2]
+
+
+def deploy_transform(x: torch.Tensor, controller=False, proxy_imu=False) -> torch.Tensor:
+    """把命令空间信号搬到部署可观测空间: C(·)=控制器透传后 state, 再可选二阶差分=代理IMU。"""
+    if controller:
+        x = apply_controller(x)
+    if proxy_imu:
+        x = _accel(x)
+    return x
+
+
 # ─── Time-domain regularizers ──────────────────────────────────────
 def l_delta_term(delta: torch.Tensor) -> torch.Tensor:
     """Residual-shrinkage / trust-region: mean |ΔA|."""
@@ -168,8 +211,11 @@ def jerk_rms(actions: torch.Tensor, dt: float = DT) -> torch.Tensor:
 
 # ─── Train / Eval loops ────────────────────────────────────────────
 def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="ACT_output",
-              zero_act_img=False, hf_mode="fraction"):
-    """lambdas = dict(hf=..., delta=..., acc=...). hf_mode: fraction|abs."""
+              zero_act_img=False, hf_mode="fraction", controller_aware=False, proxy_imu=False,
+              combine_cmd=False):
+    """lambdas = dict(hf=..., delta=..., acc=...). hf_mode: fraction|abs.
+    controller_aware: HF 平滑损失在 C(refined) 上算(#71); proxy_imu: 再二阶差分=代理IMU。
+    combine_cmd: controller_aware 时再加命令空间损失(0.5/0.5), 堵住 >5Hz 命令倾倒盲区。"""
     model.train(train)
     n = 0
     acc = dict(  # running sums (× batch size)
@@ -185,6 +231,9 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
     eh_ref_sum = 0.0; eh_act_sum = 0.0
     # FIR (uniform-weight) absolute energy sums — no Hann edge blind spot
     fir_ref_sum = 0.0; fir_act_sum = 0.0
+    # controller-space (#71): 同样的绝对高频比, 但在 C(·)(可选+二阶差分) 透传后算
+    ctrl_eh_ref_sum = 0.0; ctrl_eh_act_sum = 0.0
+    ctrl_fir_ref_sum = 0.0; ctrl_fir_act_sum = 0.0
 
     grad_context = torch.enable_grad() if train else torch.no_grad()
     with grad_context:
@@ -211,18 +260,26 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
                 act_img=act_img, act_rlt=act_rlt,
             )
 
-            l_bc = nn.functional.l1_loss(refined, A_clean)
-            if hf_mode == "abs":
-                l_hf = hf_abs_loss(refined, act_output)
-            elif hf_mode == "absfir":
-                l_hf = hf_absfir_loss(refined, act_output)
-            elif hf_mode == "absboth":
-                # Hann-FFT(频率尖锐/边缘盲) + FIR(时间均匀/过渡带软) 盲区互补,
-                # 模型无法把高频垃圾倒进任一盲区
-                l_hf = 0.5 * (hf_abs_loss(refined, act_output)
-                              + hf_absfir_loss(refined, act_output))
-            else:
+            l_bc = nn.functional.l1_loss(refined, A_clean)   # 保真损失始终在命令空间
+            # controller-aware: HF 平滑损失搬到 C(refined) vs C(ACT)(可选再二阶差分=代理IMU)。
+            # ratio-of-sums 损失尺度不变 → C 后幅度虽小(透传~0.2)梯度不塌。fraction 模式不变。
+            def _hf_pair(r, a):
+                if hf_mode == "abs":
+                    return hf_abs_loss(r, a)
+                if hf_mode == "absfir":
+                    return hf_absfir_loss(r, a)
+                # absboth: Hann-FFT(频率尖锐/边缘盲) + FIR(时间均匀/过渡带软) 盲区互补
+                return 0.5 * (hf_abs_loss(r, a) + hf_absfir_loss(r, a))
+
+            if hf_mode == "fraction":
                 l_hf = hf_fraction_loss(refined)
+            else:
+                r_hf = deploy_transform(refined, controller_aware, proxy_imu)
+                a_hf = deploy_transform(act_output, controller_aware, proxy_imu)
+                l_hf = _hf_pair(r_hf, a_hf)
+                # combine_cmd: 再加命令空间损失 → 透传带强调 + >5Hz 命令仍被罚(防倾倒盲区)
+                if combine_cmd and (controller_aware or proxy_imu):
+                    l_hf = 0.5 * l_hf + 0.5 * _hf_pair(refined, act_output)
             l_dl = l_delta_term(delta)
             l_ac = l_acc_term(refined)
             loss = (l_bc
@@ -254,6 +311,14 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
                 eh_act_sum += eh_a[:, ACTIVE_JOINTS].sum().item()
                 fir_ref_sum += _fir_highpass(refined)[:, :, ACTIVE_JOINTS].pow(2).sum().item()
                 fir_act_sum += _fir_highpass(act_output)[:, :, ACTIVE_JOINTS].pow(2).sum().item()
+                if controller_aware or proxy_imu:
+                    rC = deploy_transform(refined, controller_aware, proxy_imu)
+                    aC = deploy_transform(act_output, controller_aware, proxy_imu)
+                    ce_r, _ = hf_power(rC); ce_a, _ = hf_power(aC)
+                    ctrl_eh_ref_sum += ce_r[:, ACTIVE_JOINTS].sum().item()
+                    ctrl_eh_act_sum += ce_a[:, ACTIVE_JOINTS].sum().item()
+                    ctrl_fir_ref_sum += _fir_highpass(rC)[:, :, ACTIVE_JOINTS].pow(2).sum().item()
+                    ctrl_fir_act_sum += _fir_highpass(aC)[:, :, ACTIVE_JOINTS].pow(2).sum().item()
             hf_ref += fr[ACTIVE_JOINTS] * B
             hf_act += fa[ACTIVE_JOINTS] * B
             hf_cln += fc[ACTIVE_JOINTS] * B
@@ -270,6 +335,10 @@ def run_epoch(model, loader, optimizer, lambdas, device, train=True, input_key="
     out["abs_hf_ratio"] = eh_ref_sum / (eh_act_sum + EPS)          # absolute high-freq (energy-weighted); <1 = real smoothing
     out["absfir_hf_ratio"] = fir_ref_sum / (fir_act_sum + EPS)     # FIR uniform-weight absolute; immune to Hann edge gaming
     out["absmax_ratio"] = max(out["abs_hf_ratio"], out["absfir_hf_ratio"])  # worst-case of the two (anti-gaming selection)
+    if ctrl_eh_act_sum > 0:    # controller-space (#71): 部署可观测空间的绝对高频比, <1=真降透传后高频
+        out["ctrl_abs_ratio"] = ctrl_eh_ref_sum / (ctrl_eh_act_sum + EPS)
+        out["ctrl_absfir_ratio"] = ctrl_fir_ref_sum / (ctrl_fir_act_sum + EPS)
+        out["ctrl_absmax_ratio"] = max(out["ctrl_abs_ratio"], out["ctrl_absfir_ratio"])
     return out
 
 
@@ -317,6 +386,15 @@ def main():
                     help="#69 M-q: image-token 注意力读出的 query 数(1=#63a现状, >1 加容量)")
     ap.add_argument("--use-act-rlt", action="store_true",
                     help="#69 RLT-AE: 用重构预训练压缩器的 K 个冻结 token 作 context(需 H5 有 act_rlt_tokens)")
+    ap.add_argument("--controller-aware", action="store_true",
+                    help="#71 把 HF 平滑损失搬到实测控制器透传后 C(refined)(action→state 低通) → "
+                         "残差只在 2-4.5Hz 透传带学、惩罚 #66 中频放大; 需 controller_surrogate.npz")
+    ap.add_argument("--proxy-imu", action="store_true",
+                    help="#71 在 C(·) 后再二阶差分=代理 IMU 加速度, HF 损失更贴真机 IMU 口径")
+    ap.add_argument("--combine-cmd", action="store_true",
+                    help="#71 controller-aware 时再加命令空间损失(0.5/0.5), 堵住 >5Hz 命令倾倒盲区")
+    ap.add_argument("--controller-npz", type=Path, default=None,
+                    help="控制器代理核路径(默认 outputs/sim/controller_surrogate.npz)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--h5", type=Path, default=H5_PATH)
     ap.add_argument("--out-dir", type=Path,
@@ -332,6 +410,10 @@ def main():
         _FIR_TAPS = torch.from_numpy(
             _firwin(31, HF_CUTOFF / (FPS / 2.0), pass_zero=False).astype(np.float32))
         print(f"[#66] HF_CUTOFF 覆盖为 {HF_CUTOFF}Hz(FIR taps 已重算)")
+
+    # #71: controller-aware 需载入实测控制器代理核
+    if args.controller_aware or args.proxy_imu:
+        load_controller(args.controller_npz)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -355,6 +437,9 @@ def main():
     _hsfx += ('+zero' if args.zero_act_img else '')
     _hsfx += {'abs': '+abs', 'absfir': '+absfir', 'absboth': '+absboth'}.get(args.hf_mode, '')
     _hsfx += ('' if args.hf_cutoff == 5.0 else f'+cut{args.hf_cutoff:g}')
+    _hsfx += ('+ctrlimu' if (args.controller_aware and args.proxy_imu)
+              else '+ctrl' if args.controller_aware else '')
+    _hsfx += ('+cmb' if (args.combine_cmd and (args.controller_aware or args.proxy_imu)) else '')
     _ssfx = '' if args.seed == 42 else f'_s{args.seed}'   # seed42 保持原 tag(兼容已有目录)
     tag = args.tag or (
         f"{args.variant}{_hsfx}_in-{args.input_signal}_hf{args.lambda_hf}_dl{args.lambda_delta}{_ssfx}"
@@ -429,13 +514,15 @@ def main():
     # fraction keeps the legacy headline metric. (val loss dominated by λ choice.)
     sel_key = {"abs": "abs_hf_ratio", "absfir": "absfir_hf_ratio",
                "absboth": "absmax_ratio"}.get(args.hf_mode, "hf_ratio")
+    if args.controller_aware or args.proxy_imu:   # #71 按部署可观测空间(透传后)选模型
+        sel_key = "ctrl_absmax_ratio"
     best_hf_ratio = float("inf")
     t_start = time.time()
 
     for epoch in range(args.epochs):
         t_ep = time.time()
-        train_stats = run_epoch(model, train_loader, optimizer, lambdas, device, train=True, input_key=input_key, zero_act_img=args.zero_act_img, hf_mode=args.hf_mode)
-        val_stats = run_epoch(model, val_loader, None, lambdas, device, train=False, input_key=input_key, zero_act_img=args.zero_act_img, hf_mode=args.hf_mode)
+        train_stats = run_epoch(model, train_loader, optimizer, lambdas, device, train=True, input_key=input_key, zero_act_img=args.zero_act_img, hf_mode=args.hf_mode, controller_aware=args.controller_aware, proxy_imu=args.proxy_imu, combine_cmd=args.combine_cmd)
+        val_stats = run_epoch(model, val_loader, None, lambdas, device, train=False, input_key=input_key, zero_act_img=args.zero_act_img, hf_mode=args.hf_mode, controller_aware=args.controller_aware, proxy_imu=args.proxy_imu, combine_cmd=args.combine_cmd)
         scheduler.step()
 
         elapsed_ep = time.time() - t_ep
@@ -454,7 +541,9 @@ def main():
                   f"hf_cln={val_stats['hf_clean']:.4f}  "
                   f"ratio={val_stats['hf_ratio']:.3f} [{grade(val_stats['hf_ratio'])}]  "
                   f"abs={val_stats['abs_hf_ratio']:.3f} fir={val_stats['absfir_hf_ratio']:.3f}  "
-                  f"[{elapsed_ep:.1f}s, tot {elapsed_total/60:.1f}m]")
+                  + (f"ctrl_abs={val_stats['ctrl_abs_ratio']:.3f} ctrl_fir={val_stats['ctrl_absfir_ratio']:.3f}  "
+                     if 'ctrl_absmax_ratio' in val_stats else "")
+                  + f"[{elapsed_ep:.1f}s, tot {elapsed_total/60:.1f}m]")
 
         # Save best ckpt by headline metric, with BC guardrail
         # (refined BC must not exceed the ACT-baseline BC by more than 10%).

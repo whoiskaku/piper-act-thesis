@@ -634,9 +634,21 @@ class PiperRobotConfig(RobotConfig):
             #     width=1920,
             #     height=1080,
             # ),
+            # lerobot connect 无法覆盖相机原生 fps(双开后 V4L2 sticky), 故每相机 fps=其原生值:
+            # Logitech(two) 原生 30; ELECOM(wrist) YUYV 640x480 原生 20。采集时控制 fps 用 20
+            # (较低者; two 由30降采到20, wrist原生20匹配) → 数据集统一 20fps。
             "two": OpenCVCameraConfig(
                 camera_index=0,
                 fps=30,
+                width=640,
+                height=480,
+            ),
+            # 腕部相机(eye-in-hand) 2026-06-30 新增 for Phase2 插入 — ELECOM 5MP @
+            # /dev/video2 (camera_index=2)。若 replug/reboot 后 index 漂移, 用
+            # v4l2-ctl --list-devices 重新确认 ELECOM 对应的 /dev/videoN。
+            "wrist": OpenCVCameraConfig(
+                camera_index=2,
+                fps=20,
                 width=640,
                 height=480,
             ),
