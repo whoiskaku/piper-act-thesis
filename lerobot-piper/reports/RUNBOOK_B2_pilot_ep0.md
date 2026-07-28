@@ -375,7 +375,8 @@ $F && python sim/replay_probe.py --b2 --ep 0 --round 3 --amp 2mrad --arm A6
 $G                                              # 全量门禁
 
 python sim/analyze_probe_b2.py --ampscale 2 3 --eps 0      # ← 幅值缩放判据(核心)
-python sim/analyze_probe_b2.py --zwin --eps 0 --round 3    # 逐窗 z(f) 复现
+python sim/analyze_probe_b2.py --zwin --eps 0 --round 3 --amp 2mrad   # 逐窗 z(f)
+#                                                       ↑ **必须带 --amp**, 否则默认 4mrad 找不到文件
 ```
 
 ### 判据自身已验证

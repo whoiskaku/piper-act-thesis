@@ -824,8 +824,15 @@ def ampscale(ep, rnd_hi, rnd_lo, amp_hi=None, amp_lo=None, nboot=800):
                 for val, lb in cand:                        # k=1 时三者重合, 只留一条
                     if round(val, 3) not in seen:
                         seen.add(round(val, 3)); uniq.append((val, lb))
-                hit = [lb for val, lb in uniq if abs(r - val) < max(0.25 * val, 0.3)]
-                vd = hit[0] if len(hit) == 1 else ("多解" if hit else "不明")
+                # 显著性门只用于**偶分量** —— 偶分量的问题是"有没有可复现的确定性部分",
+                # 靠跨轮/跨幅值复相关判定; 奇分量的存在性由 SNR_p 判定, 不用相关。
+                # (n 个复样本的相关系数 sd ≈ 1/√n; 取 2σ 为门槛)
+                sig = (nzk is None) or abs(c) > 2.0 / np.sqrt(max(a.size, 1))
+                if not (np.isfinite(r) and sig):
+                    vd = "不显著/截断" if np.isfinite(r) else "超出为0"
+                else:
+                    hit = [lb for val, lb in uniq if abs(r - val) < max(0.25 * val, 0.3)]
+                    vd = hit[0] if len(hit) == 1 else ("多解" if hit else f"{r:.1f} 不明")
                 print(f"  {w:>5}{lbl:>16}{ea*1e3:>10.2f}{eb*1e3:>10.2f}{r:>9.2f}{c:>9.3f}"
                       f"{vd:>16}")
     print(f"\n  判读: 偶分量比 ≈4 ⇒ 确认 D ∝ δa² 的偶次非线性;")
