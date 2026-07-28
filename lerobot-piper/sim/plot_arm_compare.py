@@ -34,13 +34,19 @@ from lerobot.common.policies.act.b_runtime import IdealChunkRenderer
 ROOT = Path(__file__).resolve().parents[1]
 AB2 = ROOT / "outputs/ab2"
 FPS = 20.0
-STYLE = {"A": ("tab:blue", "裸 ACT"), "B": ("tab:green", "FF 单独 (lag=2)"),
-         "D": ("tab:red", "ACT + π (FF 关闭)"), "B3": ("tab:orange", "FF (lag=3)")}
+STYLE = {"A": ("tab:blue", "裸 ACT"), "B": ("tab:green", "FF lag=2 有效blend2"),
+         "D": ("tab:red", "ACT + π (FF 关闭)"),
+         "B3": ("tab:orange", "FF lag=3 有效blend2"),
+         "B3b8": ("tab:purple", "FF lag=3 有效blend5"),
+         "B3b13": ("tab:brown", "FF lag=3 有效blend10")}
 
 
 def _bp():
-    ba = butter(3, [0.5 / (FPS / 2), 9.0 / (FPS / 2)], "bandpass")
-    return lambda x: filtfilt(*ba, x, axis=0)
+    """**必须与统计口径同一个滤波器** —— analyze_ab._bp 用的是训练侧的 41 抽头 FIR
+    (train_pi_e2.make_bp)。此前这里自定义了 scipy butter(3)+filtfilt, 通带形状不同,
+    导致图上的绝对能量与报告数字对不上(A 0.0608 vs 0.05625)。2026-07-29 统一。"""
+    from analyze_ab import _bp as _shared
+    return _shared()
 
 
 def eps(arm):
