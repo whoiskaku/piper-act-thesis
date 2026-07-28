@@ -62,6 +62,9 @@ BLOCK_ORDER = ("gain", "θ_shape", "theta_mean", "R18", "D6", "poles6")
 # τ 网格步长 1 ms: P.TAU_GRID 是 5 ms, 真值 +102/−52 ms **不在格点上**,
 # 会造成 2 ms 量化失配并泄漏进 η(2026-07-28 验证阶段发现)
 TAU_GRID = np.arange(-0.250, 0.2501, 0.001)
+# 内层 CV **只**用于选 λ, τ 分辨率在此不重要 ⇒ 用 5ms 粗网格做全局扫描(仍是全程扫描,
+# 不预设分支)。外折(产出上报的 τ 与预测)仍用 1ms 网格 + 前两谷 Brent 精修。
+TAU_COARSE_STEP = 5
 # 必须包含**接近零**的一档, 否则「正则压制」与「设计不可辨识」分不开(用户 2026-07-29)
 LAM_GRID = np.array([1e-8, 1e-5, 1e-3, 1e-2, 1e-1, 1.0, 10.0])
 LAM_TINY = 1e-10                 # 仅用于"优化正确性"检查, 不进入选层级
@@ -315,15 +318,29 @@ def noise_rows(keys, F_of, Um, nb_cache):
     return np.concatenate(pool, 1), np.concatenate(sd), sess, spans
 
 
-def draw_noise(pool, sess, spans, rng):
+def draw_noise(pool, sess, spans, rng, sess_scale=1.0, force_sess=None):
     """两层重采样: **先抽 session(共享)**, 再为每个 key **独立抽轮内窗口**。
 
-    ⇒ session 分量在 key 间共享(物理真实: 同轮漂移), 窗口分量互相独立。
+    session 分量 = 该轮所有窗口的均值(key 间共享, 物理真实的同轮漂移);
+    窗口分量 = 该窗口对轮均值的偏差(key 间独立)。
+    `sess_scale` 缩放共享分量(灵敏度分析 0.5×/1×/2×)。
     """
-    si = int(rng.integers(sess.max() + 1))
+    ns = int(sess.max()) + 1
+    si = int(rng.integers(ns)) if force_sess is None else int(force_sess)
     cand = np.flatnonzero(sess == si)
+    smean = pool[cand].mean(0)
     out = np.empty(pool.shape[1], complex)
     for (lo, hi) in spans:
+        w = pool[cand[rng.integers(len(cand))], lo:hi]
+        out[lo:hi] = sess_scale * smean[lo:hi] + (w - smean[lo:hi])
+    return out
+
+
+def draw_noise_xsession(pool, sess, spans, rng, row_sess):
+    """跨 session 压力测试: 不同行按 `row_sess` 指定的 session 抽窗口。"""
+    out = np.empty(pool.shape[1], complex)
+    for si_, (lo, hi) in zip(row_sess, spans):
+        cand = np.flatnonzero(sess == si_)
         out[lo:hi] = pool[cand[rng.integers(len(cand))], lo:hi]
     return out
 
@@ -432,7 +449,7 @@ class Fitter:
                 break
         return out
 
-    def fit_scan(self, obs, mask, level, lam, mk=None, refine=False):
+    def fit_scan(self, obs, mask, level, lam, mk=None, refine=False, coarse=False):
         """R1: 在 mask（**只含训练组**）上做**全局 τ 扫描**, 返回 (τ̂, η, 曲线)。
 
         τ 网格覆盖 [−250, +250] ms 全程 —— **不先定分支再拟合**。
@@ -441,12 +458,16 @@ class Fitter:
         Bt_all, yy = self.rhs(obs, mask, mk)
         ci = self.idx(level)
         Bt = Bt_all[:, ci]                       # 任意列子集
+        grid = TAU_GRID
+        if coarse:                               # 内层 CV: 粗网格全程扫描
+            Bt = Bt[::TAU_COARSE_STEP]; grid = TAU_GRID[::TAU_COARSE_STEP]
+            yy = yy[::TAU_COARSE_STEP]
         L, M = self.gram(mask, level, lam)
         Et = np.linalg.solve(L.T, np.linalg.solve(L, Bt.T)).T          # (nτ, p)
         sse = yy - 2.0 * (Bt * Et).sum(1) + ((Et @ M) * Et).sum(1)
         if not refine:
             t = int(np.argmin(sse))
-            return float(TAU_GRID[t]), Et[t], sse, None
+            return float(grid[t]), Et[t], sse, None
         # 用户 2026-07-29: **网格只负责定位每个局部谷**, 再对前两个谷分别 Brent 精修,
         # 最后用**精修后**的 ΔSSE 比较分支 —— 否则离格量化仍会进入分支裕度。
         from scipy.optimize import minimize_scalar
@@ -478,9 +499,15 @@ def lopo(fit, obs, gmasks):
     """
     ng = len(gmasks)
     fit.new_trial(obs)                    # 清 rhs 缓存(obs 变了), Gram/子矩阵仍复用
-    trm = [(~gmasks[o], f"o{o}".encode()) for o in range(ng)]
-    inm = {(o, i): ((~gmasks[o]) & ~gmasks[i], f"o{o}i{i}".encode())
-           for o in range(ng) for i in range(ng) if i != o}
+    # 键用 mask **本身的字节**: 短标签在组集合变化时会碰撞(leave-g0-out 曾因此崩)
+    trm = []
+    for o in range(ng):
+        m = ~gmasks[o]; trm.append((m, m.tobytes()))
+    inm = {}
+    for o in range(ng):
+        for i in range(ng):
+            if i != o:
+                m = (~gmasks[o]) & ~gmasks[i]; inm[(o, i)] = (m, m.tobytes())
     out = {}
     for lv in LEVELS:
         errs, taus, vv2, lams = [], [], [], []
@@ -494,7 +521,8 @@ def lopo(fit, obs, gmasks):
                     if i == o:
                         continue
                     itr, itk = inm[(o, i)]
-                    tau_i, eta_i, _, _ = fit.fit_scan(obs, itr, lv, lam, itk)
+                    tau_i, eta_i, _, _ = fit.fit_scan(obs, itr, lv, lam, itk,
+                                                      coarse=True)
                     s, n = fit.resid(obs, gmasks[i], lv, tau_i, eta_i)
                     acc.append(s / max(n, 1))          # R2: 组内先归一, 组间等权
                 m = float(np.mean(acc))
@@ -695,7 +723,7 @@ def new_cols(fit, level):
 
 
 def make_obs(fit, npool, rng, level_true, tau_true, orth_snr, Qprev,
-             noise_on=True, base_sd=0.3):
+             noise_on=True, base_sd=0.3, dp=None, noise=None, base_eta=None):
     """按**正交 SNR** 生成可检测真值（用户 2026-07-28）。
 
         Δy⊥_k = (I − P_{k−1}) J_k Δp_k
@@ -709,9 +737,11 @@ def make_obs(fit, npool, rng, level_true, tau_true, orth_snr, Qprev,
     if k > 0:                                     # 前面各层给基线扰动
         for b in LEVELS[order[k - 1]]:
             lo, hi = fit.span[b]
-            eta[lo:hi] = rng.normal(0, 0.05 if b == "gain" else base_sd, hi - lo)
+            eta[lo:hi] = (rng.normal(0, 0.05 if b == "gain" else base_sd, hi - lo)
+                          if base_eta is None else base_eta[slice(*fit.span[b])])
     sl = new_cols(fit, level_true)
-    dp = rng.normal(size=sl.stop - sl.start)
+    if dp is None:
+        dp = rng.normal(size=sl.stop - sl.start)
     dy = fit.Aall[:, sl] @ dp.astype(complex)
     Y = np.concatenate([dy.real, dy.imag])
     Q = Qprev[level_true]
@@ -722,7 +752,7 @@ def make_obs(fit, npool, rng, level_true, tau_true, orth_snr, Qprev,
     obs = ((fit.H0 + fit.Aall @ eta.astype(complex))
            * np.exp(-2j * np.pi * fit.frow * tau_true))
     if noise_on:
-        obs = obs + draw_noise(*NZ_GLOBAL, rng)
+        obs = obs + (draw_noise(*NZ_GLOBAL, rng) if noise is None else noise)
     diag = {"raw": float(np.linalg.norm(Y) * sc / np.sqrt(n)),
             "perp": float(np.linalg.norm(perp) * sc / np.sqrt(n)),
             "absorb": 1.0 - (np.linalg.norm(perp) / max(np.linalg.norm(Y), 1e-30)) ** 2,
@@ -1139,6 +1169,70 @@ def apply_shape_rows(sig, x, nP, frow, prow, u_p):
                      s * v[:, 0] + c * v[:, 1], v[:, 2]], 1).ravel()
 
 
+def paired_run(fit, gmasks, Qprev, npair, lv_list, seed0=50000,
+               sess_scale=1.0, row_sess=None, drop_g0=False, tag=""):
+    """**配对 seed**: 同一参数方向 dp + 同一噪声 realization, 只改正交 SNR。
+
+    ⇒ 可直接统计「SNR 增大反而发生错误升级」的反常转移(用户 2026-07-29)。
+    """
+    gm = [m for i, m in enumerate(gmasks) if not (drop_g0 and i == 0)]
+    conf = {snr: np.zeros((len(lv_list), len(lv_list)), int) for snr in ORTH_SNR_GRID}
+    confb = {snr: {br: np.zeros((len(lv_list), len(lv_list)), int)
+                   for br in P.TAU_TRUE} for snr in ORTH_SNR_GRID}
+    anom = 0; ntrans = 0
+    v2 = {lv: [] for lv in lv_list}
+    for li, lt in enumerate(lv_list):
+        sl = new_cols(fit, lt)
+        for pi_ in range(npair):
+            r = np.random.default_rng(seed0 + 1000 * li + pi_)
+            dp = r.normal(size=sl.stop - sl.start)          # **固定**参数方向
+            be = r.normal(0, 0.3, fit.Aall.shape[1])
+            nz = (draw_noise(*NZ_GLOBAL, r, sess_scale=sess_scale)
+                  if row_sess is None else
+                  draw_noise_xsession(NZ_GLOBAL[0], NZ_GLOBAL[1], NZ_GLOBAL[2],
+                                      r, row_sess))          # **固定**噪声
+            br = list(P.TAU_TRUE)[pi_ % 2]; tt = P.TAU_TRUE[br]
+            sels = []
+            for snr in ORTH_SNR_GRID:
+                obs, _, _ = make_obs(fit, None, r, lt, tt, snr, Qprev,
+                                     dp=dp, noise=nz, base_eta=be)
+                out = lopo(fit, obs, gm)
+                sel = pick_level(out)[0]
+                sels.append(sel)
+                conf[snr][li, lv_list.index(sel)] += 1
+                confb[snr][br][li, lv_list.index(sel)] += 1
+                for lv in lv_list:
+                    v2[lv].extend([x for x in out[lv][3] if x is not None])
+            # 反常转移: SNR 增大, 却从"正确/更简单"跳到**更复杂的错误**层
+            for a_, b_ in zip(sels[:-1], sels[1:]):
+                ntrans += 1
+                if lv_list.index(b_) > lv_list.index(a_) and b_ != lt:
+                    anom += 1
+    return dict(conf=conf, confb=confb, anom=anom, ntrans=ntrans, v2=v2, tag=tag)
+
+
+def rep_paired(R, lv_list, npair, title):
+    print(f"\n  === {title} ===")
+    print(f"  {'正交SNR':>8}" + "".join(f"{lv:>9}" for lv in lv_list)
+          + f"{'升级':>7}{'降级':>7}{'Wilson下界(对角)':>18}")
+    for snr in ORTH_SNR_GRID:
+        c = R["conf"][snr]
+        hit = [c[i, i] / max(c[i].sum(), 1) for i in range(len(lv_list))]
+        up = sum(c[i, i + 1:].sum() for i in range(len(lv_list) - 1))
+        dn = sum(c[i, :i].sum() for i in range(1, len(lv_list)))
+        k, n = int(np.trace(c)), int(c.sum())
+        lo, _ = P.wilson(k, n)
+        print(f"  {snr:>8.1f}" + "".join(f"{h:>8.0%}" for h in hit)
+              + f"{up/max(c[:-1].sum(),1):>6.0%}{dn/max(c[1:].sum(),1):>6.0%}"
+              + f"{lo:>17.1%}")
+    print(f"  每格 n = {npair}；**反常升级转移** = {R['anom']}/{R['ntrans']}"
+          f" = {R['anom']/max(R['ntrans'],1):.1%}")
+    print(f"  {'层级':>6}{'精修后第二谷 ΔSSE 中位':>24}")
+    for lv in lv_list:
+        vv = R["v2"][lv]
+        print(f"  {lv:>6}{(np.median(vv) if vv else float('nan')):>24.3e}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default="verify", choices=["verify", "screen", "final", "g0"])
@@ -1194,6 +1288,32 @@ def main():
     if a.stage == "g0":
         g0_isolation(fit, npool, gmasks, Qprev, gkeys, grp, poses, prow, frow,
                      keys, F_of)
+        return 0
+    if a.stage == "screen":
+        lv_list = list(LEVELS)
+        npair = a.trials
+        print(f"\n  【Wilson CI 口径】只表示**给定这三个实测 session 构成的经验噪声")
+        print(f"    模型**下的 Monte Carlo 不确定度, **不含真实 session 分布的不确定性**。")
+        print(f"    只有 3 个 session ⇒ 即使跑 3000 trial 也不增加 session 层信息。\n")
+        R = paired_run(fit, gmasks, Qprev, npair, lv_list, tag="main")
+        rep_paired(R, lv_list, npair, "主结果 · 同 session group-LOPO（配对 seed）")
+        Rg = paired_run(fit, gmasks, Qprev, max(npair // 2, 2), lv_list,
+                        seed0=60000, drop_g0=True, tag="dropg0")
+        rep_paired(Rg, lv_list, max(npair // 2, 2),
+                   "leave-g0-out 功效（若层级选择主要靠 g0, 这里会明显下降）")
+        for sc in (0.5, 2.0):
+            Rs = paired_run(fit, gmasks, Qprev, max(npair // 3, 2), lv_list,
+                            seed0=70000 + int(sc * 10), sess_scale=sc)
+            rep_paired(Rs, lv_list, max(npair // 3, 2),
+                       f"session 分量灵敏度 {sc}×")
+        nk = len(NZ_GLOBAL[2])
+        for si in range(3):
+            rs = [si if any(gmasks[0][slice(*NZ_GLOBAL[2][k])]) else
+                  (si + 1) % 3 for k in range(nk)]
+            Rx = paired_run(fit, gmasks, Qprev, max(npair // 3, 2), lv_list,
+                            seed0=80000 + si, row_sess=rs)
+            rep_paired(Rx, lv_list, max(npair // 3, 2),
+                       f"跨 session 压力测试 fold {si}（**仅描述性统计**）")
         return 0
     if a.stage == "verify":
         res, lvl = stage_verify(fit, npool, gmasks, Qprev, rng, a.trials)
