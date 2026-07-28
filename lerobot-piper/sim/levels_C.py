@@ -1241,9 +1241,8 @@ def main():
     ap.add_argument("--design", default="hybrid1", choices=["hybrid1", "D1", "D2"])
     a = ap.parse_args()
 
-    cands, _, _ = S.candidate_poses()
-    Ph = np.array([S.phi_of(c) for c in cands])
-    tr = S.greedy_select(cands, 16, Ph)
+    tr, ho, cands = S.train_and_holdout(16, 5)
+    S.assert_train_only(tr, ho, where="levels_C.main")   # **硬断言**: 不得含 holdout
     poses = [cands[i] for i in tr]
     grp = {}
     for k, i in enumerate(tr):
@@ -1264,7 +1263,9 @@ def main():
     E_star = min(P.seq_energy(F_WIDE), P.seq_energy(F_NARROW))
     amp_of = {pi: P.amp_for(F_of[pi], "energy", E_star) for pi in range(16)}
 
-    print(f"=== 3.2 真实层级 + group-LOPO ({a.design}, stage={a.stage}) ===\n")
+    print(f"=== 3.2 真实层级 + group-LOPO ({a.design}, stage={a.stage}) ===")
+    print(f"  train 位姿 {len(tr)} 个; holdout **封存** {sorted(ho)} "
+          f"(HOLDOUT_LOCK={S.HOLDOUT_LOCK})\n")
     H0, blocks, frow, krow, prow, keys, phys, gauge = level_jacobian(
         g, poses, R, F_of, amp_of, models)
     _, Um = P.model_and_U(g, poses, R, F_of, amp_of)

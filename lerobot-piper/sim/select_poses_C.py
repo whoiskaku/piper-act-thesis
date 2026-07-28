@@ -615,3 +615,32 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ======================= holdout 硬封存（c-pilot-v1） =======================
+
+HOLDOUT_LOCK = True          # True = 任何路径都**不得**把 holdout 位姿交给下游
+
+
+def train_and_holdout(n_train=16, n_hold=5, seed=0):
+    """返回 (train_idx, holdout_idx, cands)。**唯一**允许产生位姿集合的入口。"""
+    cands, _, _ = candidate_poses()
+    Ph = np.array([phi_of(c) for c in cands])
+    tr = greedy_select(cands, n_train, Ph, seed=seed)
+    ho, _cls = stratified_holdout(cands, set(tr), Ph, n=n_hold)
+    return list(tr), list(ho), cands
+
+
+def assert_train_only(idx, holdout_idx, where=""):
+    """**硬断言**: 下游拿到的位姿集合不得包含任何 holdout 位姿。
+
+    用户 2026-07-29(c-pilot-v1): pilot 与完整采集的拟合/模型选择路径
+    **一律不得加载 holdout**; holdout 文件只采集并封存。
+    """
+    bad = sorted(set(idx) & set(holdout_idx))
+    if bad:
+        raise RuntimeError(
+            f"HOLDOUT 泄漏于 {where}: 位姿 {bad} 属于封存集合 {sorted(holdout_idx)}")
+    if HOLDOUT_LOCK and len(set(idx)) != len(idx):
+        raise RuntimeError(f"位姿索引重复于 {where}: {idx}")
+    return True
