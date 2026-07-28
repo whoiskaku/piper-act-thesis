@@ -64,7 +64,12 @@ def pose_table_hash(tr, ho, cands):
 # ======================= 序列构建 =======================
 
 def approach_dir_of(pose, lo, hi):
-    """统一进场方向：**从余量更大的一侧**进场（逐关节，+1 / −1）。
+    """统一进场**出发侧**：**余量更大的一侧**（逐关节，+1 = 从上方出发）。
+
+    注意约定：返回的是**出发侧**，而关节的**行进方向**是它的**反号**
+    （偏置 adir·OFF 随 ramp 衰减到 0 ⇒ 位移 = −adir·OFF）。
+    2026-07-29 实测四臂 planned{j2:−1,j3:+1} vs measured{j2:+1,j3:−1} 全部"不一致",
+    正是这两个定义混用所致 —— 不是硬件问题。落盘时两者都存并显式标注。
 
     固定符号会在贴近可达边界的位姿上把余量吃光（p15 的 q3 只剩 0.33°），
     所以方向按余量选，但对同一位姿是**确定且落盘**的。
@@ -258,8 +263,11 @@ def run_c(pose_idx, joint, arm, dry_run=False, rep=1):
         "injected_joint": int(joint) if arm != "A" else None,
         "u_peak_per_joint": np.abs(da).max(0).tolist(),               # rad
         "seq_energy": float(np.sum(da ** 2) / FPS),                   # rad^2*s
-        "approach_dir": {"planned": meta["approach_dir_planned"],
-                         "measured_from_encoder": adir_meas},
+        "approach_dir": {"planned_start_side": meta["approach_dir_planned"],
+                         "planned_travel": {k: -v for k, v in
+                                            meta["approach_dir_planned"].items()},
+                         "measured_travel_from_encoder": adir_meas,
+                         "note": "start_side 与 travel 天然反号; 比对须用 travel"},
         "dither_phase0": {"cmd_phase_rad": meta["phase0_rad"],
                           "ref_frame": 0,
                           "ref_t_send": (rec["t_send"][0] if rec.get("t_send") else None),
