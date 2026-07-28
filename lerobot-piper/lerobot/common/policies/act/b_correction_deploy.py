@@ -60,6 +60,7 @@ class BCorrectionDeployWrapper:
         self.act = act_policy
         self.device = device
         self.mode = mode
+        self.pi_ckpt = pi_ckpt
         self.verbose = verbose
         self.use_pi = mode in ("full", "pi_only", "record")
         self.apply_delta = mode in ("full", "pi_only")     # record 只观测不施加
@@ -217,7 +218,11 @@ class BCorrectionDeployWrapper:
 
     def _summary_dict(self):
         s, n = self.stats, max(self.stats["frames"], 1)
-        return {"mode": self.mode, "frames": n, "ep": self._ep_count,
+        # ckpt/FF 状态必须落盘: C 臂那次没记, 事后无法确认用的是哪个 seed,
+        # 也无法从日志本身判断 π 与 FF 的占比(2026-07-29)
+        return {"mode": self.mode, "pi_ckpt": str(self.pi_ckpt),
+                "use_ff": bool(self.use_ff), "use_pi": bool(self.use_pi),
+                "frames": n, "ep": self._ep_count,
                 "gated_pct": 100 * s["gated"] / n, "sat_pct": 100 * s["sat"] / n,
                 "stale": s["stale"], "nan": s["nan"],
                 "warmup": s.get("warmup", 0), "da_mean_mrad": 1e3 * s["da_abs_sum"] / n,

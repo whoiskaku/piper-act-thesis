@@ -75,13 +75,16 @@ def site_rot_jac(model, data, sid, q7):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eps", type=int, default=10)
+    ap.add_argument("--repo", default=None, help="只跑这一个 repo(与 --tag 配对)")
+    ap.add_argument("--tag", default=None)
     args = ap.parse_args()
+    ds = [(args.repo, args.tag)] if args.repo else DATASETS
     import mujoco
     model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
     data = mujoco.MjData(model)
     sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "ee_imu_site")
 
-    for repo, tag in DATASETS:
+    for repo, tag in ds:
         # pass1: 渲染缓存 + L + (R,b)  (与 wall_portrait 同法)
         cache, lag_votes = [], []
         for ep in range(args.eps):
