@@ -50,10 +50,12 @@ def h16(x):
 def pose_table_hash(tr, ho, cands):
     """对**规范化后的完整 train+holdout 表**求 hash，不只哈希当前位姿。"""
     rows = []
-    for tag, idx in (("train", sorted(tr)), ("holdout", sorted(ho))):
+    # 集合标记必须是**固定常量** —— Python 内置 hash() 对字符串逐进程随机化,
+    # 用它会让身份 hash 每次运行都不同(2026-07-29: 曾使每次 verify 都失败)。
+    for code, idx in ((0, sorted(tr)), (1, sorted(ho))):
         for i in idx:
             c = cands[i]
-            rows.append([hash(tag) % 7, i, round(float(c["q2"]), 9),
+            rows.append([code, i, round(float(c["q2"]), 9),
                          round(float(c["q3"]), 9), round(float(c["grip"]), 9),
                          round(float(c["dither"]), 9), round(float(c.get("hz", 0.4)), 9)])
     return h16(np.array(rows, float))
