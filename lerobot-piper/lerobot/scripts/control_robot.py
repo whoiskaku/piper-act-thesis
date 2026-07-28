@@ -289,7 +289,9 @@ def record(
             raise ValueError("BCORR_CALIB 未设置(需 IMU 标定 manifest.json)")
         policy = build_b_correction_policy(policy, _bcorr_ckpt, cfg.device, _calib,
                                            mode=_bmode,
-                                           log_path=os.environ.get("BCORR_LOG"))
+                                           log_path=os.environ.get("BCORR_LOG"),
+                                           ff_lag=os.environ.get("BCORR_FF_LAG"),
+                                           ff_blend=os.environ.get("BCORR_FF_BLEND"))
         logging.info(f"B-correction wrapper active (mode={_bmode}, ckpt={_bcorr_ckpt})")
 
     # Build a HistoryBuffer when the loaded policy was trained with autoregressive

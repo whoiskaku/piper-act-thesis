@@ -222,6 +222,8 @@ class BCorrectionDeployWrapper:
         # 也无法从日志本身判断 π 与 FF 的占比(2026-07-29)
         return {"mode": self.mode, "pi_ckpt": str(self.pi_ckpt),
                 "use_ff": bool(self.use_ff), "use_pi": bool(self.use_pi),
+                "ff_lag": int(self.ff_lag), "ff_blend": int(self.ff_blend),
+                "ff_blend_effective": int(max(self.ff_blend - self.ff_lag, 0)),
                 "frames": n, "ep": self._ep_count,
                 "gated_pct": 100 * s["gated"] / n, "sat_pct": 100 * s["sat"] / n,
                 "stale": s["stale"], "nan": s["nan"],
@@ -246,11 +248,20 @@ class BCorrectionDeployWrapper:
 
 
 def build_b_correction_policy(act_policy, pi_ckpt, device, calib_json,
-                              mode="full", log_path=None):
+                              mode="full", log_path=None, ff_lag=None, ff_blend=None):
     """calib_json: 含 {"R": 3x3, "b": 3} 的标定文件（p2_labels/<tag>/manifest.json 同格式）。"""
     m = json.loads(Path(calib_json).read_text())
     R = np.array(m["R"], np.float32)
     b = np.array(m.get("b", [0, 0, 0]), np.float32)
     assert abs(np.linalg.det(R) - 1.0) < 1e-3, f"R 非旋转矩阵 (det={np.linalg.det(R):.4f})"
+    # 2026-07-29: ff_lag/ff_blend 原写死。实测残余滞后 A/D=3 帧、B(lag=2)=1 帧
+    # ⇒ lag=2 欠补偿 1 帧。且 lag 会**丢掉** blend 的前 lag 帧
+    # ⇒ 有效 blend = blend − lag（实测 blend=4,lag=2 时只有 k0/k1 起作用）。
+    # 两者不独立, 必须一起调, 故一并开放。
+    kw = {}
+    if ff_lag is not None:
+        kw["ff_lag"] = int(ff_lag)
+    if ff_blend is not None:
+        kw["ff_blend"] = int(ff_blend)
     return BCorrectionDeployWrapper(act_policy, pi_ckpt, device, R, b,
-                                    mode=mode, log_path=log_path)
+                                    mode=mode, log_path=log_path, **kw)
