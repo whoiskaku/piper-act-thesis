@@ -682,12 +682,86 @@ def e2e_test():
     return 0 if good else 1
 
 
+def zwin(ep, amp, rnd=1, nboot=1000):
+    """逐 (关节, 窗) 的 z(f) / 方向残差 / CI —— **位形相关性的正式判据**。
+
+    2026-07-28 用户定: 位形依赖不能只比幅值比, 要用三轴复数投影 z(f)、方向残差和 CI。
+    z(f) = (H_Ĝ^H H_real)/(H_Ĝ^H H_Ĝ):  |z| = 模型方向上的增益比, arg(z) = 相位误差,
+    方向残差 = 正交分量占比(方向失配)。单窗时 CI 由实测噪声窗给出(γ² 不可用)。
+    """
+    import json
+    BARE = {1: ("A1", "A2"), 2: ("A3", "A4")}[rnd]
+    rt = "" if rnd == 1 else f"r{rnd}_"
+    print(f"=== ep{ep} 第{rnd}轮 {amp}: 逐窗 z(f) / 方向残差 / 95%CI ===")
+    out = {}
+    for jn in ("j2", "j3"):
+        try:
+            seq = np.load(PB / f"seq_ep{ep}_{jn}_{amp}_p.npz", allow_pickle=True)
+            R = {k: json.loads((PB / f"replay_ep{ep}_{rt}{v}.json").read_text()) for k, v in
+                 [("A1", BARE[0]), ("A2", BARE[1]),
+                  ("Bp", f"{jn}_{amp}_p"), ("Bm", f"{jn}_{amp}_m")]}
+        except FileNotFoundError as e:
+            print(f"  {jn}: 缺数据 ({e.filename and Path(e.filename).name}) — 跳过")
+            continue
+        F = np.asarray(seq["freqs"], float)
+        W = {k: arm_windows(R[k], seq, {"A1": 0, "A2": 0, "Bp": 1, "Bm": -1}[k]) for k in R}
+        common = sorted(set.intersection(*[set(v) for v in W.values()]))
+        pred = seq["pred"]
+        tg = np.arange(0, NANA / FPS, 0.01)
+        for w in common:
+            LI = lambda k, f: lockin_at(W[k][w]["y"], W[k][w]["t"], f, W[k][w]["dt"])
+            U = np.array([[(lockin_at(W["Bp"][w]["u"], W["Bp"][w]["t"], f, W["Bp"][w]["dt"])
+                            - lockin_at(W["Bm"][w]["u"], W["Bm"][w]["t"], f,
+                                        W["Bm"][w]["dt"])) / 2 for f in F]])
+            Yo = np.array([[(LI("Bp", f) - LI("Bm", f)) / 2 for f in F]])
+            # Ĝ: 逐成员(不可用成员均值 —— 宽带瞬态上成员分歧大会压低均值)
+            YGk = [np.array([[lockin_at(_bl_eval(pred[k], w / FPS + tg), tg, f) for f in F]])
+                   for k in range(pred.shape[0])]
+            nz = [(np.stack([np.interp(tg, W["A2"][w]["t"], W["A2"][w]["y"][:, c])
+                             - np.interp(tg, W["A1"][w]["t"], W["A1"][w]["y"][:, c])
+                             for c in range(3)], 1)) / 2]
+            zs, rf = [], []
+            for k in range(pred.shape[0]):
+                fr = frf_from_lockin(U, Yo, YGk[k], F)
+                zs.append([fr[float(f)]["z"] for f in F])
+                rf.append([fr[float(f)]["resid_frac"] for f in F])
+            zs, rf = np.array(zs), np.array(rf)
+            km = int(np.argsort(np.abs(zs).mean(1))[len(zs) // 2])      # 中位成员
+            _, ci = bootstrap_lockin(U, Yo, YGk[km], nz, [tg], [None], F,
+                                     nboot=nboot, seed=0)
+            print(f"\n  {jn} 窗{w}  (成员中位 k={km}; 成员间 |z| 极差 "
+                  f"{np.abs(zs).max(0).mean()/max(np.abs(zs).min(0).mean(),1e-9):.2f}×)")
+            print(f"  {'f(Hz)':>7}{'|z|':>8}{'95%CI':>16}{'arg z':>9}{'95%CI':>18}"
+                  f"{'方向残差':>10}")
+            for i, f in enumerate(F):
+                print(f"  {f:>7.1f}{abs(zs[km, i]):>8.2f}"
+                      f"  [{ci['z_abs'][0, i]:>5.2f},{ci['z_abs'][1, i]:>5.2f}]"
+                      f"{np.degrees(np.angle(zs[km, i])):>+8.0f}°"
+                      f"  [{ci['z_phase'][0, i]:>+6.0f},{ci['z_phase'][1, i]:>+6.0f}]°"
+                      f"{rf[km, i]:>10.2f}")
+            out[f"{jn}_w{w}"] = {"z_abs": np.abs(zs[km]).tolist(),
+                                 "z_arg_deg": np.degrees(np.angle(zs[km])).tolist(),
+                                 "resid_frac": rf[km].tolist(),
+                                 "ci_abs": ci["z_abs"].tolist(),
+                                 "ci_phase": ci["z_phase"].tolist()}
+    print(f"\n  判读: |z| 的 CI 若在两窗之间不重叠 ⇒ 位形依赖成立(单轮仍需第二轮复现)。")
+    print(f"        方向残差大 ⇒ 失配不只是增益, 还有方向 —— 逐关节标量增益校准不适用。")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--zwin", action="store_true",
+                    help="逐窗 z(f)/方向残差/CI —— 位形相关性的正式判据")
+    ap.add_argument("--amp", default="4mrad")
+    ap.add_argument("--round", type=int, default=1, choices=[1, 2])
     ap.add_argument("--e2e", action="store_true", help="端到端(合成四臂记录)")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--eps", type=int, nargs="+", default=[0])
     a = ap.parse_args()
+    if a.zwin:
+        zwin(a.eps[0], a.amp, a.round)
+        raise SystemExit(0)
     if a.e2e:
         raise SystemExit(e2e_test())
     if a.self_test:

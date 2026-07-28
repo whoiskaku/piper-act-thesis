@@ -40,7 +40,11 @@ FREQS = np.array([6.0, 6.5, 7.0, 7.5])     # Hz
 NEXC = 40                                   # 2.0 s 激励
 NDEC = 30                                   # 1.5 s 衰减(≥1.2-1.5s)
 PERIOD = NEXC + NDEC                        # 3.5 s 一发
-AMPS = {"4mrad": 0.004, "8mrad": 0.008}     # 合成**总峰值**(不顶 ε=10; 见 D 方案)
+# 合成**总峰值**(不顶 ε=10; 见 D 方案)。2026-07-28: 加入 2mrad —— 用户裁决幅值线性度
+# 改测 2/4 而非 4/8: 按名义 SNR 的平方缩放 SNR₂ ≈ SNR₄/4 ⇒ j2≈10.5 / j3≈15, 仍够辨识,
+# 且更贴近 π 实际约 1 mrad 的工作区。8mrad 降级为后续压力测试。
+AMPS = {"2mrad": 0.002, "4mrad": 0.004, "8mrad": 0.008}
+AMP_FOR_WINDOWS = "8mrad"                   # 选窗按最严幅值 ⇒ 窗集与首轮完全一致
 SIGNS = {"p": +1.0, "m": -1.0}              # D 方案: 正负成对(相位相反)
 JOINTS = {"j2": 1, "j3": 2}
 GATE_TH = 0.04
@@ -181,7 +185,7 @@ def main():
         cmd7 = np.concatenate([a_arm, grip[:, None]], 1)
         T = len(a_arm)
         err, src = tracking_err(a_arm)
-        WJ = {jn: pick_windows(z, T, klo, khi, a_arm, AMPS["8mrad"], err, j)
+        WJ = {jn: pick_windows(z, T, klo, khi, a_arm, AMPS[AMP_FOR_WINDOWS], err, j)
               for jn, j in JOINTS.items()}
         (OUT / f"windows_ep{EP}.json").write_text(json.dumps(
             {"windows_by_joint": WJ, "n_exc": NEXC, "n_dec": NDEC,
@@ -197,8 +201,8 @@ def main():
             for w in wins:
                 sg = slice(w, w + NEXC)
                 v = a_arm[sg, j]
-                m = min((v - AMPS["8mrad"] - klo[j]).min(),
-                        (khi[j] - v - AMPS["8mrad"]).min())
+                m = min((v - AMPS[AMP_FOR_WINDOWS] - klo[j]).min(),
+                        (khi[j] - v - AMPS[AMP_FOR_WINDOWS]).min())
                 e9 = np.percentile(err[sg, j], 99)
                 print(f"      窗{w}: 到可达余量 {np.degrees(m):6.3f}° − 窗内跟踪p99 "
                       f"{np.degrees(e9):6.3f}° = residual {np.degrees(m-e9):+6.3f}°"

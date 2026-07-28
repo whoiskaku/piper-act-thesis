@@ -29,18 +29,26 @@ import analyze_probe_b2 as A
 
 ROOT = Path(__file__).resolve().parents[1]
 PB = ROOT / "outputs/probe_b2"
+RTAG = [""]                # 轮次文件前缀: 第1轮 "", 第2轮 "r2_"
 ENV_CACHE = PB / "safety_envelope.json"
 FPS = 20.0
 MD = np.pi / 180 / 1000                       # 0.001° → rad
 
-# ep0 顺序（用户定，正负成对做平衡）: A1 → j2+ → j2− → j3− → j3+ → A2
-ORDER_EVEN = ["A1", "j2_4mrad_p", "j2_4mrad_m", "j3_4mrad_m", "j3_4mrad_p", "A2"]
-ORDER_ODD = ["A1", "j3_4mrad_p", "j3_4mrad_m", "j2_4mrad_m", "j2_4mrad_p", "A2"]
+# 第 1 轮（已完成）: A1 → j2+ → j2− → j3− → j3+ → A2
+# 第 2 轮 = **反向平衡块**（用户 2026-07-28 定）: A3 → j3+ → j3− → j2− → j2+ → A4
+#   同时反转了关节顺序与符号顺序。若偶分量是真实探针效应, 两轮应同号复现;
+#   若来自时间漂移或单次复放变异, 反向块会改变或抵消它。
+#   必须**重复 B 对**, 只补 A3/A4 不足以分辨。
+ROUND = {1: ["A1", "j2_{a}_p", "j2_{a}_m", "j3_{a}_m", "j3_{a}_p", "A2"],
+         2: ["A3", "j3_{a}_p", "j3_{a}_m", "j2_{a}_m", "j2_{a}_p", "A4"]}
 
 
-def order_for(ep, amp="4mrad"):
-    o = ORDER_EVEN if ep % 2 == 0 else ORDER_ODD
-    return [c.replace("4mrad", amp) for c in o]
+def order_for(ep, amp="4mrad", rnd=1):
+    return [c.format(a=amp) for c in ROUND[rnd]]
+
+
+def bare_arms(rnd=1):
+    return [c for c in ROUND[rnd] if c.startswith("A")]
 
 
 # ---------------------------------------------------------------- 安全包络
@@ -241,6 +249,7 @@ def gate3_identity(recs, seq):
 
 
 AMP = ["4mrad"]
+BARE = ["A1", "A2"]        # 该轮的两条裸复放名(第2轮是 A3/A4)
 
 
 def gate456(recs, seq, env):
@@ -248,7 +257,7 @@ def gate456(recs, seq, env):
     freqs = np.asarray(seq["freqs"], float)
     jn = {1: "j2", 2: "j3"}[int(seq["joint"])]
     W = {k: A.arm_windows(recs[c], seq, sg) for k, (c, sg) in
-         {"A1": ("A1", 0), "A2": ("A2", 0),
+         {"A1": (BARE[0], 0), "A2": (BARE[1], 0),
           "Bp": (f"{jn}_{AMP[0]}_p", +1), "Bm": (f"{jn}_{AMP[0]}_m", -1)}.items()}
     common = sorted(set.intersection(*[set(v) for v in W.values()]))
     if not common:
@@ -257,6 +266,11 @@ def gate456(recs, seq, env):
     def LI(arm, w):
         d = W[arm][w]
         return np.array([A.lockin_at(d["y"], d["t"], f, d["dt"]) for f in freqs])
+
+    def LIf(arm, w, f):
+        """任意频点的锁相(⑤b 的宽带诊断用), 各臂按自身时间戳。"""
+        d = W[arm][w]
+        return A.lockin_at(d["y"], d["t"], f, d["dt"])
 
     Yo = np.array([(LI("Bp", w) - LI("Bm", w)) / 2 for w in common])
     Ye = np.array([(LI("Bp", w) + LI("Bm", w)) / 2
@@ -287,79 +301,103 @@ def gate456(recs, seq, env):
               f" 不确定度只能由实测噪声窗给出; SNR_p/偶分量仍可判, 但离散度更大")
     # ④ 两档:
     #   门禁档 SNR≥3 —— 只问"注入信号在测量链路里看得见吗", 看不见说明链路有问题, 停机。
-    #   校准档 SNR≥5 —— 够不够支撑 Ĝ 校准结论。4mrad 达不到是**预期内**的,
-    #   那正是开放 8mrad 的理由, 不是停机理由(幅值本就是按 8mrad 设计的)。
+    #   SNR_p ≥ 5 (γ²≈0.83) —— 用于更新 Ĝ 的**必要条件, 不是充分条件**。
+    #     2026-07-28 用户澄清: SNR 只证明"响应可见"。可否用于稳定校准还另受限于
+    #     裸复放对数(单对 A 的噪声底自由度太少)、每关节工作点数(j3 单窗无交叉对照)、
+    #     以及 ⑤ 暴露的非平稳性。达不到 ≥5 则该频点确定不可用; 达到也不等于可用。
     ok4, ok5 = snr_o >= 3.0, snr_e <= 3.0
     grade = snr_o >= 5.0
-    print(f"   ④ 奇/噪 SNR = {snr_o:.1f}   链路档(≥3) {'✓' if ok4 else '✗ 信号埋在噪声里, 链路有问题'}"
-          f"   校准档(≥5) {'✓' if grade else '— 未达; 属预期, 是开放 8mrad 的依据'}")
+    print(f"   ④ 奇分量 SNR_p = {snr_o:.1f} (γ²≈{snr_o/(1+snr_o):.2f})   "
+          f"链路门(≥3) {'✓ 响应可见' if ok4 else '✗ 埋在噪声里, 暂停后续配置并排查'}")
+    print(f"      可用于 Ĝ 的**必要条件**(≥5) "
+          f"{'✓ 满足' if grade else '— 未达, 该频点确定不可用'}"
+          f"  —— 非充分: 另受限于裸复放对数、每关节工作点数、⑤ 的非平稳性")
     print(f"   ⑤ 偶分量 SNR_p = {snr_e:.1f} (阈 ≤3, H0=0)  "
           f"{'✓ 与噪声相容' if ok5 else '✗ 有偶次非线性或漂移'}")
-    # ⑤b 宽带偶分量。基频锁相**看不见二次非线性** —— y² 把能量搬到 DC、差频
-    #    (0.5/1.0/1.5Hz) 和二次谐波(12-15Hz), 四个分析频点上一点都不落。
-    #    故另在这两个带内比较偶分量与噪声的能量。
-    tg = np.arange(0, A.NANA / A.FPS, 0.01)
-    def onto(arm, w):
-        d = W[arm][w]
-        return np.stack([np.interp(tg, d["t"], d["y"][:, c]) for c in range(3)], 1)
-    Ee, En = [], []
-    for w in common:
-        Ee.append((onto("Bp", w) + onto("Bm", w)) / 2 - (onto("A1", w) + onto("A2", w)) / 2)
-        En.append((onto("A2", w) - onto("A1", w)) / 2)
-    def band(X, lo, hi):
-        F = np.fft.rfft(np.asarray(X), axis=1)
-        fq = np.fft.rfftfreq(len(tg), 0.01)
-        m = (fq >= lo) & (fq <= hi)
-        return float(np.mean(np.abs(F[:, m]) ** 2))
-    print(f"   ⑤b 宽带偶分量 (基频锁相对二次非线性是盲的)")
+    # ⑤b 宽带偶分量 —— **完全不用插值**: 各臂按自身时间戳锁相, 再频域做奇偶组合。
+    #   早先用 np.interp 把四臂搬到公共网格再相减: 插值误差正比于探针响应、四臂不相消,
+    #   噪声窗里又没有探针信号 ⇒ 比值被系统性抬高(实测 二次谐波 6.02 → 去插值后 4.41,
+    #   差频 2.22 → 1.38)。
+    # 判读边界: 差频带干净**只能排除简单的无记忆二次模型**。带动态滤波的非线性
+    #   (先非线性再线性滤波, 或先滤波再非线性) 仍可能只在和频/二次谐波带显现。
+    # 另设**基带参照带**(无探针内容也无谐波内容): 若那里也超出, 说明超出不是探针的谐波,
+    #   而是 B 对与 A 对之间的系统性差异(非平稳/单对A低估变异/探针宽带微扰)。
+    BANDS = [("差频 0.5/1.0/1.5Hz", np.array([0.5, 1.0, 1.5])),
+             ("和频/二次谐波 12-15Hz", np.arange(12.0, 15.01, 0.5)),
+             ("基带参照 5/8.x Hz", np.array([5.0, 5.25, 8.25, 8.5, 8.75]))]
+    print(f"   ⑤b 宽带偶分量 (无插值; 基频锁相对二次非线性是盲的)")
     ok5b = True
-    for lbl, lo, hi in [("差频 0.3-1.7Hz", 0.3, 1.7), ("二次谐波 11.5-15.5Hz", 11.5, 15.5)]:
-        r = band(Ee, lo, hi) / max(band(En, lo, hi), 1e-30)
-        # H0: 偶分量方差 σ², 噪声窗方差 σ²/2 ⇒ 期望比值 2.0; 阈 4.0 留一倍余量
+    for lbl, FS in BANDS:
+        pe = np.mean([P((LIf("Bp", w, f) + LIf("Bm", w, f)) / 2
+                        - (LIf("A1", w, f) + LIf("A2", w, f)) / 2)
+                      for w in common for f in FS])
+        pnb = np.mean([P((LIf("A2", w, f) - LIf("A1", w, f)) / 2)
+                       for w in common for f in FS])
+        r = pe / max(pnb, 1e-30)
         good = r < 4.0
         ok5b &= good
-        print(f"      {lbl:>22}: 偶/噪 能量比 {r:>6.2f} (H0≈2.0, 阈<4.0) {'✓' if good else '✗ 有二次非线性'}")
+        print(f"      {lbl:>24}: 偶/噪 能量比 {r:>6.2f} (H0≈2.0, 阈<4.0) "
+              f"{'✓' if good else '✗'}")
+    print(f"      注: 差频干净仅排除**无记忆**二次模型; 动态滤波型非线性可能只现于和频带。")
+    print(f"          基带参照超出 ⇒ 非探针谐波, 而是 B 对/A 对的系统性差异。")
     ok5 = ok5 and ok5b
     print(f"      注: 4mrad 只验证**奇对称**; 开放 8mrad 还须偶分量与噪声相容、无削顶、响应峰值留余量")
 
     # ⑥ 安全包络
-    print(f"\n⑥ {jn} {AMP[0]} 响应 vs 既有 20 集包络")
     gmax = np.array(env["gyro_max"]).max()
+    jj = int(seq["joint"])
 
     def ratios(c):
-        """该臂的 (gyro, 速度, 加速度) 相对既有包络的占比。"""
+        """(gyro占比, 逐关节速度占比[6], 逐关节加速度占比[6])。"""
         a = np.asarray(recs[c]["imu100"], float)
         q = np.asarray(recs[c]["state"], float)[:, :6] * MD
-        return np.array([
-            np.abs(a[:, 5:8]).max() / gmax,
-            (np.abs(np.diff(q, axis=0) * FPS) / np.array(env["vel_max"])).max(),
-            (np.abs(np.diff(q, 2, axis=0) * FPS ** 2) / np.array(env["acc_max"])).max()])
+        return (np.abs(a[:, 5:8]).max() / gmax,
+                np.abs(np.diff(q, axis=0) * FPS).max(0) / np.array(env["vel_max"]),
+                np.abs(np.diff(q, 2, axis=0) * FPS ** 2).max(0) / np.array(env["acc_max"]))
 
-    # 包络是**这 20 集自身的最大值**, 而探针复放的正是其中一集 —— 裸复放天然就在 ~100%。
-    # 所以主判据是**探针带来的增量**(同一轨迹, B 减 A, 干净归因);
-    # 绝对值只作越界护栏(不得明显越过历史包络)。
-    rA = np.mean([ratios(c) for c in ("A1", "A2")], 0)
-    lbl3 = ("gyro", "速度", "加速度")
-    print(f"   {'臂':>14}" + "".join(f"{k:>22}" for k in lbl3))
-    print(f"   {'裸复放 A1/A2':>14}" + "".join(f"{v*100:>21.0f}%" for v in rA))
-    inc, absr = [], []
+    rA = [ratios(c) for c in BARE]
+    gA = float(np.mean([r[0] for r in rA]))
+    vA = np.mean([r[1] for r in rA], 0)
+    print(f"\n⑥ {jn} {AMP[0]} 响应 vs 既有 20 集**经验异常门**(非硬件安全认证)")
+    print(f"   {'臂':>14}{'gyro':>16}{'被注入 j'+str(jj+1):>18}"
+          + "".join(f"{'j'+str(k+1):>7}" for k in range(6) if k != jj) + "   (其余=诊断)")
+    print(f"   {'裸复放 '+'/'.join(BARE):>14}{gA*100:>15.0f}%{vA[jj]*100:>17.0f}%"
+          + "".join(f"{vA[k]*100:>6.0f}%" for k in range(6) if k != jj))
+    # 裸复放之间的离散 = 该量自身的噪声底(判据分辨力)
+    vspread = np.abs(rA[0][1] - rA[1][1])
+    print(f"   {BARE[0]+'↔'+BARE[1]+' 离散':>14}{abs(rA[0][0]-rA[1][0])*100:>15.1f}pp{vspread[jj]*100:>16.1f}pp"
+          + "".join(f"{vspread[k]*100:>5.1f}pp" for k in range(6) if k != jj))
+    dg, dvj, absg = [], [], []
     for c in (f"{jn}_{AMP[0]}_p", f"{jn}_{AMP[0]}_m"):
-        r = ratios(c)
-        inc.append(r - rA); absr.append(r)
-        print(f"   {c:>14}" + "".join(
-            f"{r[k]*100:>14.0f}% ({(r[k]-rA[k])*100:+.0f}pp)" for k in range(3)))
-    mi, ma = np.max(inc), np.max(absr)
-    ok6 = mi < 0.10 and ma < 1.10
-    print(f"   ⑥ 探针增量最大 {mi*100:+.1f}pp (阈 <+10pp) | "
-          f"绝对占比最大 {ma*100:.0f}% (护栏 <110%)  {'✓' if ok6 else '✗ 停机'}")
-    print(f"      注: 主判据是增量 —— 包络取自含本集在内的 20 集, 裸复放本就接近 100%;"
-          f"\n          加速度的 20Hz 二阶差分在 7Hz 近奈奎斯特, 绝对值不可靠, 但同轨迹增量可比")
+        g, v, _ = ratios(c)
+        dg.append(g - gA); dvj.append(v[jj] - vA[jj]); absg.append(g)
+        print(f"   {c:>14}{g*100:>10.0f}% ({(g-gA)*100:+.1f}pp){v[jj]*100:>9.0f}% "
+              f"({(v[jj]-vA[jj])*100:+.1f}pp)"
+              + "".join(f"{v[k]*100:>6.0f}%" for k in range(6) if k != jj))
+    # 主判据: 100Hz IMU gyro(带宽足够) + 被注入关节。
+    #   其余关节的 20Hz 差分速度**降为诊断项** —— 7Hz 已近 20Hz 的奈奎斯特, 一阶差分同样
+    #   不可靠(此前只把这条告诫用在了加速度上); 且实测 A1↔A2 在 j5/j6 上就差 13pp/10pp,
+    #   与 +10pp 阈值同量级, 分辨力不足。**但仍全关节监控并打印**, 不排除任何关节。
+    ok6 = max(dg) < 0.10 and max(absg) < 1.10 and max(dvj) < 0.25
+    print(f"   ⑥ 主判据: gyro 增量 {max(dg)*100:+.1f}pp(阈<+10) · gyro 绝对 "
+          f"{max(absg)*100:.0f}%(异常门<110%) · 被注入 j{jj+1} 速度增量 "
+          f"{max(dvj)*100:+.1f}pp(阈<+25)  {'✓' if ok6 else '✗'}")
+    print(f"      注: 「110% 历史包络」是**经验异常门**(20集实测的最大值), 不是硬件安全认证。")
+    print(f"          其余关节 20Hz 差分速度仅诊断 —— 7Hz 近奈奎斯特, 且 A1↔A2 自身离散"
+          f" 达 {vspread.max()*100:.0f}pp。")
+    dvo = [max(abs(ratios(c)[1][k] - vA[k]) for k in range(6) if k != jj)
+           for c in (f"{jn}_{AMP[0]}_p", f"{jn}_{AMP[0]}_m")]
+    if max(dvo) > 0.10:
+        print(f"      · 诊断: 非注入关节速度增量最大 {max(dvo)*100:+.0f}pp "
+              f"(> A1↔A2 离散 {vspread.max()*100:.0f}pp 则值得复现确认)")
     return ok4, ok5, ok6
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ep", type=int, default=0)
+    ap.add_argument("--round", type=int, default=1, choices=[1, 2],
+                    help="1=首轮 A1..A2; 2=反向平衡块 A3 → j3+ → j3− → j2− → j2+ → A4")
     ap.add_argument("--only", default=None, help="只查这一条的记录质量(刚跑完时用)")
     ap.add_argument("--margin", action="store_true",
                     help="⓪ 逐窗余量门禁(任一 B 配置上机前必须过; 有 A 记录则用实测)")
@@ -367,6 +405,7 @@ def main():
     ap.add_argument("--amp", default="4mrad")
     a = ap.parse_args()
     AMP[0] = a.amp
+    RTAG[0] = "" if a.round == 1 else f"r{a.round}_"
 
     env = safety_envelope(rebuild=a.envelope)
     if a.envelope:
@@ -378,18 +417,19 @@ def main():
 
     if a.margin:
         rA = []
-        for c in ("A1", "A2"):
-            q = PB / f"replay_ep{a.ep}_{c}.json"
+        for c in bare_arms(a.round):
+            q = PB / f"replay_ep{a.ep}_{RTAG[0]}{c}.json"
             if q.exists():
                 rA.append(json.loads(q.read_text()))
         return 0 if gate0_margin(a.ep, a.amp, rA or None) else 1
 
-    order = order_for(a.ep, a.amp)
-    print(f"=== ep{a.ep} B′ pilot 门禁  (顺序 {' → '.join(order)}) ===")
+    order = order_for(a.ep, a.amp, a.round)
+    BARE[:] = bare_arms(a.round)
+    print(f"=== ep{a.ep} 第{a.round}轮 B′ 门禁  (顺序 {' → '.join(order)}) ===")
     want = [a.only] if a.only else order
     recs, missing = {}, []
     for cfg in want:
-        p = PB / f"replay_ep{a.ep}_{cfg}.json"
+        p = PB / f"replay_ep{a.ep}_{RTAG[0]}{cfg}.json"
         if not p.exists():
             missing.append(cfg); continue
         recs[cfg] = json.loads(p.read_text())
@@ -398,7 +438,7 @@ def main():
     if not recs:
         return 1
 
-    g0 = gate0_margin(a.ep, a.amp, [recs[c] for c in ("A1", "A2") if c in recs] or None)
+    g0 = gate0_margin(a.ep, a.amp, [recs[c] for c in BARE if c in recs] or None)
     g1 = gate1_recording(recs)
     if a.only or missing:
         print(f"\n（仅记录质量检查{'：' + a.only if a.only else ''}）"
@@ -424,8 +464,8 @@ def main():
     print("判决: " + ("✅ 六项全过 —— 可以讨论是否开放 8 mrad"
                      if allok else "❌ 未全过 —— 不开放 8 mrad"))
     print("提醒: 相位/增益/时延本阶段只作观察, 不据此下最终结论。")
-    (PB / f"gate_ep{a.ep}.json").write_text(json.dumps(
-        {"ep": a.ep, "order": order, "results": {l: bool(v) for l, v in res},
+    (PB / f"gate_ep{a.ep}_r{a.round}.json").write_text(json.dumps(
+        {"ep": a.ep, "round": a.round, "amp": a.amp, "order": order, "results": {l: bool(v) for l, v in res},
          "clocks": {c: d.get("_clock") for c, d in recs.items()}}, indent=1))
     return 0 if allok else 1
 

@@ -93,7 +93,9 @@ def safety_checks(cmd7, da, model_path=None):
 
 def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=None):
     cmd7, da, z = load_seq(seqfile, b2)
-    use_probe = arm.startswith("B") or (b2 and arm not in ("A1", "A2"))
+    import re
+    is_bare = bool(re.fullmatch(r"A\d+", arm))      # A1/A2/A3/A4… 全是裸复放
+    use_probe = arm.startswith("B") or (b2 and not is_bare)
     total = cmd7[:, :6] + (da if use_probe else 0.0)
     print(f"=== 复放 {arm} ({'加探针' if use_probe else '裸'}) · {len(cmd7)} 帧 "
           f"= {len(cmd7)/FPS:.0f}s ===")
@@ -232,7 +234,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=No
             for ht, ms, ac, gy in rdr.drain_recording():
                 rec["imu100"].append([float(ht), int(ms), *map(float, ac), *map(float, gy)])
             rdr.stop_recording()
-        p = (outdir or PROBE) / f"replay_{tag}{arm}.json"
+        p = (outdir or PROBE) / f"replay_{tag}{arm}.json"   # tag 含 ep 与轮次
         rec["stopped"] = stopped
         rec["seqfile"] = seqfile
         p.write_text(json.dumps(rec))
@@ -247,13 +249,20 @@ if __name__ == "__main__":
     ap.add_argument("--ep", type=int, default=None,
                     help="pp2 集号(0/1/2); 用 probe_seq_pp2_ep{ep}.npz, 输出 replay_ep{ep}_*.json")
     ap.add_argument("--b2", action="store_true", help="用 B′(6-8Hz 多正弦)序列")
+    ap.add_argument("--amp", default="4mrad", help="A 臂借哪个幅值的 cmd7(内容无关)")
+    ap.add_argument("--round", type=int, default=1, choices=[1, 2],
+                    help="2 = 反向平衡块(输出文件加 _r2_ 前缀, 不覆盖首轮)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     if a.b2:
-        cfg = a.arm if a.arm not in ("A1", "A2") else "j2_8mrad_p"   # A 臂借任一序列的 cmd7
+        import re as _re
+        cfg = ("j2_" + a.amp + "_p" if _re.fullmatch(r"A\d+", a.arm)
+               else a.arm)                          # A 臂借任一序列的 cmd7(只用 cmd7)
         seqfile = f"seq_ep{a.ep}_{cfg}.npz"
+        # 轮次后缀: 第2轮的 B 臂配置名与第1轮相同, 不加后缀会**覆盖首轮数据**
+        tag = f"ep{a.ep}_" if a.round == 1 else f"ep{a.ep}_r{a.round}_"
         raise SystemExit(run(a.arm, a.dry_run, seqfile=seqfile,
-                             tag=f"ep{a.ep}_", b2=True, outdir=PB2))
+                             tag=tag, b2=True, outdir=PB2))
     seqfile = f"probe_seq_pp2_ep{a.ep}.npz" if a.ep is not None else "probe_seq.npz"
     tag = f"ep{a.ep}_" if a.ep is not None else ""
     raise SystemExit(run(a.arm, a.dry_run, seqfile=seqfile, tag=tag))
