@@ -67,13 +67,15 @@ def safety_envelope(rebuild=False):
 
 # ---------------------------------------------------------------- 逐项
 def limits():
-    import mujoco
-    from ideal_imu_kinematic import MODEL_PATH
-    from make_probe_b2 import robot_limits
-    mj = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
-    rlo, rhi = robot_limits()
-    return (np.maximum(mj.jnt_range[:6, 0] - 0.035, rlo),
-            np.minimum(mj.jnt_range[:6, 1] + 0.035, rhi))
+    """返回 (可达下界, 可达上界)。
+
+    2026-07-28: 原来用 robot_limits()(实测范围±2°)。但那对**会饱和的关节**给出比可达
+    范围宽 2° 的界 —— j2 指令到过 −2.40° 而编码器只到 −0.07°; j3 到过 +0.94° 而编码器
+    只到 +0.09°。用它算余量会高估 2°, 且削顶检测永远触发不了(编码器饱和在 0° 时
+    q ≤ lo=−2° 不成立)。余量与削顶都必须对**可达范围**判。
+    """
+    from make_probe_b2 import reach_limits
+    return reach_limits()
 
 
 def gate0_margin(ep, amp, recA=None):
@@ -126,27 +128,36 @@ def gate0_margin(ep, amp, recA=None):
             ok &= bool(good)
             print(f"{jn:>5}{w:>6}{D(mn):>9.3f}°{D(mp):>9.3f}°{D(mm):>9.3f}°"
                   f"{D(e9):>9.3f}°{D(res):>+10.3f}°  {'✓' if good else '✗'}")
-    # 命令削顶: 编码器在限位处出现平台而指令仍在动 ⇒ 控制器截断
+    # 命令削顶 = 编码器**钉在可达边界不动** 且 指令**在明显移动** ⇒ 控制器/硬件截断。
+    #   · "在动"阈值取 1°/s: 早先用 1e-5 rad/帧(0.0006°) —— 指令的量化抖动都算在动, 误报
+    #   · **按注入窗判门禁**: 基准轨迹别处的削顶(j2 指令到 −1.77° 而可达下界 −0.07°)是
+    #     六臂共有的属性, 与探针无关, 只作信息报告, 不阻断
     clip = False
     if recA:
+        from make_probe_b2 import NEXC, JOINTS
+        winj = {j: [int(x) for x in seqs[jn]["wins"]] for jn, j in JOINTS.items()}
         for d in recA:
             q = np.asarray(d["state"], float)[:, :6] * MD
             c = np.asarray(d["cmd"], float)[:, :6]
             n = min(len(q), len(c))
             for j in range(6):
-                # 削顶 = 编码器**钉住不动** 且 已到/越过限位 且 指令仍在动。
-                # 三个条件都要。早先只写了后两条: 起始位姿在实测限位外(j5 停在
-                # safe_disable 的 28.9°, 限位上界 24.5°)时 hi−q 为负也满足 "<0.2°",
-                # 而编码器正在以 100°/s 下行 —— 判成削顶是假阳性。
                 still = np.abs(np.diff(q[:n, j], prepend=q[0, j])) * FPS < np.radians(0.5)
-                out = (q[:n, j] <= lo[j]) | (q[:n, j] >= hi[j])
-                mv = np.abs(np.diff(c[:n, j], prepend=c[0, j])) > 1e-5
-                k = int((still & out & mv).sum())
-                if k > 3:
+                out = ((q[:n, j] <= lo[j] + np.radians(0.1))
+                       | (q[:n, j] >= hi[j] - np.radians(0.1)))
+                mv = np.abs(np.diff(c[:n, j], prepend=c[0, j])) * FPS > np.radians(1.0)
+                bad = still & out & mv
+                inw = np.zeros(n, bool)
+                for w in winj.get(j, []):
+                    inw[w:w + NEXC] = True
+                k_in, k_all = int((bad & inw).sum()), int(bad.sum())
+                if k_in > 3:                       # 注入窗内削顶 ⇒ 阻断
                     clip = True
-                    print(f"   ✗ 削顶: {d.get('arm')} j{j+1} 有 {k} 帧编码器钉在限位"
-                          f"而指令仍在动")
-        print(f"   命令削顶检查: {'✗ 发现削顶' if clip else '✓ 未发现'}")
+                    print(f"   ✗ 削顶(注入窗内): {d.get('arm')} j{j+1} {k_in} 帧 "
+                          f"—— 该窗不得注入")
+                elif k_all > 3:                    # 窗外削顶 ⇒ 只报告
+                    print(f"   · 削顶(注入窗外, 不阻断): {d.get('arm')} j{j+1} {k_all} 帧 "
+                          f"—— 基准轨迹本身的属性, 六臂共有")
+        print(f"   命令削顶检查(注入窗内): {'✗ 发现削顶' if clip else '✓ 未发现'}")
     else:
         print(f"   命令削顶检查: — 需 A 实测记录")
     ok &= not clip
@@ -271,6 +282,9 @@ def gate456(recs, seq, env):
         se = max(P(Ye[:, i]) - 2 * pn, 0.0) / max(2 * pn, 1e-30)
         print(f"{f:>7.1f}{np.sqrt(P(Yo[:, i]))*1e3:>9.2f}{np.sqrt(P(Ye[:, i]))*1e3:>9.2f}"
               f"{np.sqrt(pn)*1e3:>9.2f}{so:>9.1f}{so/(1+so):>9.2f}{se:>10.1f}")
+    if nw < 2:
+        print(f"   ⚠ {jn} 只有 1 个注入窗 —— 无窗间独立观测: H1 的 γ² 无意义(已置 NaN),"
+              f" 不确定度只能由实测噪声窗给出; SNR_p/偶分量仍可判, 但离散度更大")
     # ④ 两档:
     #   门禁档 SNR≥3 —— 只问"注入信号在测量链路里看得见吗", 看不见说明链路有问题, 停机。
     #   校准档 SNR≥5 —— 够不够支撑 Ĝ 校准结论。4mrad 达不到是**预期内**的,

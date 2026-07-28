@@ -58,7 +58,10 @@ def make_rec(seq, sign, cfg, seed, g=1.4, tau=0.075, rot=8.0, nz=0.045,
     from scipy.signal import butter, filtfilt
     bb, aa = butter(2, 4.0, fs=FPS, btype="low")
     q = np.zeros((n20, 7))
-    q[:, :6] = filtfilt(bb, aa, base[:, :6] + da * 0.30, axis=0) / MD
+    qq = filtfilt(bb, aa, base[:, :6] + da * 0.30, axis=0)
+    from make_probe_b2 import reach_limits
+    klo, khi = reach_limits()              # 真机到不了可达范围之外(j2 饱和在 −0.07°)
+    q[:, :6] = np.clip(qq, klo, khi) / MD
     q[:, 6] = base[:, 6] / MD
     imu100 = np.concatenate([host[:, None], ms[:, None],
                              np.zeros((len(ms), 3)), y], 1)

@@ -132,7 +132,13 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=No
     # j5=0.16° —— 直接开跑会在 0.6s 内扫过 29°, j5 峰速 102°/s = 既有包络的 155%,
     # 且六臂的起始位姿取决于机械臂停在哪里(门禁③ 就只能验"停机位姿可复现")。
     # 故先用 PREMOVE_S 秒线性插值缓慢过去, 再稳定 PRESETTLE_S 秒。
-    PREMOVE_S, PRESETTLE_S, PRE_TOL = 3.0, 1.0, np.radians(1.0)
+    # 判据(2026-07-28 A1 二跑修正): 不能要求"到达 cmd7[0]" —— 该指令的 j2 = −1.23°
+    # **低于 j2 的可达下界 −0.07°**, 真机在稳态上到不了(静态偏差 +1.17°)。
+    # 改判两条: (a) 已**稳定**(末段速度 <0.5°/s);
+    #          (b) 偏差 ≤ 该关节"指令超出可达范围的量" + 1° 的裕度。
+    # 六臂之间的一致性由门禁③(state_init 离散 <0.5°)把关, 那才是真正要保证的。
+    PREMOVE_S, PRESETTLE_S = 3.0, 1.5
+    PRE_VEL_TOL = np.radians(0.5)                  # °/s
     q_now = (obs0["observation.state"].numpy()[:6] * np.pi / 180 / 1000).astype(np.float32)
     q_tgt = cmd7[0, :6].astype(np.float32)
     n_pre = int(PREMOVE_S * FPS)
@@ -144,17 +150,34 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=No
         act = np.concatenate([q_now + w * (q_tgt - q_now), cmd7[0, 6:7]]).astype(np.float32)
         robot.send_action(torch.from_numpy(act))
         time.sleep(DT)
+    settle = []
     for _ in range(int(PRESETTLE_S * FPS)):               # 稳定, 让余振衰完
         robot.send_action(torch.from_numpy(
             np.concatenate([q_tgt, cmd7[0, 6:7]]).astype(np.float32)))
+        settle.append(robot.capture_observation()["observation.state"].numpy()[:6]
+                      * np.pi / 180 / 1000)
         time.sleep(DT)
     obs0 = robot.capture_observation()                    # 起始状态改在**预移动后**取
     q_pre = obs0["observation.state"].numpy()[:6] * np.pi / 180 / 1000
-    dev = float(np.abs(q_pre - q_tgt).max())
-    print(f"  预移动后离首帧位姿 {np.degrees(dev):.3f}° "
-          f"(阈 {np.degrees(PRE_TOL):.1f}°)  {'✓' if dev <= PRE_TOL else '✗'}")
-    assert dev <= PRE_TOL, (f"预移动未到位, 最大偏差 {np.degrees(dev):.3f}° —— 停机排查, "
-                            f"六臂起始位姿必须一致")
+    # (a) 稳定: 末段 0.5s 的关节速度
+    tail = np.asarray(settle[-int(0.5 * FPS):], float)
+    vmax = float(np.abs(np.diff(tail, axis=0) * FPS).max()) if len(tail) > 1 else 0.0
+    # (b) 偏差 ≤ 指令超出可达范围的量 + 1°
+    from make_probe_b2 import reach_limits
+    klo, khi = reach_limits()
+    unreach = np.maximum(np.maximum(klo - q_tgt, q_tgt - khi), 0.0)
+    tol = unreach + np.radians(1.0)
+    dev = np.abs(q_pre - q_tgt)
+    j_bad = int(np.argmax(dev - tol))
+    print(f"  预移动后: 末段峰速 {np.degrees(vmax):.3f}°/s (阈 {np.degrees(PRE_VEL_TOL):.1f})"
+          f"  {'✓稳定' if vmax <= PRE_VEL_TOL else '✗未稳定'}")
+    print(f"    逐关节 |偏差| {np.round(np.degrees(dev), 3)}°  容差 {np.round(np.degrees(tol), 3)}°"
+          f"  (含指令超出可达范围 {np.round(np.degrees(unreach), 3)}°)")
+    assert vmax <= PRE_VEL_TOL, f"预移动后仍在动 ({np.degrees(vmax):.3f}°/s) —— 停机排查"
+    assert (dev <= tol).all(), (
+        f"预移动未到位: j{j_bad+1} 偏差 {np.degrees(dev[j_bad]):.3f}° > 容差 "
+        f"{np.degrees(tol[j_bad]):.3f}° —— 停机排查, 六臂起始位姿必须一致")
+    print(f"  ✓ 预移动到位 (最大超容差 {np.degrees((dev - tol).max()):+.3f}°)")
 
     # t_send: **JointCtrl 真正写总线的时刻**(ZOH 起点), monotonic 与 TSND host_t 同钟。
     # 同时存 t_send_span = post−pre, 用于量化"实际发送时刻"本身的不确定度。
@@ -165,7 +188,9 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=No
            "cmd_hash": cmd_hash, "seqfile": seqfile, "use_probe": bool(use_probe),
            "premove": {"s": PREMOVE_S, "settle_s": PRESETTLE_S,
                        "q_parked": q_now.tolist(), "q_start": q_pre.tolist(),
-                       "dev_deg": float(np.degrees(dev))},
+                       "dev_deg": np.degrees(dev).tolist(),
+                       "tol_deg": np.degrees(tol).tolist(),
+                       "settle_vmax_dps": float(np.degrees(vmax))},
            "state_init": obs0["observation.state"].numpy().tolist()}
     print(f"  基准指令 hash {cmd_hash}  起始关节 "
           f"{np.round(np.array(rec['state_init'][:6]) * np.pi / 180 / 1000, 4)}")

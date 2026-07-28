@@ -59,6 +59,25 @@ def schroeder(freqs, n, fps=FPS, seed=0):
     return (x / cf).astype(np.float32), ph, float(cf / np.sqrt(np.mean(x ** 2)) * 1)
 
 
+def reach_limits():
+    """**可达范围** = 20 集编码器实测 min/max, 不加任何余量。
+
+    2026-07-28 A1 pilot 查出: `robot_limits()` 的「实测范围 ±2°」对**会饱和的关节**
+    给出比可达范围宽 2° 的界。实测证据:
+      · j2 指令到过 −2.40° 但编码器只到 −0.07°; 指令 <−0.5° 时静态偏差 +1.17°
+      · j3 指令到过 +0.94° 但编码器只到 +0.09°; 指令 ∈[0.3,1.0) 时偏差 −0.469°
+    注入窗必须按**可达范围**留余量 —— 顶在饱和点上时探针的一个半周会被吞掉,
+    奇对称直接破坏(ep0 的 j3 窗 320 即此: 加 4mrad 后指令到 +0.49°, 超饱和点 0.4°)。
+    """
+    from compare_ideal_methods import load_episode
+    E = []
+    for repo, n in [("enolab-guo/eval_pickplace2_100k", 10), ("enolab-guo/eval_ab_A", 10)]:
+        for ep in range(n):
+            E.append(load_episode(repo, ep)["state_mdeg"][:, :6] * np.pi / 180 / 1000)
+    E = np.concatenate(E)
+    return E.min(0), E.max(0)
+
+
 def robot_limits(margin=0.035):
     """真机安全限位 = 20 集实测编码器范围 ± margin(默认 2°)。
 
@@ -100,27 +119,32 @@ def tracking_err(a_arm):
     return np.abs(q - a_arm[:n]), f"{best[1]} ep{best[2]}"
 
 
-def pick_windows(z, T, mj_lo, mj_hi, a_arm, amp_max, err, j, need=0.5):
-    """选 **该关节 j** 的注入窗: 运动段、非接触、且
+def pick_windows(z, T, rlo, rhi, a_arm, amp_max, err, j, need=0.5, travel=2.0):
+    """选 **该关节 j** 的注入窗。四条要求(后两条是 2026-07-28 A1 pilot 后加的):
 
-        residual margin = min(B± 到限位的余量) − p99(|编码器−指令|)  ≥ need(默认 0.5°)
+      1. 整臂在运动段(IMU gyro 门) 且 非接触
+      2. residual margin = min(B± 到**可达范围**的余量) − p99(|编码器−指令|) ≥ need
+      3. **被注入的关节自己**在动: 窗内该关节行程 ≥ travel(默认 2°)
+         —— 原来只看整臂 gyro, 结果 ep0 的 j3 窗 320 被选中, 但 j3 在那 2 秒里
+            只走了 0.60°、40 帧中 28 帧是编码器平台, 且正顶在饱和上限
+      4. 余量算到 reach_limits() 而非 robot_limits() (见 reach_limits 的说明)
 
-    按关节独立选 —— 同一窗对 j2 安全不代表对 j3 安全(实测 w280 对 j3 为 −2.7°)。
+    按关节独立选 —— 同一窗对 j2 安全不代表对 j3 安全(实测 ep0 w280 对 j3 为 −2.7°)。
     """
     gate = smooth(np.linalg.norm(z["real"][:, 3:6], axis=1))
     moving = gate >= GATE_TH
     contact = z["mask_contact"]
-    need = np.radians(need)
+    need, travel = np.radians(need), np.radians(travel)
     wins = []
     t = PERIOD
     while t + PERIOD < T:
         seg = slice(t, t + NEXC)
-        if not moving[seg].all() or contact[seg].any():
-            t += 10
-            continue
         v = a_arm[seg, j]
-        m = min((v - amp_max - mj_lo[j]).min(), (mj_hi[j] - v - amp_max).min())
-        if m - np.percentile(err[seg, j], 99) < need:
+        bad = (not moving[seg].all() or contact[seg].any()
+               or (v.max() - v.min()) < travel
+               or min((v - amp_max - rlo[j]).min(), (rhi[j] - v - amp_max).min())
+               - np.percentile(err[seg, j], 99) < need)
+        if bad:
             t += 10
             continue
         wins.append(int(t))
@@ -137,12 +161,14 @@ def main():
     from ideal_imu_kinematic import MODEL_PATH
     mj = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
     mlo, mhi = mj.jnt_range[:6, 0], mj.jnt_range[:6, 1]
-    rlo, rhi = robot_limits()                       # 真机实测范围 ±2°
-    lo = np.maximum(mlo - 0.035, rlo)               # 兜底: 模型限位也放宽同样余量
+    rlo, rhi = robot_limits()                       # 真机实测范围 ±2° (安全限位用)
+    lo = np.maximum(mlo - 0.035, rlo)
     hi = np.minimum(mhi + 0.035, rhi)
-    print("安全限位(真机实测±2° ∩ 模型±2°):")
+    klo, khi = reach_limits()                       # **可达范围**(不加余量, 选窗用)
+    print("安全限位(真机实测±2° ∩ 模型±2°) / 可达范围(20集编码器实测):")
     for j in (1, 2):
-        print(f"  j{j+1}: [{np.degrees(lo[j]):.1f}°, {np.degrees(hi[j]):.1f}°]")
+        print(f"  j{j+1}: 安全 [{np.degrees(lo[j]):7.2f}, {np.degrees(hi[j]):7.2f}]°   "
+              f"可达 [{np.degrees(klo[j]):7.2f}, {np.degrees(khi[j]):7.2f}]°")
     rig = Rigid()
     models = load_ensemble(rigid=rig)
     man = json.loads((TP.LROOT / TAG / "manifest.json").read_text())
@@ -155,11 +181,12 @@ def main():
         cmd7 = np.concatenate([a_arm, grip[:, None]], 1)
         T = len(a_arm)
         err, src = tracking_err(a_arm)
-        WJ = {jn: pick_windows(z, T, lo, hi, a_arm, AMPS["8mrad"], err, j)
+        WJ = {jn: pick_windows(z, T, klo, khi, a_arm, AMPS["8mrad"], err, j)
               for jn, j in JOINTS.items()}
         (OUT / f"windows_ep{EP}.json").write_text(json.dumps(
             {"windows_by_joint": WJ, "n_exc": NEXC, "n_dec": NDEC,
              "freqs": FREQS.tolist(), "src_rollout": src,
+             "reach_deg": {"lo": np.degrees(klo).tolist(), "hi": np.degrees(khi).tolist()},
              "track_p99_deg": {jn: float(np.degrees(np.percentile(err[:, j], 99)))
                                for jn, j in JOINTS.items()}}))
         print(f"\n=== ep{EP}: {T}帧={T/FPS:.0f}s · 跟踪误差源 {src} ===")
@@ -170,10 +197,12 @@ def main():
             for w in wins:
                 sg = slice(w, w + NEXC)
                 v = a_arm[sg, j]
-                m = min((v - AMPS["8mrad"] - lo[j]).min(), (hi[j] - v - AMPS["8mrad"]).min())
+                m = min((v - AMPS["8mrad"] - klo[j]).min(),
+                        (khi[j] - v - AMPS["8mrad"]).min())
                 e9 = np.percentile(err[sg, j], 99)
-                print(f"      窗{w}: min(B±)余量 {np.degrees(m):6.3f}° − 窗内跟踪p99 "
-                      f"{np.degrees(e9):6.3f}° = residual {np.degrees(m-e9):+6.3f}°")
+                print(f"      窗{w}: 到可达余量 {np.degrees(m):6.3f}° − 窗内跟踪p99 "
+                      f"{np.degrees(e9):6.3f}° = residual {np.degrees(m-e9):+6.3f}°"
+                      f"   本关节行程 {np.degrees(v.max()-v.min()):5.2f}°")
         for jn, j in JOINTS.items():
             wins = WJ[jn]
             for an, amp in AMPS.items():

@@ -61,13 +61,22 @@ def lockin_at(x, t, f, dt=None):
 
 
 def h1_coherence(U, Y):
-    """H1 估计 + 标准相干度。U:(nw,), Y:(nw,C)。返回 (H, γ², γ²_偏差修正)。"""
+    """H1 估计 + 标准相干度。U:(nw,), Y:(nw,C)。返回 (H, γ², γ²_偏差修正)。
+
+    n_win < 2 时 γ² 恒等于 1(自相干, 没有可平均的独立观测), 无信息量 —— 返回 NaN,
+    以免被误读成"相干度完美"。此时不确定度只能靠实测噪声窗给出(bootstrap 仍有效)。
+    2026-07-28: ep0 的 j3 只剩 1 个合格注入窗(其余窗顶在 j3 饱和上界 +0.09°),
+    会走到这个分支。
+    """
     num = np.sum(Y * np.conj(U)[:, None], axis=0)
     su = np.sum(np.abs(U) ** 2)
     sy = np.sum(np.abs(Y) ** 2, axis=0)
     H = num / max(su, 1e-30)
-    g2 = np.abs(num) ** 2 / np.maximum(su * sy, 1e-30)
     nw = len(U)
+    if nw < 2:
+        nan = np.full(np.shape(sy), np.nan, float)
+        return H, nan, nan
+    g2 = np.abs(num) ** 2 / np.maximum(su * sy, 1e-30)
     g2c = np.clip((g2 * nw - 1) / max(nw - 1, 1), 0.0, 1.0)
     return H, g2, g2c
 
@@ -535,11 +544,14 @@ def _cover(ci, truth):
 
 
 def self_test():
-    seq = np.load(PB / "seq_ep0_j3_4mrad_p.npz", allow_pickle=True)   # 最弱响应
+    # 主验收用 j2 4mrad(2 窗) —— j3 在 ep0 只剩 1 个合格窗(其余顶在饱和上界),
+    # 单窗没有窗间独立观测, 覆盖率的含义不同, 另列信息行。
+    seq = np.load(PB / "seq_ep0_j2_4mrad_p.npz", allow_pickle=True)
     F = np.asarray(seq["freqs"], float)
     G_T, TAU_T, ROT_T, NOISE = 1.8, 0.075, 12.0, 0.050
     print("=== 自检 v3: 100Hz 路径 + Δt 加权锁相 + 真实噪声残差 bootstrap ===")
-    print(f"    (4mrad 最弱响应; 真值 增益{G_T} 时延{TAU_T*1e3:.0f}ms 旋转{ROT_T}°)")
+    print(f"    主验收 j2 4mrad({len(seq['wins'])} 窗); 真值 增益{G_T} 时延{TAU_T*1e3:.0f}ms "
+          f"旋转{ROT_T}°")
 
     # ---- ① 零噪声: 机器精度 ----
     U, Y, T_, D, N_, YG = synth100(seq, G_T, TAU_T, ROT_T, 0.0, 0)
@@ -601,6 +613,24 @@ def self_test():
     g2 = np.mean([b[float(f)]["gamma2"].mean() for f in F])
     print(f"\n   解析交叉检查: γ²={g2:.2f} ⇒ σ_|H|/|H| ≈ σ_φ ≈ "
           f"{np.degrees(analytic_ci(g2, len(U))):.0f}° (量级对照)")
+    # ---- ③ 单窗情形(ep0 的 j3): 只报, 不作放行判据 ----
+    s3 = np.load(PB / "seq_ep0_j3_4mrad_p.npz", allow_pickle=True)
+    F3 = np.asarray(s3["freqs"], float)
+    cg3, ct3, taus3 = [], [], []
+    U0, Y0, T0, D0, _, YG0 = synth100(s3, G_T, TAU_T, ROT_T, 0.0, 0)
+    b0 = frf(U0, Y0, T0, F3, segs_yG=YG0, segs_dt=D0)
+    z0 = np.array([b0[float(f)]["z"] for f in F3])
+    for s_ in range(60):
+        U, Y, T_, D, N_, YG = synth100(s3, G_T, TAU_T, ROT_T, NOISE, 900 + s_)
+        b, ci = residual_bootstrap(U, Y, T_, N_, F3, YG, segs_dt=D, nboot=300, seed=s_)
+        zt = np.array([b[float(f)]["z"] for f in F3])
+        taus3.append(extra_delay(zt, F3)[0])
+        cg3.append(_cover(ci["z_abs"], np.abs(z0)))
+        ct3.append(float(ci["tau"][0] <= extra_delay(z0, F3)[0] <= ci["tau"][1]))
+    sd3 = np.std(taus3)
+    print(f"\n③ 单窗情形 (ep0 的 j3, {len(s3['wins'])} 窗; **仅供参考, 不作放行判据**)")
+    print(f"   增益CI 覆盖 {np.mean(cg3)*100:.0f}%  时延CI 覆盖 {np.mean(ct3)*100:.0f}%  "
+          f"τ 1σ {sd3:.1f}ms (7Hz {sd3*1e-3*7*360:.0f}°)  γ² 不可用(无窗间独立观测)")
     print(f"\n判决: {'✅ 全部通过 — 可放行 4mrad pilot' if (ok1 and all_ok) else '❌ 未通过, 不放行'}")
     return 0 if (ok1 and all_ok) else 1
 
@@ -631,7 +661,7 @@ def _fake_rec(seq, sign, g, tau_s, rot_deg, noise, seed, hz=100.0, jitter_ms=2.0
 
 def e2e_test():
     """端到端: 四条独立"复放"(各自时钟/抖动) → arm_windows → 频域奇偶分解 → z/τ。"""
-    seq = np.load(PB / "seq_ep0_j3_8mrad_p.npz", allow_pickle=True)
+    seq = np.load(PB / "seq_ep0_j2_8mrad_p.npz", allow_pickle=True)   # 2 窗
     G_T, TAU_T, ROT_T, NZ = 1.8, 0.075, 12.0, 0.050
     print("=== 端到端自检: 四臂独立时钟 → analyze_cfg(100Hz 路径) ===")
     print(f"    真值 增益 {G_T} · 时延 {TAU_T*1e3:.0f}ms · 旋转 {ROT_T}° · 噪声 {NZ*1e3:.0f}mrad/s")
