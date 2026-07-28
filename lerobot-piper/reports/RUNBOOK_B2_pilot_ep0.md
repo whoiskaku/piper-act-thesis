@@ -327,3 +327,62 @@ python sim/analyze_probe_b2.py --zwin --eps 0 --round 2    # 逐窗 z(f) 复现�
 3. **「110% 历史包络」正名为经验异常门**，不是硬件安全认证。
 4. **④ 的 SNR 措辞**：≥5 只是可用于更新 Ĝ 的**必要条件**，不是充分条件 ——
    充分性另受裸复放对数、每关节工作点数、⑤ 非平稳性限制。
+
+---
+
+## 8. 第 3 轮：2 mrad 幅值对比（2026-07-28 裁决）
+
+**顺序沿用第 2 轮**（不再反转）—— 反向平衡的问题已解决（顺序漂移已排除），
+现在要的是**干净的幅值对比**：与第 2 轮只差幅值一项。
+
+```
+A5 → j3+ → j3− → j2− → j2+ → A6      (2 mrad)
+```
+
+注入窗仍与前两轮完全一致（j2@[170,280]、j3@[170]）——选窗按最严的 8 mrad 算余量。
+输出文件加 `r3_` 前缀，不覆盖前两轮。
+
+### 一举两得
+
+| 目的 | 判据 |
+|---|---|
+| 幅值线性度（原目的） | 奇分量 \|odd\| ∝ δa ⇒ 4/2 mrad 幅值比应 **≈2** |
+| **⑤ 偶次非线性的决定性检验** | 偶次效应 \|D\| ∝ δa² ⇒ 幅值比应 **≈4**；若 ≈2 则与 δa 一次相关（不是偶次）；若 ≈1 则与幅值无关（非探针所致） |
+
+预计 SNR_p ≈ j2 10.5 / j3 15（按名义 SNR 的平方缩放），仍够辨识；
+2 mrad 也更贴近 π 实际约 1 mrad 的工作区。
+
+### 命令
+
+```bash
+cd ~/claude-test-2/lerobot-piper
+F="python sim/freeze_manifest.py --tag b2_ep0_2mrad --check"
+G="python sim/probe_b2_gate.py --ep 0 --round 3 --amp 2mrad"
+
+$F && python sim/replay_probe.py --b2 --ep 0 --round 3 --amp 2mrad --arm A5
+$G --only A5
+$G --margin                                     # ⓪ 用 A5 实测重算
+
+$F && python sim/replay_probe.py --b2 --ep 0 --round 3 --amp 2mrad --arm j3_2mrad_p
+$G --only j3_2mrad_p
+$F && python sim/replay_probe.py --b2 --ep 0 --round 3 --amp 2mrad --arm j3_2mrad_m
+$G --only j3_2mrad_m
+$F && python sim/replay_probe.py --b2 --ep 0 --round 3 --amp 2mrad --arm j2_2mrad_m
+$G --only j2_2mrad_m
+$F && python sim/replay_probe.py --b2 --ep 0 --round 3 --amp 2mrad --arm j2_2mrad_p
+$G --only j2_2mrad_p
+$F && python sim/replay_probe.py --b2 --ep 0 --round 3 --amp 2mrad --arm A6
+$G                                              # 全量门禁
+
+python sim/analyze_probe_b2.py --ampscale 2 3 --eps 0      # ← 幅值缩放判据(核心)
+python sim/analyze_probe_b2.py --zwin --eps 0 --round 3    # 逐窗 z(f) 复现
+```
+
+### 判据自身已验证
+
+`--ampscale 1 2` 拿两轮 4 mrad 数据做了自检（同幅值 ⇒ 所有比值应 ≈1）：
+奇分量 1.03 / 0.93 / 0.90，偶分量 0.80–1.33，全部正确判为 ≈1。
+（j2@280 的偶分量太弱，扣噪后归零，标「不明」—— 低 SNR 下的诚实结果。）
+
+`--ampscale` 的「判」列按**实际幅值比 k** 自适应：线性 ≈k、偶次 ≈k²、与幅值无关 ≈1；
+k=1 时三者重合，会标注「仅验证判据自身」。

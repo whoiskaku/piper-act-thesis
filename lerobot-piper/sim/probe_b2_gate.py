@@ -39,8 +39,11 @@ MD = np.pi / 180 / 1000                       # 0.001° → rad
 #   同时反转了关节顺序与符号顺序。若偶分量是真实探针效应, 两轮应同号复现;
 #   若来自时间漂移或单次复放变异, 反向块会改变或抵消它。
 #   必须**重复 B 对**, 只补 A3/A4 不足以分辨。
+# 第 3 轮 = 2 mrad, **沿用第 2 轮的顺序**（用户 2026-07-28 定）:
+#   反向平衡的问题已解决(漂移排除), 现在要的是干净的幅值对比 —— 与第 2 轮只差幅值一项。
 ROUND = {1: ["A1", "j2_{a}_p", "j2_{a}_m", "j3_{a}_m", "j3_{a}_p", "A2"],
-         2: ["A3", "j3_{a}_p", "j3_{a}_m", "j2_{a}_m", "j2_{a}_p", "A4"]}
+         2: ["A3", "j3_{a}_p", "j3_{a}_m", "j2_{a}_m", "j2_{a}_p", "A4"],
+         3: ["A5", "j3_{a}_p", "j3_{a}_m", "j2_{a}_m", "j2_{a}_p", "A6"]}
 
 
 def order_for(ep, amp="4mrad", rnd=1):
@@ -398,8 +401,9 @@ def gate456(recs, seq, env):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ep", type=int, default=0)
-    ap.add_argument("--round", type=int, default=1, choices=[1, 2],
-                    help="1=首轮 A1..A2; 2=反向平衡块 A3 → j3+ → j3− → j2− → j2+ → A4")
+    ap.add_argument("--round", type=int, default=1, choices=[1, 2, 3],
+                    help="1=首轮(4mrad); 2=反向平衡块(4mrad, A3/A4); "
+                         "3=幅值对比(2mrad, A5/A6, 顺序同第2轮)")
     ap.add_argument("--only", default=None, help="只查这一条的记录质量(刚跑完时用)")
     ap.add_argument("--margin", action="store_true",
                     help="⓪ 逐窗余量门禁(任一 B 配置上机前必须过; 有 A 记录则用实测)")

@@ -250,8 +250,9 @@ if __name__ == "__main__":
                     help="pp2 集号(0/1/2); 用 probe_seq_pp2_ep{ep}.npz, 输出 replay_ep{ep}_*.json")
     ap.add_argument("--b2", action="store_true", help="用 B′(6-8Hz 多正弦)序列")
     ap.add_argument("--amp", default="4mrad", help="A 臂借哪个幅值的 cmd7(内容无关)")
-    ap.add_argument("--round", type=int, default=1, choices=[1, 2],
-                    help="2 = 反向平衡块(输出文件加 _r2_ 前缀, 不覆盖首轮)")
+    ap.add_argument("--round", type=int, default=1, choices=[1, 2, 3],
+                    help="2=反向平衡块(4mrad) / 3=幅值对比(2mrad, 顺序同第2轮); "
+                         "输出文件加 _rN_ 前缀, 不覆盖前轮")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     if a.b2:

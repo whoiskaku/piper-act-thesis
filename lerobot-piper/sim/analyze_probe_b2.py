@@ -690,7 +690,7 @@ def zwin(ep, amp, rnd=1, nboot=1000):
     方向残差 = 正交分量占比(方向失配)。单窗时 CI 由实测噪声窗给出(γ² 不可用)。
     """
     import json
-    BARE = {1: ("A1", "A2"), 2: ("A3", "A4")}[rnd]
+    BARE = {1: ("A1", "A2"), 2: ("A3", "A4"), 3: ("A5", "A6")}[rnd]
     rt = "" if rnd == 1 else f"r{rnd}_"
     print(f"=== ep{ep} 第{rnd}轮 {amp}: 逐窗 z(f) / 方向残差 / 95%CI ===")
     out = {}
@@ -749,16 +749,104 @@ def zwin(ep, amp, rnd=1, nboot=1000):
     return out
 
 
+AMP_OF_ROUND = {1: "4mrad", 2: "4mrad", 3: "2mrad"}
+
+
+def ampscale(ep, rnd_hi, rnd_lo, amp_hi=None, amp_lo=None, nboot=800):
+    """幅值缩放判据 —— ⑤ 偶次非线性的决定性检验。
+
+    奇分量(线性响应):  |odd| ∝ δa      ⇒ 4mrad/2mrad 的幅值比应 ≈ **2**
+    偶次非线性:        |D|  ∝ δa²      ⇒ 幅值比应 ≈ **4**
+    与幅值无关的伪影:                    ⇒ 幅值比应 ≈ **1**
+    另算两轮偶分量的复相关: 同一机制则相位形状一致 ⇒ 相关为正。
+    """
+    import json
+    amp_hi = amp_hi or AMP_OF_ROUND[rnd_hi]
+    amp_lo = amp_lo or AMP_OF_ROUND[rnd_lo]
+    BARE = {1: ("A1", "A2"), 2: ("A3", "A4"), 3: ("A5", "A6")}
+    RT = {1: "", 2: "r2_", 3: "r3_"}
+    FN = np.array([5.0, 5.25, 8.25, 8.5, 8.75])
+    H2 = np.arange(12.0, 15.01, 0.5)
+    P = lambda v: float(np.sum(np.abs(v) ** 2))
+    print(f"=== 幅值缩放判据: 第{rnd_hi}轮 {amp_hi} vs 第{rnd_lo}轮 {amp_lo} ===")
+    k = float(amp_hi[:-4]) / float(amp_lo[:-4])          # 幅值比
+    print(f"    期望: 奇分量(线性) ≈ {k:.1f} | 偶分量(∝δa²) ≈ {k**2:.1f} | "
+          f"与幅值无关的伪影 ≈ 1.0"
+          + ("   [同幅值 ⇒ 三者都是 1.0, 本次仅验证判据自身]" if abs(k - 1) < 1e-9 else ""))
+    for jn in ("j2", "j3"):
+        D = {}
+        for tag, rnd, amp in (("hi", rnd_hi, amp_hi), ("lo", rnd_lo, amp_lo)):
+            seq = np.load(PB / f"seq_ep{ep}_{jn}_{amp}_p.npz", allow_pickle=True)
+            rt, ba = RT[rnd], BARE[rnd]
+            try:
+                R = {k: json.loads((PB / f"replay_ep{ep}_{rt}{v}.json").read_text())
+                     for k, v in [("A1", ba[0]), ("A2", ba[1]),
+                                  ("Bp", f"{jn}_{amp}_p"), ("Bm", f"{jn}_{amp}_m")]}
+            except FileNotFoundError as e:
+                print(f"  {jn}: 缺 {Path(e.filename).name} — 跳过"); D = None; break
+            W = {k: arm_windows(R[k], seq, {"A1": 0, "A2": 0, "Bp": 1, "Bm": -1}[k])
+                 for k in R}
+            D[tag] = (W, np.asarray(seq["freqs"], float))
+        if not D:
+            continue
+        F = D["hi"][1]
+        common = sorted(set.intersection(*[set(D[t][0][k]) for t in D for k in D[t][0]]))
+        print(f"\n  --- {jn} (窗 {common}) ---")
+        print(f"  {'窗':>5}{'量':>16}{amp_hi:>10}{amp_lo:>10}{'幅值比':>9}{'复相关':>9}{'判':>16}")
+        for w in common:
+            V = {}
+            for t in ("hi", "lo"):
+                W = D[t][0]
+                LI = lambda k, f: lockin_at(W[k][w]["y"], W[k][w]["t"], f, W[k][w]["dt"])
+                V[t] = {
+                    "odd": np.stack([(LI("Bp", f) - LI("Bm", f)) / 2 for f in F]),
+                    "even_t": np.stack([(LI("Bp", f) + LI("Bm", f)) / 2
+                                        - (LI("A1", f) + LI("A2", f)) / 2 for f in F]),
+                    "even_h": np.stack([(LI("Bp", f) + LI("Bm", f)) / 2
+                                        - (LI("A1", f) + LI("A2", f)) / 2 for f in H2]),
+                    "nz_t": np.stack([(LI("A2", f) - LI("A1", f)) / 2 for f in F]),
+                    "nz_h": np.stack([(LI("A2", f) - LI("A1", f)) / 2 for f in H2])}
+            for lbl, key, nzk, exp in [("奇分量(探针点)", "odd", None, 2.0),
+                                       ("偶分量(探针点)", "even_t", "nz_t", 4.0),
+                                       ("偶分量(和频)", "even_h", "nz_h", 4.0)]:
+                a, b = V["hi"][key].ravel(), V["lo"][key].ravel()
+                if nzk:   # 偶分量: 扣掉噪声底(H0: 方差 = 2×噪声窗方差), 取超出部分的幅值
+                    ea = max(P(V["hi"][key]) - 2 * P(V["hi"][nzk]), 0.0) ** 0.5
+                    eb = max(P(V["lo"][key]) - 2 * P(V["lo"][nzk]), 0.0) ** 0.5
+                else:
+                    ea, eb = P(V["hi"][key]) ** 0.5, P(V["lo"][key]) ** 0.5
+                r = ea / eb if eb > 1e-12 else float("nan")
+                c = np.real(np.vdot(a, b)) / (np.linalg.norm(a) * np.linalg.norm(b))
+                # 判据按**实际幅值比 k** 自适应: 线性 ≈k, 偶次 ≈k², 与幅值无关 ≈1
+                cand = [(k, f"≈{k:.1f} 线性"), (k ** 2, f"≈{k**2:.1f} ∝δa²"),
+                        (1.0, "≈1 与幅值无关")]
+                seen, uniq = set(), []
+                for val, lb in cand:                        # k=1 时三者重合, 只留一条
+                    if round(val, 3) not in seen:
+                        seen.add(round(val, 3)); uniq.append((val, lb))
+                hit = [lb for val, lb in uniq if abs(r - val) < max(0.25 * val, 0.3)]
+                vd = hit[0] if len(hit) == 1 else ("多解" if hit else "不明")
+                print(f"  {w:>5}{lbl:>16}{ea*1e3:>10.2f}{eb*1e3:>10.2f}{r:>9.2f}{c:>9.3f}"
+                      f"{vd:>16}")
+    print(f"\n  判读: 偶分量比 ≈4 ⇒ 确认 D ∝ δa² 的偶次非线性;")
+    print(f"        ≈2 ⇒ 与 δa 一次相关(不是偶次); ≈1 ⇒ 与幅值无关(非探针所致)。")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--zwin", action="store_true",
                     help="逐窗 z(f)/方向残差/CI —— 位形相关性的正式判据")
     ap.add_argument("--amp", default="4mrad")
-    ap.add_argument("--round", type=int, default=1, choices=[1, 2])
+    ap.add_argument("--round", type=int, default=1, choices=[1, 2, 3])
+    ap.add_argument("--ampscale", nargs=2, metavar=("RND_HI", "RND_LO"),
+                    help="幅值缩放判据: 比较两轮(高幅值 低幅值)的奇/偶分量缩放")
     ap.add_argument("--e2e", action="store_true", help="端到端(合成四臂记录)")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--eps", type=int, nargs="+", default=[0])
     a = ap.parse_args()
+    if a.ampscale:
+        ampscale(a.eps[0], int(a.ampscale[0]), int(a.ampscale[1]))
+        raise SystemExit(0)
     if a.zwin:
         zwin(a.eps[0], a.amp, a.round)
         raise SystemExit(0)
