@@ -134,11 +134,17 @@ def gate0_margin(ep, amp, recA=None):
             c = np.asarray(d["cmd"], float)[:, :6]
             n = min(len(q), len(c))
             for j in range(6):
-                at = (q[:n, j] - lo[j] < np.radians(0.2)) | (hi[j] - q[:n, j] < np.radians(0.2))
+                # 削顶 = 编码器**钉住不动** 且 已到/越过限位 且 指令仍在动。
+                # 三个条件都要。早先只写了后两条: 起始位姿在实测限位外(j5 停在
+                # safe_disable 的 28.9°, 限位上界 24.5°)时 hi−q 为负也满足 "<0.2°",
+                # 而编码器正在以 100°/s 下行 —— 判成削顶是假阳性。
+                still = np.abs(np.diff(q[:n, j], prepend=q[0, j])) * FPS < np.radians(0.5)
+                out = (q[:n, j] <= lo[j]) | (q[:n, j] >= hi[j])
                 mv = np.abs(np.diff(c[:n, j], prepend=c[0, j])) > 1e-5
-                if int((at & mv).sum()) > 3:
+                k = int((still & out & mv).sum())
+                if k > 3:
                     clip = True
-                    print(f"   ✗ 削顶: {d.get('arm')} j{j+1} 有 {(at&mv).sum()} 帧编码器贴限位"
+                    print(f"   ✗ 削顶: {d.get('arm')} j{j+1} 有 {k} 帧编码器钉在限位"
                           f"而指令仍在动")
         print(f"   命令削顶检查: {'✗ 发现削顶' if clip else '✓ 未发现'}")
     else:

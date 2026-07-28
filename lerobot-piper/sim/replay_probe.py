@@ -127,6 +127,35 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=No
     assert np.isfinite(imu0).all(), f"IMU 首帧异常: {imu0}"
     print(f"  IMU 自检 ✓  acc={np.round(imu0[:3],2)}  gyro={np.round(imu0[3:],3)}")
 
+    # ---- 预移动: 缓慢移到轨迹首帧位姿, 稳定后才开始记录 ----
+    # 2026-07-28: 机械臂停在 safe_disable_position(j5=0.52rad=29.8°), 而轨迹首帧要求
+    # j5=0.16° —— 直接开跑会在 0.6s 内扫过 29°, j5 峰速 102°/s = 既有包络的 155%,
+    # 且六臂的起始位姿取决于机械臂停在哪里(门禁③ 就只能验"停机位姿可复现")。
+    # 故先用 PREMOVE_S 秒线性插值缓慢过去, 再稳定 PRESETTLE_S 秒。
+    PREMOVE_S, PRESETTLE_S, PRE_TOL = 3.0, 1.0, np.radians(1.0)
+    q_now = (obs0["observation.state"].numpy()[:6] * np.pi / 180 / 1000).astype(np.float32)
+    q_tgt = cmd7[0, :6].astype(np.float32)
+    n_pre = int(PREMOVE_S * FPS)
+    print(f"  预移动 {PREMOVE_S:.0f}s: 最大位移 "
+          f"{np.degrees(np.abs(q_tgt - q_now)).max():.2f}° (j{int(np.abs(q_tgt-q_now).argmax())+1}) "
+          f"→ 峰速约 {np.degrees(np.abs(q_tgt - q_now)).max()/PREMOVE_S:.1f}°/s")
+    for i in range(n_pre + 1):
+        w = (1.0 - np.cos(np.pi * i / n_pre)) / 2.0        # 余弦缓入缓出, 零起始/终止速度
+        act = np.concatenate([q_now + w * (q_tgt - q_now), cmd7[0, 6:7]]).astype(np.float32)
+        robot.send_action(torch.from_numpy(act))
+        time.sleep(DT)
+    for _ in range(int(PRESETTLE_S * FPS)):               # 稳定, 让余振衰完
+        robot.send_action(torch.from_numpy(
+            np.concatenate([q_tgt, cmd7[0, 6:7]]).astype(np.float32)))
+        time.sleep(DT)
+    obs0 = robot.capture_observation()                    # 起始状态改在**预移动后**取
+    q_pre = obs0["observation.state"].numpy()[:6] * np.pi / 180 / 1000
+    dev = float(np.abs(q_pre - q_tgt).max())
+    print(f"  预移动后离首帧位姿 {np.degrees(dev):.3f}° "
+          f"(阈 {np.degrees(PRE_TOL):.1f}°)  {'✓' if dev <= PRE_TOL else '✗'}")
+    assert dev <= PRE_TOL, (f"预移动未到位, 最大偏差 {np.degrees(dev):.3f}° —— 停机排查, "
+                            f"六臂起始位姿必须一致")
+
     # t_send: **JointCtrl 真正写总线的时刻**(ZOH 起点), monotonic 与 TSND host_t 同钟。
     # 同时存 t_send_span = post−pre, 用于量化"实际发送时刻"本身的不确定度。
     import hashlib
@@ -134,6 +163,9 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=No
     rec = {"arm": arm, "t": [], "t_send": [], "t_send_span": [], "cmd": [],
            "imu": [], "state": [], "imu100": [], "clock": "time.monotonic",
            "cmd_hash": cmd_hash, "seqfile": seqfile, "use_probe": bool(use_probe),
+           "premove": {"s": PREMOVE_S, "settle_s": PRESETTLE_S,
+                       "q_parked": q_now.tolist(), "q_start": q_pre.tolist(),
+                       "dev_deg": float(np.degrees(dev))},
            "state_init": obs0["observation.state"].numpy().tolist()}
     print(f"  基准指令 hash {cmd_hash}  起始关节 "
           f"{np.round(np.array(rec['state_init'][:6]) * np.pi / 180 / 1000, 4)}")
