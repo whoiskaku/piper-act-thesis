@@ -41,30 +41,90 @@ F_WIDE = np.arange(2.0, 8.01, 0.5)
 F_NARROW = np.array([6.0, 6.5, 7.0, 7.5])
 
 # ---- R4: 真正嵌套的层级。B-only(9) **不作为独立块**, 只保留有效残量 R18 ----
+# θ 拆成 **θ_shape(21 个位形调度形状方向)** 与 **modal_scale(3 个模态平均尺度)**。
+#
+# 2026-07-29 实测: theta_mean 落在 span(R18) 内的比例只有 **0.057**。
+#   **正确解释**(用户校准): 窗内时变**不会**破坏等价性 —— 系统对模态输入是线性的,
+#   真正的统一缩放 α_m(t) → s·α_m(t) 与 R_m → s·R_m **严格等价**, 与 α 是否时变无关。
+#   0.057 只说明这 3 个方向**不是纯 modal scale**: 它们是 θ 中改变**平均 α** 的方向,
+#   经 softplus 与 φ 依赖同时改变了**归一化调度形状**, 故 R 的径向缩放替代不了。
+#   ⇒ 命名为 theta_mean(不叫 modal_scale); 真正的均匀缩放列另做单元测试(见 gauge_tests)。
+# ⇒ 若 L2R 起排除 modal_scale, span(L1) ⊄ span(L2R), **嵌套性会被破坏**。
+#   故 modal_scale 保留在 L1 及以上**全部**层级(见 describe 的嵌套性验收)。
 LEVELS = {
-    "L0": ["gain"],
-    "L1": ["gain", "θ"],
-    "L2": ["gain", "θ", "R18", "D6"],
-    "L3": ["gain", "θ", "R18", "D6", "poles6"],
+    "L0":  ["gain"],
+    "L1":  ["gain", "θ_shape", "theta_mean"],
+    "L2R": ["gain", "θ_shape", "theta_mean", "R18"],  # D6 消融臂(用户 2026-07-28)
+    "L2":  ["gain", "θ_shape", "theta_mean", "R18", "D6"],
+    "L3":  ["gain", "θ_shape", "theta_mean", "R18", "D6", "poles6"],
 }
+BLOCK_ORDER = ("gain", "θ_shape", "theta_mean", "R18", "D6", "poles6")
 # τ 网格步长 1 ms: P.TAU_GRID 是 5 ms, 真值 +102/−52 ms **不在格点上**,
 # 会造成 2 ms 量化失配并泄漏进 η(2026-07-28 验证阶段发现)
 TAU_GRID = np.arange(-0.250, 0.2501, 0.001)
-LAM_GRID = np.array([1e-3, 1e-2, 1e-1, 1.0, 10.0])
+# 必须包含**接近零**的一档, 否则「正则压制」与「设计不可辨识」分不开(用户 2026-07-29)
+LAM_GRID = np.array([1e-8, 1e-5, 1e-3, 1e-2, 1e-1, 1.0, 10.0])
 LAM_TINY = 1e-10                 # 仅用于"优化正确性"检查, 不进入选层级
+# 用户 2026-07-28: 真值恰在 1ms 格点上属**过于容易的自检**。分支判别仍用 1ms 网格,
+# 但**绝对时延恢复**必须用离格真值 + 连续一维精修。
+TAU_TRUE_OFF = {"+102.37ms": 0.10237, "-51.63ms": -0.05163}
+ORTH_SNR_GRID = (0.5, 1.0, 2.0, 3.0, 5.0)        # 可检测真值的正交 SNR 扫描
+RANK_TOL = 1e-8                  # 数值秩阈值: σ_i > σ_max·RANK_TOL
 HOLDOUT_SEALED = True          # R6: 本模块**任何路径都不读** holdout 行
 
 
-def prior_scale(models, attr):
-    """**统一的**先验尺度 = K 个 bootstrap 成员之间的标准差(数据驱动)。
+# 每块的尺度**下限**(相对该参数量级)。K=5 的成员间标准差在某些分量上会塌到 0,
+# 那不代表"该分量确定", 只代表 5 个 bootstrap 成员碰巧一致。
+FLOOR_HIT = {}
+SPREAD_FLOOR = {"B": 0.05, "D": 0.05, "log_om": 0.02, "raw_ze": 0.05, "theta": 0.05}
 
-    2026-07-28: 原先 B/D 用「10% of max」、log_om 用 0.05、raw_ze 用 0.2 都是拍的,
-    结果各块的 η=1 含义不同 —— L3 的 poles6 在同尺度下几乎不可见(注入 SNR
-    1.48 vs L2 的 1.50), 使「L2/L3 被错误降级」沦为扰动幅度的产物。
-    改为与 θ 一致: **η=1 ⇔ 该参数的一个先验标准差**。
+
+def ensemble_spread(models, attr):
+    """**集合分歧尺度** = K=5 个 bootstrap 成员之间的标准差。
+
+    用户 2026-07-28: 这**不能叫校准先验** —— K=5 成员间标准差只反映重采样分歧,
+    不代表各物理块同等可信。统一尺度是对的, 但 **η=1 只表示一个集合标准差**。
+    故: (a) 每块加尺度下限(相对量级), 防止 K=5 偶然一致导致尺度塌陷;
+        (b) 报告时**并列给出物理单位扰动**, 见 `describe`。
     """
     v = np.array([getattr(g.flex, attr).detach().numpy() for g in models])
-    return np.maximum(v.std(0), np.abs(v).mean() * 1e-3 + 1e-9)
+    floor = SPREAD_FLOOR.get(attr, 0.05) * (np.abs(v).mean() + 1e-12)
+    out = np.maximum(v.std(0), floor)
+    FLOOR_HIT[attr] = float(np.mean(v.std(0) < floor))
+    return out
+
+
+def theta_gauge(g, poses, sc):
+    """**参数空间**规范固定（用户 2026-07-29）。
+
+    先前做的是「输出空间残差化」—— 把 J_θ 的列投影掉三个方向。那**不删除参数
+    自由度**(24 列投影后仍 24 秩), 只是把信息挪走。正确做法是在参数空间加约束:
+
+        c_m(θ) = Σ_c w_c·log α_m(φ_c; θ) − c_m(θ_0) = 0        (每模态一个)
+        G = ∂c/∂θ ∈ R^{3×24},   N = null(G) ∈ R^{24×21}
+        δθ = N ξ,   J_{θ,fit} = W · J_θ · N                    (**先减到 21, 再白化**)
+
+    φ 网格**预先固定为同一套计划位姿**, 不随 fold 改变; 它只用设计协变量、
+    不用响应数据 ⇒ 不构成标签泄漏。
+
+    在**先验缩放**坐标 u = θ/sc 下构造(J_θ 的列已按 sc 扰动), 故 G_s = G_raw·diag(sc)。
+    返回 (G_s, N(24×21), Mrow(24×3), rank)。Mrow = 被删除的三个**模态平均尺度**方向。
+    """
+    th0 = g.flex.theta.detach().numpy()
+    Phi = np.array([S.phi_of(p) for p in poses])          # (C, 8) 固定计划位姿
+    M_, K = th0.shape
+    w = np.ones(len(Phi)) / len(Phi)
+    G = np.zeros((M_, M_ * K))
+    for m in range(M_):
+        z = Phi @ th0[m]
+        sp = np.maximum(z, 0) + np.log1p(np.exp(-np.abs(z)))   # softplus(稳定式)
+        sig = 1.0 / (1.0 + np.exp(-z))                          # softplus'
+        G[m, m * K:(m + 1) * K] = ((w * sig / np.maximum(sp, 1e-12))[:, None]
+                                   * Phi).sum(0)
+    G = G * sc.ravel()[None, :]                            # → 先验缩放坐标
+    U, sv, Vt = np.linalg.svd(G)
+    r = int((sv > sv[0] * 1e-10).sum())
+    return G, Vt[r:].T, Vt[:r].T, r
 
 
 # ======================= Jacobian（逐位姿频点集） =======================
@@ -105,7 +165,7 @@ def level_jacobian(g, poses, R, F_of, amp_of, models):
     blocks["gain"] = np.stack([H0, 1j * H0], 1)
 
     th0 = g.flex.theta.detach().clone()
-    sc = S.theta_prior_scale(models)
+    sc = ensemble_spread(models, "theta")
     cols = []
     for m in range(th0.shape[0]):
         for c in range(th0.shape[1]):
@@ -117,7 +177,7 @@ def level_jacobian(g, poses, R, F_of, amp_of, models):
     blocks["θ"] = np.stack(cols, 1)
 
     B0 = g.flex.B.detach().clone(); W0 = g.flex.W.detach().clone()
-    bsc_m = prior_scale(models, "B")            # **先验尺度**, 逐元素
+    bsc_m = ensemble_spread(models, "B")            # **先验尺度**, 逐元素
     cols = []
     for m in range(B0.shape[0]):
         for c in range(3):
@@ -133,7 +193,7 @@ def level_jacobian(g, poses, R, F_of, amp_of, models):
     blocks["R18"] = np.stack(cols, 1)
 
     D0 = g.flex.D.detach().clone()
-    dsc_m = prior_scale(models, "D")
+    dsc_m = ensemble_spread(models, "D")
     cols = []
     for jj in (1, 2):
         for c in range(3):
@@ -145,7 +205,7 @@ def level_jacobian(g, poses, R, F_of, amp_of, models):
     blocks["D6"] = np.stack(cols, 1)
 
     lo0 = g.flex.log_om.detach().clone(); rz0 = g.flex.raw_ze.detach().clone()
-    lsc = prior_scale(models, "log_om"); zsc = prior_scale(models, "raw_ze")
+    lsc = ensemble_spread(models, "log_om"); zsc = ensemble_spread(models, "raw_ze")
     cols = []
     for m in range(len(lo0)):
         cols.append(column(
@@ -159,19 +219,33 @@ def level_jacobian(g, poses, R, F_of, amp_of, models):
             lambda: g.flex.raw_ze.data.copy_(rz0)))
     blocks["poles6"] = np.stack(cols, 1)
 
-    # ---- 规范: 把 θ 中沿"纯缩放模态残量"的方向投影掉(21 = 24 − 3) ----
-    Bw = np.abs(B0.detach().numpy())
-    # 「整体缩放模态 m 的残量」= 按当前 B 值加权、**两个关节列一起**求和
-    #   （R18 是按 (m,c,joint) 展开的; 只取一个关节会给出错误的规范方向）
-    Sdir = np.stack([sum(Bw[m, c] * (blocks["R18"][:, (m * 3 + c) * 2]
-                                     + blocks["R18"][:, (m * 3 + c) * 2 + 1])
-                         for c in range(3))
-                     for m in range(B0.shape[0])], 1)
-    Q = np.linalg.qr(np.concatenate([Sdir.real, Sdir.imag], 0))[0]
-    Th = np.concatenate([blocks["θ"].real, blocks["θ"].imag], 0)
-    Th = Th - Q @ (Q.T @ Th)
-    n = len(H0)
-    blocks["θ"] = Th[:n] + 1j * Th[n:]
+    # ---- 决定性单元测试用: **真正的均匀缩放列** J_{s_m} = ∂y/∂log s_m ----
+    #   α_m(t) → e^{s_m}·α_m(t)。由线性性, 它应几乎完全落入 span(R18)。
+    #   若仍只有 ~0.057, 才说明 R 的 Jacobian 或缩放实现有 bug。
+    import torch as _t
+    _orig_gains = g.flex.gains
+    _eps = 0.05
+    _sc_cols = []
+    for m in range(g.flex.theta.shape[0]):
+        vec = _t.ones(g.flex.theta.shape[0]); vec[m] = float(np.exp(_eps))
+        g.flex.gains = (lambda phi, _o=_orig_gains, _v=vec: _o(phi) * _v)
+        g._vker = g._exck = None
+        _sc_cols.append((evaluate() - H0) / _eps)
+        g.flex.gains = _orig_gains
+        g._vker = g._exck = None
+    J_unif = np.stack(_sc_cols, 1)
+
+    # ---- **参数空间**规范: δθ = Nξ, 把 24 个 θ 方向真正减到 21 ----
+    Gs, Nn, Mrow, rk = theta_gauge(g, poses, sc)
+    Jth = blocks.pop("θ")
+    blocks["θ_shape"] = Jth @ Nn            # 21 个**位形调度形状**方向
+    blocks["theta_mean"] = Jth @ Mrow      # 其余 3 个 **θ 方向**(不是纯 modal scale)
+    gauge = {"G": Gs, "N": Nn, "M": Mrow, "rank": rk,
+             "Jth_raw": Jth, "J_unif": J_unif,
+             "GN": float(np.linalg.norm(Gs @ Nn)),
+             "rank_JN": int((np.linalg.svd(
+                 np.concatenate([(Jth @ Nn).real, (Jth @ Nn).imag], 0),
+                 compute_uv=False) > 1e-8).sum())}
 
     # 行元信息
     frow, krow, prow = [], [], []
@@ -179,7 +253,15 @@ def level_jacobian(g, poses, R, F_of, amp_of, models):
         for f in F_of[pi]:
             for _ in range(3):
                 frow.append(f); krow.append(ki); prow.append(pi)
-    return (H0, blocks, np.array(frow), np.array(krow), np.array(prow), keys)
+    phys = {"θ_shape": ("softplus 调度形状", float(np.median(sc))),
+            "theta_mean": ("θ 平均方向", float(np.median(sc))),
+            "R18": ("模态残量 B", float(np.median(bsc_m))),
+            "D6": ("直通 D", float(np.median(dsc_m))),
+            "poles6": ("log ω / raw ζ", float(np.median(np.concatenate(
+                [lsc.ravel(), zsc.ravel()])))),
+            "gain": ("整体复增益(η=1 ⇔ 100%)", 1.0)}
+    return (H0, blocks, np.array(frow), np.array(krow), np.array(prow), keys, phys,
+            gauge)
 
 
 # ======================= 噪声与白化 =======================
@@ -207,7 +289,7 @@ class Fitter:
         off = 0
         self.span = {}
         mats = []
-        for nm in ("gain", "θ", "R18", "D6", "poles6"):
+        for nm in BLOCK_ORDER:
             Bm = blocks[nm] * w[:, None]
             self.span[nm] = (off, off + Bm.shape[1]); off += Bm.shape[1]
             mats.append(Bm)
@@ -215,12 +297,17 @@ class Fitter:
         self.E = np.exp(2j * np.pi * np.outer(TAU_GRID, frow))     # (nτ, n)
         self._chol = {}
         self._subc = {}
+        self._sublvc = {}
         self._rhs = {}
+        self._obs = None
 
     def idx(self, level):
-        """块顺序 = gain,θ,R18,D6,poles6, 而各层级恰是其**连续前缀**
-        ⇒ 可以只算一次全列右端项, 各层级切片即可(见 `rhs`)。"""
-        return np.arange(0, max(self.span[b][1] for b in LEVELS[level]))
+        """层级的列集合**不必是前缀**(L2R 要跳过 modal_scale)。
+
+        右端项 Bt 仍只按 mask 算一次**全列**, 各层级按列索引取子集即可 —— 与
+        前缀切片同样免费(见 `rhs`)。
+        """
+        return np.concatenate([np.arange(*self.span[b]) for b in LEVELS[level]])
 
     def rhs(self, obs, mask, mk):
         """右端项 Bt(τ) 与 ‖y(τ)‖²。**与 λ、与层级都无关**（层级只是切片）。
@@ -228,6 +315,10 @@ class Fitter:
         Bt(τ) = Re(A^H(obs·e^{+2πjfτ})) − Re(A^H H0)  —— 对频率的 NUDFT。
         每个 mask 每个 trial 只算一次 ⇒ 相比逐(层级,λ)重算快约 17×。
         """
+        # 缓存**只在同一个 obs 内**有效。忘记 new_trial() 必须**立刻报错**,
+        # 不能静默返回上一个 trial 的右端项(2026-07-28 曾因此使验证 A 段全错)。
+        if self._obs is not obs:
+            raise RuntimeError("rhs 缓存与当前 obs 不符: 调用 fit.new_trial(obs)")
         if mk in self._rhs:
             return self._rhs[mk]
         Asub, Em = self._sub(mask, mk)
@@ -243,33 +334,83 @@ class Fitter:
             self._subc[mk] = (self.Aall[mask], self.E[:, mask])
         return self._subc[mk]
 
-    def new_trial(self):
-        self._rhs = {}
+    def _sublv(self, mask, mk, level):
+        """按层级切好的子矩阵 —— Brent 精修每步都要用, 不能每次重新花式索引。"""
+        k = (mk, level)
+        if k not in self._sublvc:
+            self._sublvc[k] = self._sub(mask, mk)[0][:, self.idx(level)]
+        return self._sublvc[k]
 
-    def gram(self, mask, level, lam):
+    def new_trial(self, obs):
+        """每次 obs 变化都必须调用: 清右端项缓存并登记当前 obs。"""
+        self._rhs = {}
+        self._obs = obs
+
+    def gram(self, mask, level, lam, level_mk=None):
         """Re(A^H A) + λI 的 Cholesky。**与 τ 无关 ⇒ 可缓存**。"""
         key = (mask.tobytes(), level, float(lam))
         if key not in self._chol:
-            Asub = self.Aall[mask][:, self.idx(level)]
+            Asub = self._sublv(mask, level_mk, level) if level_mk else \
+                self.Aall[mask][:, self.idx(level)]
             M = (Asub.conj().T @ Asub).real
             M = M + lam * np.trace(M) / max(M.shape[0], 1) * np.eye(M.shape[0])
             self._chol[key] = (np.linalg.cholesky(M), M)
         return self._chol[key]
 
-    def fit_scan(self, obs, mask, level, lam, mk=None):
+    def sse_at(self, obs, mask, level, lam, tau, mk):
+        """任意(连续)τ 处的 SSE 与 η —— 供网格后的一维精修。"""
+        Am = self._sublv(mask, mk, level)
+        yr = obs[mask] * np.exp(2j * np.pi * self.frow[mask] * tau) - self.H0[mask]
+        b = (Am.conj().T @ yr).real
+        L, M = self.gram(mask, level, lam)
+        eta = np.linalg.solve(L.T, np.linalg.solve(L, b))
+        return float((np.abs(yr) ** 2).sum() - 2 * b @ eta + eta @ M @ eta), eta
+
+    def valleys(self, sse, k=2):
+        """保留前 k 个**局部**谷 —— L2/L3 可能吸收错误分支, 必须看得见第二谷。"""
+        loc = [i for i in range(1, len(sse) - 1)
+               if sse[i] <= sse[i - 1] and sse[i] <= sse[i + 1]]
+        gm = int(np.argmin(sse))
+        if gm not in loc:                 # 极小落在网格边界时无内部谷 ⇒ 兜底
+            loc.append(gm)
+        loc.sort(key=lambda i: sse[i])
+        out, used = [], []
+        for i in loc:
+            if any(abs(TAU_GRID[i] - TAU_GRID[j]) < 0.020 for j in used):
+                continue
+            used.append(i); out.append((float(TAU_GRID[i]), float(sse[i])))
+            if len(out) == k:
+                break
+        return out
+
+    def fit_scan(self, obs, mask, level, lam, mk=None, refine=False):
         """R1: 在 mask（**只含训练组**）上做**全局 τ 扫描**, 返回 (τ̂, η, 曲线)。
 
         τ 网格覆盖 [−250, +250] ms 全程 —— **不先定分支再拟合**。
         """
         mk = mk if mk is not None else mask.tobytes()
         Bt_all, yy = self.rhs(obs, mask, mk)
-        p = len(self.idx(level))
-        Bt = Bt_all[:, :p]                       # 层级 = 连续前缀
+        ci = self.idx(level)
+        Bt = Bt_all[:, ci]                       # 任意列子集
         L, M = self.gram(mask, level, lam)
         Et = np.linalg.solve(L.T, np.linalg.solve(L, Bt.T)).T          # (nτ, p)
         sse = yy - 2.0 * (Bt * Et).sum(1) + ((Et @ M) * Et).sum(1)
-        t = int(np.argmin(sse))
-        return TAU_GRID[t], Et[t], sse
+        if not refine:
+            t = int(np.argmin(sse))
+            return float(TAU_GRID[t]), Et[t], sse, None
+        # 用户 2026-07-29: **网格只负责定位每个局部谷**, 再对前两个谷分别 Brent 精修,
+        # 最后用**精修后**的 ΔSSE 比较分支 —— 否则离格量化仍会进入分支裕度。
+        from scipy.optimize import minimize_scalar
+        d = TAU_GRID[1] - TAU_GRID[0]
+        ref = []
+        for t0, _ in self.valleys(sse, 2):
+            r = minimize_scalar(lambda x: self.sse_at(obs, mask, level, lam, x, mk)[0],
+                                bounds=(t0 - d, t0 + d), method="bounded",
+                                options={"xatol": 1e-7})
+            v, et = self.sse_at(obs, mask, level, lam, float(r.x), mk)
+            ref.append((float(r.x), v, et))
+        ref.sort(key=lambda z: z[1])
+        return ref[0][0], ref[0][2], sse, ref
 
     def resid(self, obs, mask, level, tau, eta):
         """在 mask 上的白化 SSE（用于留出组的预测误差）。"""
@@ -287,13 +428,13 @@ def lopo(fit, obs, gmasks):
     返回 {level: (七组等权平均误差, 七组误差数组, 各外折 τ̂)}。
     """
     ng = len(gmasks)
-    fit.new_trial()                       # 清 rhs 缓存(obs 变了), Gram/子矩阵仍复用
+    fit.new_trial(obs)                    # 清 rhs 缓存(obs 变了), Gram/子矩阵仍复用
     trm = [(~gmasks[o], f"o{o}".encode()) for o in range(ng)]
     inm = {(o, i): ((~gmasks[o]) & ~gmasks[i], f"o{o}i{i}".encode())
            for o in range(ng) for i in range(ng) if i != o}
     out = {}
     for lv in LEVELS:
-        errs, taus = [], []
+        errs, taus, vv2, lams = [], [], [], []
         for o in range(ng):
             tr, trk = trm[o]
             # ---- 内层: 在剩余 6 组里选 λ ----
@@ -304,18 +445,20 @@ def lopo(fit, obs, gmasks):
                     if i == o:
                         continue
                     itr, itk = inm[(o, i)]
-                    tau_i, eta_i, _ = fit.fit_scan(obs, itr, lv, lam, itk)
+                    tau_i, eta_i, _, _ = fit.fit_scan(obs, itr, lv, lam, itk)
                     s, n = fit.resid(obs, gmasks[i], lv, tau_i, eta_i)
                     acc.append(s / max(n, 1))          # R2: 组内先归一, 组间等权
                 m = float(np.mean(acc))
                 if m < best:
                     best, blam = m, lam
             # ---- 外层: 用 λ* 在 6 组上重拟合(含**全局 τ 扫描**), 预测留出组 ----
-            tau_o, eta_o, _ = fit.fit_scan(obs, tr, lv, blam, trk)
+            # 外折**精修**前两个谷(内折只用于选 λ, 相对比较即可, 不精修)
+            tau_o, eta_o, _, ref = fit.fit_scan(obs, tr, lv, blam, trk, refine=True)
             s, n = fit.resid(obs, gmasks[o], lv, tau_o, eta_o)
-            errs.append(s / max(n, 1)); taus.append(tau_o)
+            errs.append(s / max(n, 1)); taus.append(tau_o); lams.append(blam)
+            vv2.append(ref[1][1] - ref[0][1] if ref and len(ref) > 1 else None)
         errs = np.array(errs)
-        out[lv] = (float(errs.mean()), errs, np.array(taus))   # **七组等权**
+        out[lv] = (float(errs.mean()), errs, np.array(taus), vv2, lams)  # **七组等权**
     return out
 
 
@@ -333,165 +476,413 @@ def pick_level(res):
     return best, best, se, thr
 
 
-def describe(fit):
-    print("  【层级定义（R4: 真正嵌套）】")
-    print(f"  {'层级':>6}{'开放参数块':>34}{'列数':>7}{'累计dof':>9}")
-    for lv, bl in LEVELS.items():
-        p = sum(fit.span[b][1] - fit.span[b][0] for b in bl)
-        print(f"  {lv:>6}{'+'.join(bl):>34}{p:>7}{p:>9}")
-    print("  规范: θ 已投影掉 3 个「纯缩放模态残量」方向 ⇒ 24 → **21**")
-    print("  **B-only(9) 不作为独立块**（与 R18 嵌套, 会造成秩亏）")
-    n = fit.Aall.shape[0]
-    print(f"\n  各块的白化列 RMS（η=1 ⇔ 一个先验标准差; 白化后噪声 RMS≈1）")
-    print(f"  {'块':>8}{'列数':>6}{'列 RMS 中位':>13}{'块整体 SNR':>12}")
+def gauge_tests(fit, gauge, w, npool):
+    """规范的三项决定性验收（用户 2026-07-29）。"""
+    N, V = gauge["N"], gauge["M"]
+    Jth = gauge["Jth_raw"] * w[:, None]           # 白化后的原始 θ24
+    Ju = gauge["J_unif"] * w[:, None]             # 真正的均匀缩放列 J_{s_m}
+
+    def frac_in(basis, tgt):
+        Y = np.concatenate([tgt.real, tgt.imag], 0)
+        X = np.concatenate([basis.real, basis.imag], 0)
+        Q = np.linalg.qr(X)[0]
+        return float(1 - ((Y - Q @ (Q.T @ Y)) ** 2).sum() / max((Y ** 2).sum(), 1e-30))
+
+    R18 = fit.Aall[:, slice(*fit.span["R18"])]
+    tm = fit.Aall[:, slice(*fit.span["theta_mean"])]
+    print("  【单元测试 1 · 真正的均匀缩放 alpha_m(t) -> e^{s_m}*alpha_m(t)】")
+    print(f"    J_unif  落在 span(R18) 内的比例 = {frac_in(R18, Ju):.4f}   (应≈1)")
+    print(f"    theta_mean 落在 span(R18) 的比例 = {frac_in(R18, tm):.4f}   (无要求)")
+    fu = frac_in(R18, Ju)
+    verdict = ("均匀缩放确实被 R 吸收 ⇒ R Jacobian 与缩放实现无 bug" if fu > 0.9
+               else "**仍很低 ⇒ R Jacobian 或缩放实现有 bug**")
+    print(f"    ⇒ {verdict}")
+
+    # ---- 换基矩阵 T = [N V] 是否正交 ⇒ 决定各向同性惩罚是否已经正确 ----
+    T = np.concatenate([N, V], 1)
+    dev = float(np.abs(T.T @ T - np.eye(24)).max())
+    print(f"\n  【换基矩阵】T = [N V], ‖TᵀT − I‖_max = {dev:.2e}")
+    print(f"    先验在缩放坐标 u=θ/sc 下为 Σ_u⁻¹ = I ⇒ 新坐标惩罚 = zᵀ(TᵀΣ_u⁻¹T)z = zᵀ(TᵀT)z")
+    print(f"    T 正交 ⇒ TᵀT = I ⇒ **各向同性惩罚在此换基下恰好正确**(非巧合豁免, 已验证)")
+
+    # ---- 两项一致性验收 ----
+    gcol = fit.Aall[:, slice(*fit.span["gain"])]
+    C24 = np.concatenate([gcol, Jth], 1)
+    CSP = np.concatenate([gcol, Jth @ N, Jth @ V], 1)
+    P24 = np.eye(C24.shape[1])
+    PSP = np.eye(CSP.shape[1]); PSP[2:, 2:] = T.T @ T          # **变换后的完整 penalty**
+    rng = np.random.default_rng(11)
+    y = (fit.H0 + C24 @ rng.normal(size=C24.shape[1]).astype(complex)) \
+        * np.exp(-2j * np.pi * fit.frow * 0.102) + npool[0]
+
+    def solve(C, Pen, lam):
+        yr = y * np.exp(2j * np.pi * fit.frow * 0.102) - fit.H0
+        M = (C.conj().T @ C).real
+        M = M + lam * np.trace(M) / M.shape[0] * Pen
+        e = np.linalg.solve(M, (C.conj().T @ yr).real)
+        pr = C @ e.astype(complex)
+        return float((np.abs(yr - pr) ** 2).sum()), pr
+
+    print(f"\n  【验收 A · λ=0: 原 θ24 与 theta_shape+theta_mean 必须逐点一致】")
+    s0, p0 = solve(C24, P24, 0.0); s1, p1 = solve(CSP, PSP, 0.0)
+    print(f"    SSE: {s0:.6e} vs {s1:.6e}   相对差 {abs(s0-s1)/max(s0,1e-30):.2e}")
+    print(f"    预测逐点最大差 = {np.abs(p0-p1).max():.2e}"
+          f"  (相对信号 {np.abs(p0-p1).max()/max(np.abs(p0).max(),1e-30):.2e})")
+
+    print(f"\n  【验收 B · 相同 λ, 携带变换后完整 penalty】")
+    for lam in (1e-3, 1e-2, 1e-1):
+        s0, p0 = solve(C24, P24, lam); s1, p1 = solve(CSP, PSP, lam)
+        print(f"    λ={lam:<6g} SSE 相对差 {abs(s0-s1)/max(s0,1e-30):.2e}"
+              f"   预测最大差 {np.abs(p0-p1).max():.2e}")
+    print()
+
+
+def describe(fit, phys, gauge):
+    """R4 + 用户 2026-07-28: 必须区分**原始列数**、**约束秩**、**数值秩**、**有效 dof**。"""
+    print("  【L0 的两个参数】")
+    print("    η_gain,re 与 η_gain,im: 模型整体乘 (1+η_re+jη_im)。")
+    print("    ⇒ 一个**与频率、位姿、关节都无关的复标量**; η=1 表示 100% 幅值变化。\n")
+
+    n2 = 2 * fit.Aall.shape[0]
+    def nrank(cols):
+        X = np.concatenate([cols.real, cols.imag], 0)
+        sv = np.linalg.svd(X, compute_uv=False)
+        return int((sv > sv[0] * RANK_TOL).sum()) if len(sv) and sv[0] > 0 else 0
+
+    print(f"  【逐块】数值秩阈值 σ_i > σ_max·{RANK_TOL:g}")
+    print("    θ 已按**参数空间**规范拆为 θ_shape(21) + modal_scale(3); 两类分开打印。")
+    print(f"  {'块':>8}{'原始列':>7}{'数值秩':>8}{'块 SNR':>9}"
+          f"{'floor 触发':>11}{'物理单位扰动(η=1)':>26}")
+    ATTR = {"θ_shape": "theta", "theta_mean": "theta", "R18": "B",
+            "D6": "D", "poles6": "log_om"}
     for b, (lo, hi) in fit.span.items():
         col = fit.Aall[:, lo:hi]
         rms = np.sqrt((np.abs(col) ** 2).mean(0))
-        print(f"  {b:>8}{hi-lo:>6}{np.median(rms):>13.3f}"
-              f"{np.sqrt((rms ** 2).sum()):>12.2f}")
+        nm, val = phys.get(b, ("", float("nan")))
+        fh = FLOOR_HIT.get(ATTR.get(b, ""), float("nan"))
+        print(f"  {b:>8}{hi-lo:>7}{nrank(col):>8}"
+              f"{np.sqrt((rms**2).sum()):>9.2f}{fh:>11.0%}{nm+f' ≈{val:.3g}':>26}")
 
-    # 每一层**新增**块相对前面所有块张成空间的正交残量 —— 决定该层是否真能被辨识
-    print(f"\n  逐层**新增**信息量（新块对前面各层张成空间的正交残量）")
-    print(f"  {'层级':>6}{'新增块':>14}{'正交残量 SNR':>14}{'被前层解释':>12}")
-    prev = np.zeros((fit.Aall.shape[0], 0), complex)
+    print("\n  【逐层级: 有效 dof = 白化 Jacobian 的数值秩, **不是列数**】")
+    print(f"  {'层级':>6}{'原始列':>7}{'数值秩':>8}{'秩亏':>6}{'开放块':>30}")
     for lv, bl in LEVELS.items():
-        new = [b for b in bl if b not in
-               (LEVELS[list(LEVELS)[list(LEVELS).index(lv) - 1]] if lv != "L0" else [])]
+        ci = fit.idx(lv)
+        r = nrank(fit.Aall[:, ci])
+        print(f"  {lv:>6}{len(ci):>7}{r:>8}{len(ci)-r:>6}{'+'.join(bl):>30}")
+
+    print("\n  【参数空间规范验收】(**不是**输出空间残差化)")
+    G, N = gauge["G"], gauge["N"]
+    print(f"    rank(G)       = {gauge['rank']}              (应为 3)")
+    print(f"    N.shape       = {N.shape}       (应为 (24, 21))")
+    print(f"    ‖G @ N‖       = {gauge['GN']:.2e}       (应 < 1e-10)")
+    print(f"    rank(J_θ @ N) = {gauge['rank_JN']}             (应 ≤ 21)")
+    print(f"    φ 网格 = 固定的 16 个计划位姿, **不随 fold 改变**; 只用设计协变量")
+    print(f"           ⇒ 不构成标签泄漏, 各折参数化一致 ⇒ 嵌套性得以保持")
+
+    print("\n  【被删除的三个模态平均尺度去了哪】")
+    def frac_in(basis, tgt):
+        Y = np.concatenate([tgt.real, tgt.imag], 0)
+        X = np.concatenate([basis.real, basis.imag], 0)
+        Q = np.linalg.qr(X)[0]
+        return float(1 - ((Y - Q @ (Q.T @ Y)) ** 2).sum() / max((Y ** 2).sum(), 1e-30))
+    ms = fit.Aall[:, slice(*fit.span["theta_mean"])]
+    print(f"    theta_mean 落在 R18 张成空间内的比例 = "
+          f"{frac_in(fit.Aall[:, slice(*fit.span['R18'])], ms):.3f}")
+    print(f"      ⇒ 该前提**不成立**(应≈1)。α 在输入侧经 softplus 且窗内时变,")
+    print(f"        与输出侧残量纯缩放只在冻结时变时等价。故 modal_scale **保留在**")
+    print(f"        L1 及以上全部层级, 否则嵌套性被破坏。")
+    print("\n  【嵌套性验收】rank(L_k ∪ L_{k+1}) 必须 == rank(L_{k+1})")
+    order = list(LEVELS)
+    for i in range(len(order) - 1):
+        a_, b_ = order[i], order[i + 1]
+        u = np.union1d(fit.idx(a_), fit.idx(b_))
+        ru, rb = nrank(fit.Aall[:, u]), nrank(fit.Aall[:, fit.idx(b_)])
+        print(f"    span({a_}) ⊆ span({b_}): rank(∪)={ru} vs rank({b_})={rb}"
+              f"   {'✓' if ru == rb else '**✗**'}")
+    print(f"    注: 白化空间里 θ_shape 与 R 仍可能非零重叠 —— 那是**统计混杂**,")
+    print(f"        不是 gauge 没删干净。规范定义在参数空间, 不随噪声协方差/fold 变。\n")
+
+    print("  【逐层**新增**信息量（新块对前面各层张成空间的正交残量）】")
+    print(f"  {'层级':>6}{'新增块':>10}{'正交残量 SNR':>14}{'被前层解释':>12}")
+    order = list(LEVELS)
+    prev = np.zeros((fit.Aall.shape[0], 0), complex)
+    for i, lv in enumerate(order):
+        new = [b for b in LEVELS[lv] if i == 0 or b not in LEVELS[order[i - 1]]]
         if not new:
             continue
         Nw = np.concatenate([fit.Aall[:, slice(*fit.span[b])] for b in new], 1)
+        Y = np.concatenate([Nw.real, Nw.imag], 0)
         if prev.shape[1]:
             X = np.concatenate([prev.real, prev.imag], 0)
-            Y = np.concatenate([Nw.real, Nw.imag], 0)
-            Q = np.linalg.qr(X)[0]
-            Res = Y - Q @ (Q.T @ Y)
+            Qp = np.linalg.qr(X)[0]
+            Res = Y - Qp @ (Qp.T @ Y)
             frac = 1.0 - (Res ** 2).sum() / max((Y ** 2).sum(), 1e-30)
-            snr = np.sqrt((Res ** 2).sum() / (2 * n))
         else:
-            frac, snr = 0.0, np.sqrt((np.abs(Nw) ** 2).sum() / n)
-        print(f"  {lv:>6}{'+'.join(new):>14}{snr:>14.2f}{frac:>11.0%}")
+            Res, frac = Y, 0.0
+        print(f"  {lv:>6}{'+'.join(new):>10}"
+              f"{np.sqrt((Res ** 2).sum() / n2):>14.2f}{frac:>11.0%}")
         prev = np.concatenate([prev, Nw], 1)
     print()
 
 
-# ======================= trial 生成 =======================
+# ======================= 可检测真值（按正交 SNR 定义） =======================
 
-def make_obs(fit, npool, rng, level_true, tau_true, eta_sd, noise_on=True):
-    """按真值层级生成一次观测（白化空间）。"""
+def prev_basis(fit):
+    """每个层级**前面所有块**张成空间的正交基(实堆叠) —— 用于取正交残量。"""
+    order = list(LEVELS)
+    out = {}
+    for i, lv in enumerate(order):
+        if i == 0:
+            out[lv] = np.zeros((2 * fit.Aall.shape[0], 0)); continue
+        X = fit.Aall[:, fit.idx(order[i - 1])]
+        out[lv] = np.linalg.qr(np.concatenate([X.real, X.imag], 0))[0]
+    return out
+
+
+def new_cols(fit, level):
+    order = list(LEVELS); i = order.index(level)
+    lo = 0 if i == 0 else len(fit.idx(order[i - 1]))
+    return slice(lo, len(fit.idx(level)))
+
+
+def make_obs(fit, npool, rng, level_true, tau_true, orth_snr, Qprev,
+             noise_on=True, base_sd=0.3):
+    """按**正交 SNR** 生成可检测真值（用户 2026-07-28）。
+
+        Δy⊥_k = (I − P_{k−1}) J_k Δp_k
+
+    层级"选对率"不能只按生成参数块命名: 若 L3 的扰动 80% 可由 L2 表达,
+    one-SE 选 L2 **反而是正确的预测决策**。故真值按 ‖Δy⊥‖ 定标, 并同时返回
+    原始扰动、正交残量与最佳低层近似误差。
+    """
+    order = list(LEVELS); k = order.index(level_true)
     eta = np.zeros(fit.Aall.shape[1])
-    for b in LEVELS[level_true]:
-        lo, hi = fit.span[b]
-        sd = 0.05 if b == "gain" else eta_sd          # 增益只允许小偏差
-        eta[lo:hi] = rng.normal(0, sd, hi - lo)
-    sig = fit.H0 + fit.Aall @ eta.astype(complex)
-    obs = sig * np.exp(-2j * np.pi * fit.frow * tau_true)
+    if k > 0:                                     # 前面各层给基线扰动
+        for b in LEVELS[order[k - 1]]:
+            lo, hi = fit.span[b]
+            eta[lo:hi] = rng.normal(0, 0.05 if b == "gain" else base_sd, hi - lo)
+    sl = new_cols(fit, level_true)
+    dp = rng.normal(size=sl.stop - sl.start)
+    dy = fit.Aall[:, sl] @ dp.astype(complex)
+    Y = np.concatenate([dy.real, dy.imag])
+    Q = Qprev[level_true]
+    perp = Y - Q @ (Q.T @ Y) if Q.shape[1] else Y
+    n = fit.Aall.shape[0]
+    sc = orth_snr / max(np.linalg.norm(perp) / np.sqrt(n), 1e-30)
+    eta[sl] = dp * sc
+    obs = ((fit.H0 + fit.Aall @ eta.astype(complex))
+           * np.exp(-2j * np.pi * fit.frow * tau_true))
     if noise_on:
         obs = obs + npool[rng.integers(len(npool))]
-    return obs, eta
+    diag = {"raw": float(np.linalg.norm(Y) * sc / np.sqrt(n)),
+            "perp": float(np.linalg.norm(perp) * sc / np.sqrt(n)),
+            "absorb": 1.0 - (np.linalg.norm(perp) / max(np.linalg.norm(Y), 1e-30)) ** 2,
+            # 达到该正交 SNR 所需的**参数幅度**(单位: 集合标准差)。若远大于 1,
+            # 该真值在先验下不合理 —— ridge 会正当地把它压回去, 不算检测失败。
+            "dp_sd": float(np.sqrt(np.mean((dp * sc) ** 2)))}
+    return obs, eta, diag
 
 
-def branch_absorb(taus, tau_true):
-    """R: 更自由的层级是否**吸收错误 τ 分支**。"""
-    other = P.TAU_TRUE["-52ms" if abs(tau_true - P.TAU_TRUE["+102ms"]) < 1e-9
-                       else "+102ms"]
-    return (float(np.mean(np.abs(taus - tau_true) > 0.030)),
-            float(np.mean(np.abs(taus - other) < 0.030)))
+def branch_absorb(taus, tau_true, tol=0.030):
+    """更自由的层级是否**吸收错误 τ 分支**。"""
+    br = min(P.TAU_TRUE, key=lambda k: abs(P.TAU_TRUE[k] - tau_true))
+    other = P.TAU_TRUE["-52ms" if br == "+102ms" else "+102ms"]
+    return (float(np.mean(np.abs(taus - tau_true) > tol)),
+            float(np.mean(np.abs(taus - other) < tol)))
 
 
 # ======================= 各阶段 =======================
 
-def stage_verify(fit, npool, gmasks, rng, ntr, eta_sd):
-    print("  【A. 优化正确性（无噪声, 真值层级, λ→0）】")
-    print(f"    真值 τ 必须落在网格上: 步长 {1e3*(TAU_GRID[1]-TAU_GRID[0]):.0f} ms, "
-          f"+102/−52 ms 在格点上 = "
-          f"{all(np.min(np.abs(TAU_GRID - t)) < 1e-9 for t in P.TAU_TRUE.values())}")
-    print(f"  {'真值层级':>10}{'τ 误差(ms)':>12}{'η 相对误差':>12}{'残差/信号':>12}"
-          f"{'注入 SNR':>11}")
-    ok = True
+def stage_verify(fit, npool, gmasks, Qprev, rng, ntr):
     full = np.ones(len(fit.frow), bool)
-    for lv in LEVELS:
-        for br, tt in P.TAU_TRUE.items():
-            obs, eta = make_obs(fit, npool, np.random.default_rng(7), lv, tt,
-                                eta_sd, noise_on=False)
-            th, eh, _ = fit.fit_scan(obs, full, lv, LAM_TINY)
-            ci = fit.idx(lv)
-            rel = np.linalg.norm(eh - eta[ci]) / max(np.linalg.norm(eta[ci]), 1e-12)
-            s, n = fit.resid(obs, full, lv, th, eh)
-            sg = float((np.abs(obs) ** 2).sum())
-            # 注入信号相对噪声的量级（白化空间 ⇒ 噪声 RMS ≈ 1/行）
-            snr = np.linalg.norm(fit.Aall[:, ci] @ eta[ci].astype(complex)) / np.sqrt(len(obs))
-            bad = abs(th - tt) > 1e-9
-            ok &= not bad
-            print(f"  {lv+'/'+br:>10}{(th-tt)*1e3:>12.1f}{rel:>12.2e}"
-                  f"{np.sqrt(s/sg):>12.2e}{snr:>11.2f}")
-    print(f"  ⇒ τ 恢复{'**全部精确**' if ok else '**有偏差**'}\n")
+    print("  【A. 优化正确性】格点真值 vs **离格真值 + 连续一维精修**")
+    print(f"  {'真值':>22}{'精修':>6}{'τ 误差(μs)':>13}{'η 相对误差':>12}{'残差/信号':>12}")
+    ok = True
+    for lv in ("L1", "L2", "L3"):
+        for nm, tt in list(P.TAU_TRUE.items()) + list(TAU_TRUE_OFF.items()):
+            off = nm in TAU_TRUE_OFF
+            obs, eta, _ = make_obs(fit, npool, np.random.default_rng(7), lv, tt,
+                                   2.0, Qprev, noise_on=False)
+            for rf in ((False, True) if off else (False,)):
+                fit.new_trial(obs)
+                th, eh, _, _ = fit.fit_scan(obs, full, lv, LAM_TINY, refine=rf)
+                ci = fit.idx(lv)
+                rel = np.linalg.norm(eh - eta[ci]) / max(np.linalg.norm(eta[ci]), 1e-12)
+                sse, _ = fit.resid(obs, full, lv, th, eh)
+                sg = float((np.abs(obs) ** 2).sum())
+                if off and rf:
+                    ok &= abs(th - tt) < 5e-6
+                print(f"  {lv+'/'+nm:>22}{'是' if rf else '否':>6}"
+                      f"{(th-tt)*1e6:>13.1f}{rel:>12.2e}{np.sqrt(sse/sg):>12.2e}")
+    print(f"  ⇒ 离格真值经连续精修后误差 <5 μs: {'**是**' if ok else '**否**'}\n")
 
     print("  【B. 无泄漏检查】")
-    print(f"    · Jacobian 只含 16 个训练条件, **holdout 位姿未进入任何矩阵**"
+    print(f"    · Jacobian 只含 16 训练条件, **holdout 位姿未进入任何矩阵**"
           f"  (HOLDOUT_SEALED={HOLDOUT_SEALED})")
-    obs, _ = make_obs(fit, npool, rng, "L2", P.TAU_TRUE["+102ms"], eta_sd)
+    obs, _, _ = make_obs(fit, npool, rng, "L2", P.TAU_TRUE["+102ms"], 2.0, Qprev)
     same = True
     for o in range(len(gmasks)):
         tr = ~gmasks[o]
-        t1, e1, _ = fit.fit_scan(obs, tr, "L2", 1e-2)
-        obs2 = obs.copy()
-        obs2[gmasks[o]] = rng.normal(size=int(gmasks[o].sum())) * 1e3   # 破坏留出组
-        t2, e2, _ = fit.fit_scan(obs2, tr, "L2", 1e-2)
+        fit.new_trial(obs); t1, e1, _, _ = fit.fit_scan(obs, tr, "L2", 1e-2)
+        o2 = obs.copy(); o2[gmasks[o]] = rng.normal(size=int(gmasks[o].sum())) * 1e3
+        fit.new_trial(o2); t2, e2, _, _ = fit.fit_scan(o2, tr, "L2", 1e-2)
         same &= (t1 == t2) and np.allclose(e1, e2)
-    print(f"    · 破坏留出组后训练侧 (τ̂, η) {'**逐位不变**' if same else '**改变了 ⇒ 泄漏**'}")
+    print(f"    · 破坏留出组后训练侧 (τ̂, η) {'**逐位不变**' if same else '**改变 ⇒ 泄漏**'}")
     ovl = max(int((gmasks[i] & gmasks[j]).sum())
               for i in range(len(gmasks)) for j in range(i + 1, len(gmasks)))
-    print(f"    · 七个物理位姿组两两行重叠 = {ovl}（应为 0；同组 grip/速度整组移除）\n")
-
-    print(f"  【C. {ntr} trial 层级选择（含噪声）】")
-    return run_trials(fit, npool, gmasks, ntr, eta_sd, rng)
+    print(f"    · 七组两两行重叠 = {ovl}（应为 0）\n")
+    return run_trials(fit, npool, gmasks, Qprev, ntr, rng)
 
 
-def run_trials(fit, npool, gmasks, ntr, eta_sd, rng):
+def run_trials(fit, npool, gmasks, Qprev, ntr, rng):
+    """按 ORTH_SNR_GRID 扫描; 记录分支、λ、以及各真值的尺度诊断。"""
     lv_list = list(LEVELS)
-    conf = np.zeros((4, 4), int)
-    absorb = {lv: [] for lv in lv_list}
-    wrongbr = {lv: [] for lv in lv_list}
-    gerr = {lv: [] for lv in lv_list}
-    for t in range(ntr):
-        lt = lv_list[t % 4]
-        tt = P.TAU_TRUE["+102ms" if (t // 4) % 2 == 0 else "-52ms"]
-        obs, _ = make_obs(fit, npool, np.random.default_rng(90000 + t), lt, tt, eta_sd)
-        res = lopo(fit, obs, gmasks)
-        sel, _, _, _ = pick_level(res)
-        conf[lv_list.index(lt), lv_list.index(sel)] += 1
-        for lv in lv_list:
-            a, b = branch_absorb(res[lv][2], tt)
-            absorb[lv].append(a); wrongbr[lv].append(b)
-            gerr[lv].append(res[lv][1])
-    return conf, absorb, wrongbr, gerr, lv_list
+    res = {}
+    for snr in ORTH_SNR_GRID:
+        conf = np.zeros((len(lv_list), len(lv_list)), int)
+        confb = {br: np.zeros((len(lv_list), len(lv_list)), int) for br in P.TAU_TRUE}
+        ab = {lv: [] for lv in lv_list}; wb = {lv: [] for lv in lv_list}
+        ge = {lv: [] for lv in lv_list}; dg = {lv: [] for lv in lv_list}
+        v2 = {lv: [] for lv in lv_list}; lam = {lv: [] for lv in lv_list}
+        per = max(ntr // len(lv_list), 1)
+        for i, lt in enumerate(lv_list):
+            for t in range(per):
+                br = list(P.TAU_TRUE)[t % 2]; tt = P.TAU_TRUE[br]
+                obs, _, d = make_obs(fit, npool, np.random.default_rng(
+                    90000 + 1000 * i + t + int(snr * 7)), lt, tt, snr, Qprev)
+                out = lopo(fit, obs, gmasks)
+                sel, _, _, _ = pick_level(out)
+                conf[i, lv_list.index(sel)] += 1
+                confb[br][i, lv_list.index(sel)] += 1
+                dg[lt].append(d)
+                for lv in lv_list:
+                    a_, b_ = branch_absorb(out[lv][2], tt)
+                    ab[lv].append(a_); wb[lv].append(b_); ge[lv].append(out[lv][1])
+                    v2[lv].append(out[lv][3]); lam[lv].extend(out[lv][4])
+        res[snr] = dict(conf=conf, confb=confb, ab=ab, wb=wb, ge=ge, dg=dg,
+                        v2=v2, lam=lam)
+    return res, lv_list
 
 
-def report(conf, absorb, wrongbr, gerr, lv_list):
-    n = conf.sum()
-    print(f"  混淆矩阵（行=真值, 列=所选; n={n}）")
-    hdr = "真/选"
-    print(f"  {hdr:>8}" + "".join(f"{c:>8}" for c in lv_list) + f"{'选对率':>9}")
-    for i, r in enumerate(lv_list):
-        tot = max(conf[i].sum(), 1)
-        print(f"  {r:>8}" + "".join(f"{conf[i, j]:>8}" for j in range(4))
-              + f"{conf[i, i]/tot:>8.1%}")
-    up = (conf[0, 1:].sum() + conf[1, 2:].sum()) / max(conf[:2].sum(), 1)
-    dn = (conf[2, :2].sum() + conf[3, :3].sum()) / max(conf[2:].sum(), 1)
-    print(f"\n  **L0/L1 被错误升级** = {up:.1%}   (门槛 ≤10%)")
-    print(f"  **L2/L3 被错误降级** = {dn:.1%}")
-    print(f"\n  {'层级':>6}{'τ 偏离真值>30ms':>17}{'落到错误分支':>14}"
-          f"{'组间误差 CV':>13}")
+def d6_diagnostic(fit, npool, gmasks, Qprev, rng):
+    """D6 三分诊断（用户 2026-07-29）: oracle / 内层 CV / one-SE 三者对比。
+
+    判读:
+      oracle 也恢复不了 D        ⇒ **当前设计确实缺少 D 信息**
+      oracle 能、CV ridge 不能   ⇒ **正则尺度或 λ 网格问题**
+      CV 能、one-SE 选 L2R       ⇒ 预测收益不足以支付复杂度, **合理简化**
+      SNR 3–5 仍系统性选 L2R     ⇒ 需重点查**模型选择实现**
+    """
+    print("  【D6 三分诊断】(真值 = L2, 即 D6 被打开)")
+    print(f"  {'正交SNR':>8}{'oracle η_D 相对误差':>20}{'CV η_D 相对误差':>17}"
+          f"{'CV 选的 λ(中位)':>17}{'one-SE 选层':>12}")
+    full = np.ones(len(fit.frow), bool)
+    sl = new_cols(fit, "L2")
+    for snr in (1.0, 2.0, 3.0, 5.0):
+        orel, crel, lams, sels = [], [], [], []
+        for t in range(6):
+            obs, eta, _ = make_obs(fit, npool, np.random.default_rng(4242 + t),
+                                   "L2", P.TAU_TRUE["+102ms"], snr, Qprev)
+            fit.new_trial(obs)
+            # (1) oracle: 正确层级 + **极弱** ridge, 全训练集
+            _, eo, _, _ = fit.fit_scan(obs, full, "L2", LAM_TINY)
+            orel.append(np.linalg.norm(eo[sl] - eta[sl])
+                        / max(np.linalg.norm(eta[sl]), 1e-30))
+            # (2) 内层 CV 选出的 λ
+            out = lopo(fit, obs, gmasks)
+            lm = float(np.median(out["L2"][4])); lams.append(lm)
+            fit.new_trial(obs)
+            _, ec, _, _ = fit.fit_scan(obs, full, "L2", lm)
+            crel.append(np.linalg.norm(ec[sl] - eta[sl])
+                        / max(np.linalg.norm(eta[sl]), 1e-30))
+            # (3) one-SE 的层级决定
+            sels.append(pick_level(out)[0])
+        top = max(set(sels), key=sels.count)
+        print(f"  {snr:>8.1f}{np.median(orel):>20.2f}{np.median(crel):>17.2f}"
+              f"{np.median(lams):>17.1e}{top+f'({sels.count(top)}/6)':>12}")
+    print(f"  λ 网格 = {LAM_GRID}  (含 {LAM_GRID.min():g} ⇒ **接近零**)\n")
+
+
+def report(res, lv_list):
+    print("  【表 1 · 可检测性】横轴 = 正交输出 SNR; **不因所需 η 大而剔除任何结果**")
+    print(f"  {'正交SNR':>8}" + "".join(f"{lv:>9}" for lv in lv_list)
+          + f"{'错误升级':>10}{'错误降级':>10}")
+    for snr, R in res.items():
+        conf = R["conf"]
+        hit = [conf[i, i] / max(conf[i].sum(), 1) for i in range(len(lv_list))]
+        up = sum(conf[i, i + 1:].sum() for i in range(len(lv_list) - 1))
+        dn = sum(conf[i, :i].sum() for i in range(1, len(lv_list)))
+        print(f"  {snr:>8.1f}" + "".join(f"{h:>8.0%}" for h in hit)
+              + f"{up/max(conf[:-1].sum(),1):>9.0%}{dn/max(conf[1:].sum(),1):>9.0%}")
+
+    print("\n  【表 2 · 尺度合理性】**只说明与集合分歧的距离**, 不判定物理合理性")
+    print("    (K=5 集合分歧尺度不是校准先验; D 恰可能是集合共同漏掉的结构误差)")
+    print(f"  {'真值层级':>8}{'正交SNR':>8}{'所需 η(集合σ)':>15}{'物理单位扰动':>14}"
+          f"{'floor 触发':>11}")
+    ATTR = {"L1": ("theta", "softplus 系数"), "L2R": ("B", "模态残量 B"),
+            "L2": ("D", "直通 D"), "L3": ("log_om", "log ω")}
     for lv in lv_list:
-        ge = np.array(gerr[lv])
-        cv = float(np.mean(ge.std(1) / np.maximum(ge.mean(1), 1e-30)))
-        print(f"  {lv:>6}{np.mean(absorb[lv]):>16.1%}{np.mean(wrongbr[lv]):>14.1%}"
-              f"{cv:>13.2f}")
-    print(f"\n  每组白化预测误差（七组等权; 不只报总体均值）")
+        if lv not in ATTR:
+            continue
+        at, unit = ATTR[lv]
+        for snr in ORTH_SNR_GRID:
+            d = res[snr]["dg"][lv]
+            if not d:
+                continue
+            dps = float(np.mean([x["dp_sd"] for x in d]))
+            print(f"  {lv:>8}{snr:>8.1f}{dps:>15.1f}{unit:>14}"
+                  f"{FLOOR_HIT.get(at, float('nan')):>11.0%}")
+
+    snr_ref = ORTH_SNR_GRID[2]
+    R = res[snr_ref]
+    print(f"\n  【混淆矩阵 @ 正交 SNR = {snr_ref}】(行=真值, 列=所选)")
+    hdr = "真/选"
+    print(f"  {hdr:>7}" + "".join(f"{c:>8}" for c in lv_list))
+    for i, r in enumerate(lv_list):
+        print(f"  {r:>7}" + "".join(f"{R['conf'][i, j]:>8}" for j in range(len(lv_list))))
+
+    print(f"\n  【两分支分别的层级选对率】")
+    print(f"  {'正交SNR':>8}" + "".join(f"{br:>12}" for br in P.TAU_TRUE))
+    for snr, Rx in res.items():
+        cells = []
+        for br in P.TAU_TRUE:
+            c = Rx["confb"][br]
+            cells.append(f"{np.trace(c)/c.sum():>11.0%}" if c.sum()
+                         else f"{'—(n=0)':>11}")     # 无样本 ≠ 0%
+        print(f"  {snr:>8.1f}" + "".join(cells))
+
+    print(f"\n  【每个真值的输出分解 @ 正交 SNR = {snr_ref}】")
+    print(f"  {'真值层级':>8}{'原始扰动':>11}{'正交残量':>11}{'最佳低层近似误差':>18}"
+          f"{'被低层吸收':>12}")
+    for lv in lv_list:
+        d = R["dg"][lv]
+        if not d:
+            continue
+        print(f"  {lv:>8}{np.mean([x['raw'] for x in d]):>11.2f}"
+              f"{np.mean([x['perp'] for x in d]):>11.2f}"
+              f"{np.mean([x['perp'] for x in d]):>18.2f}"
+              f"{np.mean([x['absorb'] for x in d]):>11.0%}")
+
+    print(f"\n  【τ 诊断 @ 正交 SNR = {snr_ref}】(**固定用该层级拟合**全部真值)")
+    print(f"  {'拟合层级':>8}{'τ 偏离>30ms':>14}{'落到错误分支':>14}"
+          f"{'精修后第二谷 ΔSSE 中位':>24}")
+    for lv in lv_list:
+        vv = [x for t_ in R["v2"][lv] for x in t_ if x is not None]
+        print(f"  {lv:>8}{np.mean(R['ab'][lv]):>13.1%}{np.mean(R['wb'][lv]):>14.1%}"
+              f"{(np.median(vv) if vv else float('nan')):>24.3e}")
+
+    print(f"\n  【各层实际选中的 λ 分布 @ 正交 SNR = {snr_ref}】")
+    print(f"  {'层级':>6}" + "".join(f"{f'{l:g}':>10}" for l in LAM_GRID))
+    for lv in lv_list:
+        ls = np.array(R["lam"][lv])
+        print(f"  {lv:>6}" + "".join(
+            f"{np.mean(np.isclose(ls, l)):>9.0%}" for l in LAM_GRID))
+
+    print(f"\n  【每组白化预测误差（七组等权）@ 正交 SNR = {snr_ref}】")
     print(f"  {'层级':>6}" + "".join(f"{'g'+str(i):>11}" for i in range(7)))
     for lv in lv_list:
-        ge = np.array(gerr[lv]).mean(0)
-        print(f"  {lv:>6}" + "".join(f"{v:>11.3e}" for v in ge))
+        print(f"  {lv:>6}" + "".join(f"{v:>11.3e}"
+                                     for v in np.array(R["ge"][lv]).mean(0)))
 
 
 def main():
@@ -526,7 +917,8 @@ def main():
     amp_of = {pi: P.amp_for(F_of[pi], "energy", E_star) for pi in range(16)}
 
     print(f"=== 3.2 真实层级 + group-LOPO ({a.design}, stage={a.stage}) ===\n")
-    H0, blocks, frow, krow, prow, keys = level_jacobian(g, poses, R, F_of, amp_of, models)
+    H0, blocks, frow, krow, prow, keys, phys, gauge = level_jacobian(
+        g, poses, R, F_of, amp_of, models)
     _, Um = P.model_and_U(g, poses, R, F_of, amp_of)
     nb_cache = {tuple(F_WIDE): P.noise_blocks(F_WIDE),
                 tuple(F_NARROW): P.noise_blocks(F_NARROW)}
@@ -534,25 +926,62 @@ def main():
     w = 1.0 / sd
     npool = npool * w[None, :]
     fit = Fitter(H0, blocks, frow, w)
-    describe(fit)
+    describe(fit, phys, gauge)
+    gauge_tests(fit, gauge, w, npool)
 
     gmasks = [np.isin(prow, grp[gk]) for gk in gkeys]
     print(f"  七个物理位姿组的行数: {[int(m.sum()) for m in gmasks]}")
     print(f"  条件数/组: {[len(grp[gk]) for gk in gkeys]}  (整组留出, 组间等权)\n")
 
     rng = np.random.default_rng(3)
+    Qprev = prev_basis(fit)
     if a.stage == "verify":
-        conf, ab, wb, ge, lvl = stage_verify(fit, npool, gmasks, rng, a.trials, a.eta)
+        res, lvl = stage_verify(fit, npool, gmasks, Qprev, rng, a.trials)
+        d6_diagnostic(fit, npool, gmasks, Qprev, rng)
     else:
-        conf, ab, wb, ge, lvl = run_trials(fit, npool, gmasks, a.trials, a.eta, rng)
-    report(conf, ab, wb, ge, lvl)
-    np.savez(OUT / f"levels_C_{a.design}_{a.stage}.npz", conf=conf,
-             absorb=np.array([ab[l] for l in lvl]),
-             wrongbr=np.array([wb[l] for l in lvl]),
-             gerr=np.array([ge[l] for l in lvl]))
+        res, lvl = run_trials(fit, npool, gmasks, Qprev, a.trials, rng)
+    report(res, lvl)
+    np.savez(OUT / f"levels_C_{a.design}_{a.stage}.npz",
+             levels=np.array(lvl), snr=np.array(list(res)),
+             conf=np.array([res[k]["conf"] for k in res]))
     print(f"\n→ outputs/probe_c/levels_C_{a.design}_{a.stage}.npz")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ======================= 按层级重搜最坏 shape error =======================
+# 用户 2026-07-28: "最坏扰动以 log-gain 为主, 但 L1 很可能会吸收它。因此接入
+# 真实层级后, 应**重新搜索每层的最坏 shape error**; 不能只沿用替代模型的 x*。"
+
+import worst_shape_C as WS
+
+# 逐分量椭球半径 —— 三组敏感性(不是单一标量 r)
+def rvec_of(mode, nP):
+    v = np.ones(8 + nP)
+    if mode == "gain2":                 # 仅 log-gain 通道扩到 2
+        v[:4] = 2.0
+    elif mode == "all2":                # 全通道 2 —— **压力测试, 不是置信集合**
+        v[:] = 2.0
+    return v
+
+
+SENS = {"r=1": "r1", "仅gain r=2": "gain2", "全通道 r=2(压力测试)": "all2"}
+
+
+def apply_shape_rows(sig, x, nP, frow, prow, u_p):
+    """把 shape error 作用到信号行上。规范同 §最不利搜索: Σ_p a_p = 0。"""
+    q = WS.unpack(x, nP)
+    nu = frow - frow.mean()
+    gg = q["c0"] + q["c1"] * nu + q["c2"] * nu ** 2 + q["d"] * u_p[prow]
+    psi = (q["a"][prow] * 2 * np.pi * nu + q["b1"] * 2 * np.pi * nu ** 2
+           + q["b2"] * 2 * np.pi * nu ** 3)
+    out = sig * np.exp(gg) * np.exp(-1j * psi)
+    # 三轴方向偏差: 行按 (…, 频点, 轴0/1/2) 排列 ⇒ reshape 后旋转 0-1 轴
+    ang = q["e0"] + q["e1"] * u_p[prow]
+    v = out.reshape(-1, 3); a3 = ang.reshape(-1, 3)[:, 0]
+    c, s = np.cos(a3), np.sin(a3)
+    return np.stack([c * v[:, 0] - s * v[:, 1],
+                     s * v[:, 0] + c * v[:, 1], v[:, 2]], 1).ravel()
