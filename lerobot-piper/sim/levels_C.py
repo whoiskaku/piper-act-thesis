@@ -70,6 +70,7 @@ LAM_TINY = 1e-10                 # 仅用于"优化正确性"检查, 不进入�
 TAU_TRUE_OFF = {"+102.37ms": 0.10237, "-51.63ms": -0.05163}
 ORTH_SNR_GRID = (0.5, 1.0, 2.0, 3.0, 5.0)        # 可检测真值的正交 SNR 扫描
 RANK_TOL = 1e-8                  # 数值秩阈值: σ_i > σ_max·RANK_TOL
+NZ_GLOBAL = None                 # (pool, sess, spans), main 里设置
 HOLDOUT_SEALED = True          # R6: 本模块**任何路径都不读** holdout 行
 
 
@@ -266,17 +267,65 @@ def level_jacobian(g, poses, R, F_of, amp_of, models):
 
 # ======================= 噪声与白化 =======================
 
+def noise_blocks_tagged(freqs):
+    """同 `P.noise_blocks`, 但**保留 (session, window) 标签**。
+
+    2026-07-29: 原实现让所有 key 共用同一个 `nb` 数组, 且每次只抽**一个**块索引
+    作用到全部 key ⇒ 组间噪声高度相关(非对角 |ρ| 达 0.96), 训练组能预测留出组的
+    噪声, 使纯噪声 LOPO 掉到 0.63 < 1。必须显式区分两层。
+
+    session = 采集轮次(r1: A1/A2, r2: A3/A4, r3: A5/A6) —— 同轮共享漂移
+    run/window = 轮内窗口 —— 近似独立
+    """
+    BARE = {"A1": "replay_ep0_A1", "A2": "replay_ep0_A2", "A3": "replay_ep0_r2_A3",
+            "A4": "replay_ep0_r2_A4", "A5": "replay_ep0_r3_A5", "A6": "replay_ep0_r3_A6"}
+    seq = np.load(A.PB / "seq_ep0_j2_4mrad_p.npz", allow_pickle=True)
+    Rc = {k: json.loads((A.PB / f"{v}.json").read_text()) for k, v in BARE.items()}
+    W = {k: A.arm_windows(Rc[k], seq, 0) for k in Rc}
+    blocks, sess = [], []
+    for w in [int(x) for x in seq["wins"]]:
+        if not all(w in W[k] for k in W):
+            continue
+        LI = lambda k, f: A.lockin_at(W[k][w]["y"], W[k][w]["t"], f, W[k][w]["dt"])
+        for si, (a_, b_) in enumerate([("A1", "A2"), ("A3", "A4"), ("A5", "A6")]):
+            blocks.append(np.array([(LI(b_, f) - LI(a_, f)) / 2 for f in freqs]))
+            sess.append(si)
+    return np.array(blocks), np.array(sess)
+
+
 def noise_rows(keys, F_of, Um, nb_cache):
-    """每行的噪声样本池(FRF 空间 = N/U), 与白化权重。"""
-    pool, sd = [], []
+    """**逐 key** 的噪声样本池 + 白化权重 + session 标签 + 行→key 映射。
+
+    返回的 pool 形状 (nblk, N)。与旧版的区别: 采样时**每个 key 独立抽窗口**
+    (见 `draw_noise`), 只有 session 分量在 key 之间共享。
+    """
+    pool, sd, spans = [], [], []
+    off = 0
+    sess = None
     for (pi, j) in keys:
         F = F_of[pi]
-        nb = nb_cache[tuple(F)]                    # (nblk, nf, 3)
+        nb, sess_k = nb_cache[tuple(F)]            # (nblk, nf, 3), (nblk,)
         ui = 1.0 / np.where(np.abs(Um[(pi, j)]) < 1e-15, 1e-15, Um[(pi, j)])
-        v = nb * ui[None, :, None]                 # (nblk, nf, 3)
-        pool.append(v.reshape(len(nb), -1))
+        v = nb * ui[None, :, None]
+        m = v.reshape(len(nb), -1)
+        pool.append(m)
         sd.append(np.sqrt(np.maximum((np.abs(v) ** 2).mean(0), 1e-30)).ravel())
-    return np.concatenate(pool, 1), np.concatenate(sd)
+        spans.append((off, off + m.shape[1])); off += m.shape[1]
+        sess = sess_k
+    return np.concatenate(pool, 1), np.concatenate(sd), sess, spans
+
+
+def draw_noise(pool, sess, spans, rng):
+    """两层重采样: **先抽 session(共享)**, 再为每个 key **独立抽轮内窗口**。
+
+    ⇒ session 分量在 key 间共享(物理真实: 同轮漂移), 窗口分量互相独立。
+    """
+    si = int(rng.integers(sess.max() + 1))
+    cand = np.flatnonzero(sess == si)
+    out = np.empty(pool.shape[1], complex)
+    for (lo, hi) in spans:
+        out[lo:hi] = pool[cand[rng.integers(len(cand))], lo:hi]
+    return out
 
 
 # ======================= 拟合器（Gram 与 τ 无关 ⇒ 跨 trial 缓存） =======================
@@ -673,7 +722,7 @@ def make_obs(fit, npool, rng, level_true, tau_true, orth_snr, Qprev,
     obs = ((fit.H0 + fit.Aall @ eta.astype(complex))
            * np.exp(-2j * np.pi * fit.frow * tau_true))
     if noise_on:
-        obs = obs + npool[rng.integers(len(npool))]
+        obs = obs + draw_noise(*NZ_GLOBAL, rng)
     diag = {"raw": float(np.linalg.norm(Y) * sc / np.sqrt(n)),
             "perp": float(np.linalg.norm(perp) * sc / np.sqrt(n)),
             "absorb": 1.0 - (np.linalg.norm(perp) / max(np.linalg.norm(Y), 1e-30)) ** 2,
@@ -923,14 +972,77 @@ def g0_isolation(fit, npool, gmasks, Qprev, gkeys, grp, poses, prow, frow, keys,
     print("\n  【隔离 2 · 仅噪声】(a) 不拟合的原始白化残差, 每组应≈1.00")
     acc = np.zeros(ng)
     for k in range(40):
-        nz = npool[np.random.default_rng(700 + k).integers(len(npool))]
+        nz = draw_noise(*NZ_GLOBAL, np.random.default_rng(700 + k))
         for o in range(ng):
             acc[o] += (np.abs(nz[gmasks[o]]) ** 2).sum() / n_of[o]
     print("  " + "".join(f"{v/40:>12.3f}" for v in acc))
     print("      (b) 经 LOPO 在 L0 上拟合纯噪声观测后的各组 SSE")
-    obs2 = fit.H0 * np.exp(-2j * np.pi * frow * tt) + npool[3]
-    out = lopo(fit, obs2, gmasks)
-    print("  " + "".join(f"{v:>12.3f}" for v in out["L0"][1]))
+    print("          单次抽样的组内 SD ≈ 1/√n_g, 故必须多次平均才能判 ≥1")
+    ND = 24
+    accL = np.zeros((ND, ng))
+    for k in range(ND):
+        o2 = (fit.H0 * np.exp(-2j * np.pi * frow * tt)
+              + draw_noise(*NZ_GLOBAL, np.random.default_rng(7700 + k)))
+        accL[k] = lopo(fit, o2, gmasks)["L0"][1]
+    mu, se = accL.mean(0), accL.std(0, ddof=1) / np.sqrt(ND)
+    print("      均值: " + "".join(f"{v:>12.3f}" for v in mu))
+    print("      ±SE : " + "".join(f"{v:>12.3f}" for v in se))
+    print(f"      七组等权总均值 = {mu.mean():.3f} ± {accL.mean(1).std(ddof=1)/np.sqrt(ND):.3f}"
+          f"   (应 ≥1)")
+    # 只有**显著低于 1** 才是病态方向(高于 1 是正常的: 训练侧预测误差会加上去)
+    bad = [f"g{i}" for i in range(ng) if mu[i] + 1.96 * se[i] < 1.0]
+    hi = [f"g{i}" for i in range(ng) if mu[i] - 1.96 * se[i] > 1.0]
+    print(f"      显著**低于** 1 的组(病态): {bad if bad else '无 ✓'}")
+    print(f"      显著高于 1 的组(正常方向): {hi if hi else '无'}")
+    print(f"      注: 组间残余 |ρ|≈0.26 来自**共享 session 分量**(物理真实)。")
+    print(f"          ⇒ group-LOPO 只在**同一 session 内**有效, 不验证跨 session 泛化。")
+
+    # ---- 阻断测试: 纯噪声 LOPO = 0.63 < 1 是红旗(用户 2026-07-29) ----
+    #   若留出组噪声与训练组独立: E‖n_test − ŷ_train‖² = E‖n_test‖² + E‖ŷ_train‖² ≥ 1
+    print("\n  【阻断测试 3 · 七组噪声块之间的复相关】(先查是否共享 A-run block)")
+    ng_ = len(gmasks)
+    C = np.zeros((ng_, ng_))
+    for k in range(30):
+        nz = draw_noise(*NZ_GLOBAL, np.random.default_rng(900 + k))
+        v = [nz[gmasks[o]] for o in range(ng_)]
+        for i in range(ng_):
+            for j in range(ng_):
+                a_, b_ = v[i], v[j]
+                L = min(len(a_), len(b_))
+                C[i, j] += abs(np.vdot(a_[:L], b_[:L])) / (
+                    np.linalg.norm(a_[:L]) * np.linalg.norm(b_[:L]) + 1e-30) / 30
+    print("  " + "".join(f"{'g'+str(i):>8}" for i in range(ng_)))
+    for i in range(ng_):
+        print(f"  g{i}" + "".join(f"{C[i, j]:>8.3f}" for j in range(ng_)))
+    off = C[~np.eye(ng_, dtype=bool)].mean()
+    print(f"    非对角均值 |ρ| = {off:.3f}  "
+          f"{'⇒ **组间噪声高度相关: 共享 A-run block**' if off > 0.3 else '⇒ 组间近似独立'}")
+
+    print("\n  【阻断测试 1 · 白化后逐物理组独立高斯噪声】LOPO 应回到 ≈1")
+    rg = np.random.default_rng(31)
+    nz = np.zeros(len(frow), complex)
+    for o in range(ng_):
+        m = gmasks[o]
+        nz[m] = (rg.normal(size=int(m.sum())) + 1j * rg.normal(size=int(m.sum()))) / np.sqrt(2)
+    obsI = fit.H0 * np.exp(-2j * np.pi * frow * tt) + nz
+    oI = lopo(fit, obsI, gmasks)
+    print("  " + "".join(f"{v:>12.3f}" for v in oI["L0"][1]))
+
+    print("\n  【阻断测试 2 · 训练组不变, 只把留出组换成新独立噪声】留出分应 ≈1")
+    base = (fit.H0 * np.exp(-2j * np.pi * frow * tt)
+            + draw_noise(*NZ_GLOBAL, np.random.default_rng(78)))
+    row2 = []
+    for o in range(ng_):
+        fit.new_trial(base)
+        th_, eh_, _, _ = fit.fit_scan(base, ~gmasks[o], "L0", 1e-2)   # 参数只由训练组定
+        ob = base.copy()
+        m = gmasks[o]
+        ob[m] = (fit.H0[m] * np.exp(-2j * np.pi * frow[m] * tt)
+                 + (rg.normal(size=int(m.sum()))
+                    + 1j * rg.normal(size=int(m.sum()))) / np.sqrt(2))
+        sX, nX = fit.resid(ob, m, "L0", th_, eh_)      # **参数不变**, 只换留出数据
+        row2.append(sX / nX)
+    print("  " + "".join(f"{v:>12.3f}" for v in row2))
 
     print("\n  【隔离 3 · 仅 shape error(r=1, 无噪声)】g0 是否真的更难建模")
     uv = np.array([float(np.dot(S.phi_of(poses[pi])[1:6],
@@ -1062,11 +1174,13 @@ def main():
     H0, blocks, frow, krow, prow, keys, phys, gauge = level_jacobian(
         g, poses, R, F_of, amp_of, models)
     _, Um = P.model_and_U(g, poses, R, F_of, amp_of)
-    nb_cache = {tuple(F_WIDE): P.noise_blocks(F_WIDE),
-                tuple(F_NARROW): P.noise_blocks(F_NARROW)}
-    npool, sd = noise_rows(keys, F_of, Um, nb_cache)
+    nb_cache = {tuple(F_WIDE): noise_blocks_tagged(F_WIDE),
+                tuple(F_NARROW): noise_blocks_tagged(F_NARROW)}
+    npool, sd, nsess, nspans = noise_rows(keys, F_of, Um, nb_cache)
     w = 1.0 / sd
     npool = npool * w[None, :]
+    global NZ_GLOBAL
+    NZ_GLOBAL = (npool, nsess, nspans)
     fit = Fitter(H0, blocks, frow, w)
     describe(fit, phys, gauge)
     gauge_tests(fit, gauge, w, npool)
