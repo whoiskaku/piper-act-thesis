@@ -885,9 +885,151 @@ def report(res, lv_list):
                                      for v in np.array(R["ge"][lv]).mean(0)))
 
 
+# ======================= g0 隔离诊断（用户 2026-07-29） =======================
+
+def g0_isolation(fit, npool, gmasks, Qprev, gkeys, grp, poses, prow, frow, keys, F_of):
+    """四项隔离，判定 g0 持续偏高的成因。
+
+    判读(用户给定):
+      仅第 1 项异常          ⇒ 组装 / 索引 / Jacobian bug
+      仅第 2 项异常          ⇒ 白化或组内归一问题
+      **只有**第 3 项异常    ⇒ g0 是真实的高失配工作点
+      仅少数频率/轴异常      ⇒ 后续 shape 集合须按该结构建模, 不能用统一半径
+    """
+    ng = len(gmasks)
+    n_of = [int(m.sum()) for m in gmasks]
+    print("  【组构成】(SSE 已确认按**组内复数行数**取均值, 非求和)")
+    print(f"  {'组':>4}{'条件数':>7}{'行数':>7}{'宽带':>6}{'窄带':>6}{'q2,q3':>16}")
+    for gi, gk in enumerate(gkeys):
+        pis = grp[gk]
+        nw = sum(1 for pi in pis if len(F_of[pi]) > 5)
+        print(f"  g{gi:<3}{len(pis):>7}{n_of[gi]:>7}{nw:>6}{len(pis)-nw:>6}"
+              f"{str(gk):>16}")
+
+    tt = P.TAU_TRUE["+102ms"]
+
+    print("\n  【隔离 1 · 无噪声 / 无 shape / 正确层级】各组 SSE 应≈数值零")
+    obs, eta, _ = make_obs(fit, npool, np.random.default_rng(5), "L2", tt,
+                           2.0, Qprev, noise_on=False)
+    row = []
+    for o in range(ng):
+        fit.new_trial(obs)
+        th, eh, _, _ = fit.fit_scan(obs, ~gmasks[o], "L2", LAM_TINY)
+        s, n = fit.resid(obs, gmasks[o], "L2", th, eh)
+        row.append(s / n)
+    print("  " + "".join(f"{'g'+str(i):>12}" for i in range(ng)))
+    print("  " + "".join(f"{v:>12.2e}" for v in row))
+
+    print("\n  【隔离 2 · 仅噪声】(a) 不拟合的原始白化残差, 每组应≈1.00")
+    acc = np.zeros(ng)
+    for k in range(40):
+        nz = npool[np.random.default_rng(700 + k).integers(len(npool))]
+        for o in range(ng):
+            acc[o] += (np.abs(nz[gmasks[o]]) ** 2).sum() / n_of[o]
+    print("  " + "".join(f"{v/40:>12.3f}" for v in acc))
+    print("      (b) 经 LOPO 在 L0 上拟合纯噪声观测后的各组 SSE")
+    obs2 = fit.H0 * np.exp(-2j * np.pi * frow * tt) + npool[3]
+    out = lopo(fit, obs2, gmasks)
+    print("  " + "".join(f"{v:>12.3f}" for v in out["L0"][1]))
+
+    print("\n  【隔离 3 · 仅 shape error(r=1, 无噪声)】g0 是否真的更难建模")
+    uv = np.array([float(np.dot(S.phi_of(poses[pi])[1:6],
+                                np.array([1.0, -1.0, 0.5, -0.5, 0.25])))
+                   for pi in range(len(poses))])
+    uv = (uv - uv.mean()) / (uv.std() + 1e-12)
+    rr = np.random.default_rng(9)
+    x = rr.normal(size=8 + len(poses)); x /= np.linalg.norm(x)
+    sig = fit.H0 * np.exp(-2j * np.pi * frow * tt)
+    obs3 = apply_shape_rows(sig, x, len(poses), frow, prow, uv)
+    out3 = lopo(fit, obs3, gmasks)
+    for lv in ("L0", "L2"):
+        print(f"    {lv}: " + "".join(f"{v:>11.3f}" for v in out3[lv][1]))
+
+    # 单次随机 shape 可能只是该抽样的特异性 ⇒ 对多个 shape 种子取平均。
+    # 另外并列给出**无 shape、只有注入信号**的情形 —— 100 trial 里 g0 偏高
+    # 实际由它驱动(那批观测**根本没有 shape error**)。
+    print("\n  【隔离 4 · g0 残差结构拆解】(20 个 shape 抽样平均 + 无 shape 对照)")
+    ax = np.tile([0, 1, 2], len(frow) // 3)
+    kr = np.array([ki for ki, (pi, j) in enumerate(keys)
+                   for _ in range(len(F_of[pi]) * 3)])
+    m0 = gmasks[0]
+
+    def decomp(o_):
+        fit.new_trial(o_)
+        th_, eh_, _, _ = fit.fit_scan(o_, ~m0, "L2", 1e-2)
+        pr = ((fit.H0 + fit.Aall[:, fit.idx("L2")] @ eh_.astype(complex))
+              * np.exp(-2j * np.pi * frow * th_))
+        return np.abs(o_ - pr) ** 2
+
+    accs = np.zeros(3); accf = {}; acck = {}
+    NS = 20
+    for k in range(NS):
+        rk = np.random.default_rng(300 + k)
+        xk = rk.normal(size=8 + len(poses)); xk /= np.linalg.norm(xk)
+        r2k = decomp(apply_shape_rows(sig, xk, len(poses), frow, prow, uv))
+        r2k = r2k / max(r2k[m0].mean(), 1e-30)          # 每次抽样内归一, 再平均
+        for a in (0, 1, 2):
+            accs[a] += r2k[m0 & (ax == a)].mean() / NS
+        for f in np.unique(frow[m0]):
+            accf[f] = accf.get(f, 0.0) + r2k[m0 & (frow == f)].mean() / NS
+        for ki in np.unique(kr[m0]):
+            acck[ki] = acck.get(ki, 0.0) + r2k[kr == ki].mean() / NS
+    print("    [仅 shape, 20 抽样平均, 组内归一]")
+    print("      按陀螺轴: " + "".join(f"  轴{a}={accs[a]:.3f}" for a in (0, 1, 2)))
+    print("      按频率:   " + "".join(f"  {f:.1f}Hz={accf[f]:.3f}"
+                                       for f in sorted(accf)))
+    print("      按 key:   " + "".join(
+        f"  p{keys[ki][0]}j{keys[ki][1]+1}={acck[ki]:.3f}" for ki in sorted(acck)))
+
+    r2n = decomp(make_obs(fit, npool, np.random.default_rng(5), "L2", tt,
+                          2.0, Qprev, noise_on=False)[0])
+    r2n = r2n / max(r2n[m0].mean(), 1e-30)
+    print("    [无 shape, 仅注入信号(与 100 trial 同口径)]")
+    print("      按陀螺轴: " + "".join(
+        f"  轴{a}={r2n[m0 & (ax == a)].mean():.3f}" for a in (0, 1, 2)))
+    print("      按频率:   " + "".join(
+        f"  {f:.1f}Hz={r2n[m0 & (frow == f)].mean():.3f}"
+        for f in np.unique(frow[m0])))
+
+
+# ======================= 按层级重搜最坏 shape error =======================
+# 用户 2026-07-28: "最坏扰动以 log-gain 为主, 但 L1 很可能会吸收它。因此接入
+# 真实层级后, 应**重新搜索每层的最坏 shape error**; 不能只沿用替代模型的 x*。"
+
+import worst_shape_C as WS
+
+# 逐分量椭球半径 —— 三组敏感性(不是单一标量 r)
+def rvec_of(mode, nP):
+    v = np.ones(8 + nP)
+    if mode == "gain2":                 # 仅 log-gain 通道扩到 2
+        v[:4] = 2.0
+    elif mode == "all2":                # 全通道 2 —— **压力测试, 不是置信集合**
+        v[:] = 2.0
+    return v
+
+
+SENS = {"r=1": "r1", "仅gain r=2": "gain2", "全通道 r=2(压力测试)": "all2"}
+
+
+def apply_shape_rows(sig, x, nP, frow, prow, u_p):
+    """把 shape error 作用到信号行上。规范同 §最不利搜索: Σ_p a_p = 0。"""
+    q = WS.unpack(x, nP)
+    nu = frow - frow.mean()
+    gg = q["c0"] + q["c1"] * nu + q["c2"] * nu ** 2 + q["d"] * u_p[prow]
+    psi = (q["a"][prow] * 2 * np.pi * nu + q["b1"] * 2 * np.pi * nu ** 2
+           + q["b2"] * 2 * np.pi * nu ** 3)
+    out = sig * np.exp(gg) * np.exp(-1j * psi)
+    # 三轴方向偏差: 行按 (…, 频点, 轴0/1/2) 排列 ⇒ reshape 后旋转 0-1 轴
+    ang = q["e0"] + q["e1"] * u_p[prow]
+    v = out.reshape(-1, 3); a3 = ang.reshape(-1, 3)[:, 0]
+    c, s = np.cos(a3), np.sin(a3)
+    return np.stack([c * v[:, 0] - s * v[:, 1],
+                     s * v[:, 0] + c * v[:, 1], v[:, 2]], 1).ravel()
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", default="verify", choices=["verify", "screen", "final"])
+    ap.add_argument("--stage", default="verify", choices=["verify", "screen", "final", "g0"])
     ap.add_argument("--trials", type=int, default=100)
     ap.add_argument("--eta", type=float, default=0.3)
     ap.add_argument("--design", default="hybrid1", choices=["hybrid1", "D1", "D2"])
@@ -935,6 +1077,10 @@ def main():
 
     rng = np.random.default_rng(3)
     Qprev = prev_basis(fit)
+    if a.stage == "g0":
+        g0_isolation(fit, npool, gmasks, Qprev, gkeys, grp, poses, prow, frow,
+                     keys, F_of)
+        return 0
     if a.stage == "verify":
         res, lvl = stage_verify(fit, npool, gmasks, Qprev, rng, a.trials)
         d6_diagnostic(fit, npool, gmasks, Qprev, rng)
@@ -950,38 +1096,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-# ======================= 按层级重搜最坏 shape error =======================
-# 用户 2026-07-28: "最坏扰动以 log-gain 为主, 但 L1 很可能会吸收它。因此接入
-# 真实层级后, 应**重新搜索每层的最坏 shape error**; 不能只沿用替代模型的 x*。"
-
-import worst_shape_C as WS
-
-# 逐分量椭球半径 —— 三组敏感性(不是单一标量 r)
-def rvec_of(mode, nP):
-    v = np.ones(8 + nP)
-    if mode == "gain2":                 # 仅 log-gain 通道扩到 2
-        v[:4] = 2.0
-    elif mode == "all2":                # 全通道 2 —— **压力测试, 不是置信集合**
-        v[:] = 2.0
-    return v
-
-
-SENS = {"r=1": "r1", "仅gain r=2": "gain2", "全通道 r=2(压力测试)": "all2"}
-
-
-def apply_shape_rows(sig, x, nP, frow, prow, u_p):
-    """把 shape error 作用到信号行上。规范同 §最不利搜索: Σ_p a_p = 0。"""
-    q = WS.unpack(x, nP)
-    nu = frow - frow.mean()
-    gg = q["c0"] + q["c1"] * nu + q["c2"] * nu ** 2 + q["d"] * u_p[prow]
-    psi = (q["a"][prow] * 2 * np.pi * nu + q["b1"] * 2 * np.pi * nu ** 2
-           + q["b2"] * 2 * np.pi * nu ** 3)
-    out = sig * np.exp(gg) * np.exp(-1j * psi)
-    # 三轴方向偏差: 行按 (…, 频点, 轴0/1/2) 排列 ⇒ reshape 后旋转 0-1 轴
-    ang = q["e0"] + q["e1"] * u_p[prow]
-    v = out.reshape(-1, 3); a3 = ang.reshape(-1, 3)[:, 0]
-    c, s = np.cos(a3), np.sin(a3)
-    return np.stack([c * v[:, 0] - s * v[:, 1],
-                     s * v[:, 0] + c * v[:, 1], v[:, 2]], 1).ravel()
