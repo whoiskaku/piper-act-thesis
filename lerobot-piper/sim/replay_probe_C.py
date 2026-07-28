@@ -187,7 +187,7 @@ def verify_identity(pose_idx):
 
 # ======================= 主流程 =======================
 
-def run_c(pose_idx, joint, arm, dry_run=False):
+def run_c(pose_idx, joint, arm, dry_run=False, rep=1):
     man, tr, ho, cands = verify_identity(pose_idx)
     # pilot 索引是 **tr 的顺序位置**(greedy 选择顺序), 与 gate0_C 的 `poses` 同序。
     # 用 sorted(tr) 会取到别的位姿(2026-07-29: 曾使 rm 从 0.33° 变成 12.2°)。
@@ -218,8 +218,9 @@ def run_c(pose_idx, joint, arm, dry_run=False):
     seq_hash = h16(np.concatenate([cmd7.ravel(), da.ravel()]))
     print(f"  序列 {seqname}  hash {seq_hash}  w0={meta['w0']} 帧数={len(cmd7)}")
 
-    armname = {"A": f"A_c{pose_idx}_{joint+1}", "Bp": f"Bp_c{pose_idx}_{joint+1}",
-               "Bm": f"Bm_c{pose_idx}_{joint+1}"}[arm]
+    # rep 后缀: 臂序是 A → B+ → B− → A, 两条 A 若同名会**覆盖前一条**
+    # (B′ 当初加轮次后缀正是为此)。rep 进入文件名与记录。
+    armname = f"{arm}{rep}_c{pose_idx}_{joint+1}"
     tag = f"c_p{pose_idx}_j{joint+1}_"
     aborted, reason = False, None
     try:
@@ -263,7 +264,7 @@ def run_c(pose_idx, joint, arm, dry_run=False):
                           "ref_frame": 0,
                           "ref_t_send": (rec["t_send"][0] if rec.get("t_send") else None),
                           "note": "命令相位; **实测相位须由分析器拟合后另存**"},
-        "seq_hash": seq_hash, "seq_meta": meta,
+        "seq_hash": seq_hash, "seq_meta": meta, "rep": int(rep),
         "sent_cmd7": cmd7.tolist(), "sent_da": da.tolist(),           # 完整实际发送序列
         "gate0_rm_deg": rm, "aborted": bool(aborted or rec.get("stopped")),
         "abort_reason": reason or rec.get("stopped"),
@@ -279,10 +280,12 @@ if __name__ == "__main__":
     ap.add_argument("--pose", type=int, help="train 位姿索引")
     ap.add_argument("--joint", type=int, default=2, choices=[1, 2], help="1=j2, 2=j3")
     ap.add_argument("--arm", default="A", choices=["A", "Bp", "Bm"])
+    ap.add_argument("--rep", type=int, default=1,
+                    help="同一臂型的第几条(臂序 A1→Bp1→Bm1→A2 的两条 A 必须不同)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     if a.freeze:
         freeze(); raise SystemExit(0)
     if a.pose is None:
         raise SystemExit("需要 --pose")
-    raise SystemExit(run_c(a.pose, a.joint, a.arm, a.dry_run))
+    raise SystemExit(run_c(a.pose, a.joint, a.arm, a.dry_run, a.rep))
