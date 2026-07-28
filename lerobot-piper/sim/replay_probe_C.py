@@ -226,7 +226,7 @@ def run_c(pose_idx, joint, arm, dry_run=False):
         rc = RP.run(armname, dry_run=dry_run, seqfile=seqname, tag=tag, outdir=PC)
     except BaseException as e:                        # 含 KeyboardInterrupt
         aborted, reason, rc = True, f"{type(e).__name__}: {e}", 1
-        print(f"\n✗ 异常 —— 已由 replay_probe 的 finally 安全停机并落盘部分日志")
+        print(f"\n✗ 异常: {reason}")
         traceback.print_exc()
     if dry_run:
         return rc
@@ -234,9 +234,13 @@ def run_c(pose_idx, joint, arm, dry_run=False):
     # ---- schema 后处理: 12 个字段 + 完整实际发送序列 ----
     p = PC / f"replay_{tag}{armname}.json"
     if not p.exists():
-        print(f"✗ 未生成 {p}")
-        return 1
-    rec = json.loads(p.read_text())
+        # 异常发生在 replay_probe 写盘**之前**(如连接阶段) ⇒ 这里必须自己落盘,
+        # 否则"任意异常都要留下 aborted=true/reason 的部分日志"这条就落空了。
+        print(f"  ⚠ replay_probe 未落盘 ⇒ 写最小 abort 日志")
+        rec = {"arm": armname, "t": [], "t_send": [], "imu": [], "state": [],
+               "imu100": [], "stopped": reason or "未知(无记录)"}
+    else:
+        rec = json.loads(p.read_text())
     st = np.array(rec.get("state", []), float)[:, :6] * np.pi / 180 / 1000
     adir_meas = {}
     if len(st) > N_APPR:
