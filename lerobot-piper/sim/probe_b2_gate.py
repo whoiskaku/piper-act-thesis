@@ -387,9 +387,11 @@ def gate456(recs, seq, env):
           f" 达 {vspread.max()*100:.0f}pp。")
     dvo = [max(abs(ratios(c)[1][k] - vA[k]) for k in range(6) if k != jj)
            for c in (f"{jn}_{AMP[0]}_p", f"{jn}_{AMP[0]}_m")]
-    if max(dvo) > 0.10:
+    # 只有超过裸复放自身离散才值得提 —— 否则那就是这个量的噪声
+    vs_other = max(vspread[k] for k in range(6) if k != jj)
+    if max(dvo) > vs_other:
         print(f"      · 诊断: 非注入关节速度增量最大 {max(dvo)*100:+.0f}pp "
-              f"(> A1↔A2 离散 {vspread.max()*100:.0f}pp 则值得复现确认)")
+              f"> {BARE[0]}↔{BARE[1]} 离散 {vs_other*100:.0f}pp ⇒ 值得复现确认")
     return ok4, ok5, ok6
 
 
