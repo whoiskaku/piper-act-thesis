@@ -165,9 +165,19 @@ def main():
                     for i in range(len(F))])
     en = np.median([np.abs(even[i]).max()/max(np.abs(noise[i]).max(), 1e-30)
                     for i in range(len(F))])
+    # 零分布: 单窗口下 even 与 noise 各只有**一个复样本** ⇒
+    #   |even|²/|noise|² ~ F(2,2), CDF = F/(1+F) ⇒ 95% 分位 F=19 ⇒ 比值 **4.36**
+    #   故"比值>3"在零假设下就有 10% 频点会出现 —— 用 <2 当判据是拍的(2026-07-29 修)
+    THR = np.sqrt(19.0)
+    rat = np.array([np.abs(even[i]).max() / max(np.abs(noise[i]).max(), 1e-30)
+                    for i in range(len(F))])
+    nex = int((rat > THR).sum()); exp = 0.05 * len(F)
     print(f"    median |even|/|odd| = {eo:.2f}    median |even|/|noise| = {en:.2f}")
-    print(f"    ⇒ 偶分量{'与噪声相容(非线性/漂移无证据)' if en < 2 else '**显著高于噪声**'}"
-          f" —— 单窗口下 |even|/|odd| 本身不可判, 必须与噪声底比")
+    print(f"    零分布 |even|²/|noise|² ~ F(2,2) ⇒ 95% 分位比值 = {THR:.2f}")
+    print(f"    超阈频点 **{nex}/{len(F)}**  (零假设期望 {exp:.2f})  "
+          f"⇒ 偶分量{'与噪声**相容**' if nex <= max(1, 2*exp) else '**显著高于噪声**'}")
+    print(f"    (|even|/|odd| 在单窗口下不可判; 中位数也会被频点覆盖带偏 —— P3 只有")
+    print(f"     6-7.5Hz 四个点, 恰是 P1/P2 也偏高的那一段)")
     print(f"    ⚠ 单窗口 ⇒ **相干度 γ² 无法计算**(需 ≥2 窗); 相位/时延本轮不下结论。")
 
     # ---------- 5. 门禁 F + 削顶 ----------
