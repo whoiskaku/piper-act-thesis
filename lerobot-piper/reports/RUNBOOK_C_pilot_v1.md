@@ -400,3 +400,65 @@ seq_energy, approach_dir, dither_phase0
 - [x] **dry-run（附录 D）28/28**
 - [ ] **采集脚本补 12 个字段**（阻塞项）
 - [ ] **放行**（仍未放行）
+
+---
+
+# 附录 E · 采集脚本 `sim/replay_probe_C.py`（2026-07-29）
+
+**薄封装**：连接 / IMU 自检 / 预移动 / 100 Hz 记录 / 发送 / 安全退出
+**全部调用 `replay_probe.run()`**，不复制，避免两套实现漂移。新增仅四件事：
+受控位姿 + 慢速往复 + 统一进场、C 序列生成、fail-closed 身份校验、schema 后处理。
+
+## E.1 fail-closed 状态机
+
+```
+校验(tag/manifest/train-only/位姿表hash) → ⓪对**实际序列**重算 → 写 npz
+  → replay_probe.run(连接/预移动/记录/发送/安全退出) → schema 后处理落盘
+任意异常 → 安全停机 → 写 aborted=true + reason 的部分日志
+```
+
+## E.2 12 个字段的口径
+
+| 字段 | 口径 |
+|---|---|
+| `git_hash` / `git_tag` | 从 manifest 读期望值 **并核对实际 HEAD**，不一致直接退出 |
+| `pose_table_hash` | 对**规范化后的完整 train+holdout 表**求 hash |
+| `seed_order` / `seed_sign` | manifest 里的整数 seed，运行时**不重新生成** |
+| `u_peak_per_joint` / `seq_energy` | 从**实际发送的 `da` 数组**算，单位 `rad` / `rad²·s` 写入 manifest；A 臂全零 |
+| `approach_dir` | `planned`（计划）+ `measured_from_encoder`（由编码器轨迹实测），**不只存符号** |
+| `dither_phase0` | 命令相位 + 参考帧 + 参考 `t_send`；**实测相位由分析器拟合后另存**，采集脚本不假称已知 |
+| `sent_cmd7` / `sent_da` | **完整实际发送序列** —— 元数据不是唯一证据 |
+
+**统一进场**放进**被记录的序列内**（前 40 帧），所以 C3 可由编码器实测复核，
+不靠事后推断。方向按"余量更大的一侧"确定并落盘（固定符号会吃光贴边位姿的余量）。
+
+## E.3 验收（全部通过）
+
+| 项 | 结果 |
+|---|---|
+| 序列性质 8/8 | `max\|B+ + B−\| = 0`、重建 hash/meta 完全一致、位姿表 hash 跨进程可复现、单关节约束、A 臂 da 全零、三 pilot 位姿含 1.5° 进场偏置后 rm 仍全正、峰值 ≤2 mrad、能量差 <1% |
+| npz 级 | `max\|B+ + B−\|(da) = 0`、`max\|B+ − B−\|(cmd7) = 0`、A 臂 da 全零 |
+| A / Bp / Bm 三臂 dry-run | 全部通过，⓪ 分别 0.394 / 0.345 / 0.376°（j3） |
+| 身份校验负例 | holdout 位姿 ✓拦截、工作区不干净 ✓拦截、tag 不符 ✓拦截 |
+| 异常 / 急停 | `RuntimeError` 与 `KeyboardInterrupt` 均捕获、rc=1、落盘 `aborted=true` + reason + 完整发送序列 |
+| 门禁全套回归 | dry-run 28/28、⓪ 预算三位姿不变 |
+
+## E.4 实现中查出的三个缺陷（都是我的，不是门禁的）
+
+1. **`pose_table_hash` 逐进程随机**：用了 Python 内置 `hash()`，对字符串按
+   `PYTHONHASHSEED` 随机化 ⇒ 身份 hash 每次运行都不同（实测 f5273d37 / f4faf066 /
+   98f9cfc4），**每次 verify 必失败**。改用固定常量 0/1，两进程验证一致。
+   *fail-closed 校验本身工作正常——它拦住的正是这个缺陷。*
+2. **pilot 索引用错序**：pilot 索引是 `tr` 的**顺序位置**（greedy 序），我用了
+   `sorted(tr)` ⇒ 取到别的位姿，注入窗 rm 从 0.33° 变成 12.2°。
+3. **abort 日志缺口**：异常若发生在 `replay_probe` 写盘**之前**（如连接阶段），
+   原实现完全不落盘。现改为自建最小记录再补齐字段；并修了零帧记录的 2 维索引崩溃。
+
+---
+
+## 放行清单（2026-07-29）
+
+- [x] 门禁草案 / holdout 硬断言 / ⓪ 预算 / B·C·F 阈值 / dry-run 28/28
+- [x] **采集脚本 + 12 字段 + 六项验收**（附录 E）
+- [x] 重冻 manifest（tag `c-pilot-v2`）
+- [ ] **放行决定**（用户）→ 通过后跑 P1 的 A
