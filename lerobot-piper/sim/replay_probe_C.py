@@ -241,7 +241,9 @@ def run_c(pose_idx, joint, arm, dry_run=False):
                "imu100": [], "stopped": reason or "未知(无记录)"}
     else:
         rec = json.loads(p.read_text())
-    st = np.array(rec.get("state", []), float)[:, :6] * np.pi / 180 / 1000
+    # abort 路径可能是**零帧**记录 ⇒ 不能无条件按 2 维索引
+    _st = np.asarray(rec.get("state") or [], float)
+    st = _st[:, :6] * np.pi / 180 / 1000 if _st.ndim == 2 and _st.shape[0] else np.zeros((0, 6))
     adir_meas = {}
     if len(st) > N_APPR:
         for jj in (1, 2):
