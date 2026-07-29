@@ -71,6 +71,13 @@ class IdealChunkRenderer:
         self.sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "ee_imu_site")
         self.hi = hi_fps
         self.ctx = ctx
+        # render 用 imu[::round(hi/FPS)] 降采样 —— hi/FPS 必须**整除**, 否则输出的实际
+        # 采样率是 hi/round(hi/FPS) 而非 FPS, 时基逐帧漂移(2026-07-29 在 30 Hz 复用时
+        # 踩到: 200/30→stride 7 ⇒ 28.57 Hz, 800 帧漂 ~38 帧, 滞后估计完全失效)。
+        # 生产口径 200/20=10 一直正确; 这里只是把静默失败变成显式失败。
+        if abs(hi_fps / FPS - round(hi_fps / FPS)) > 1e-9:
+            raise ValueError(f"hi_fps({hi_fps}) 必须是 FPS({FPS}) 的整数倍, "
+                             f"否则降采样时基漂移; 30 Hz 请用 240")
         from scipy.signal import butter
         self._ba = butter(4, 0.45 * FPS / (hi_fps / 2))
 

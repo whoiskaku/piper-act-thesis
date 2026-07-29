@@ -118,3 +118,10 @@ BCORR_MODE=ff BCORR_FF_LAG=3 BCORR_FF_BLEND=13 BCORR_LOG=outputs/ab_ins/B3b13_ep
 所以 FF 的 −33% 是相对 TE-OFF 基线测的。TE 与 blend 互斥（TE 要求 `n_action_steps=1`，
 没有接缝可 blend），但与 lag 正交。这是一个**已知未闭的混淆项**，不阻塞 insert，
 但论文里 FF 的适用条件必须写成"在 chunk 开环执行下"。
+
+**已查完，见 `TE_CONFOUND.md`（同日，零机时）**：三个独立口径一致 ——
+接缝倍率 TE关 5.17/6.56/6.01× → TE开 0.82/0.55/0.56×，**TE 完全消掉接缝**；
+滞后 133 → 100 ms 不变（TE 不做时移）。⇒ **blend 在 TE 下归零，lag 保留。**
+推理成本实测 8.9 ms p95 vs 50 ms 帧预算，**不是障碍**（此前判断有误）。
+本预注册的 insert 实验不受影响（同为 TE-OFF 口径），但 §二 的 H1 判否后果要加一句：
+即便 H1 通过，FF 相对 **TE** 的增值仍未测。
