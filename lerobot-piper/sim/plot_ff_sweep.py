@@ -25,8 +25,7 @@ plt.rcParams["font.sans-serif"] = ["Noto Sans CJK JP", "Noto Sans CJK SC", "Deja
 plt.rcParams["axes.unicode_minus"] = False
 
 ROOT = Path(__file__).resolve().parents[1]
-SC = Path("/tmp/claude-1000/-home-enolab-guo-claude-test-2/"
-          "675e2ec5-9ec0-48d8-a265-066e293ec7fe/scratchpad")
+AB2 = ROOT / "outputs/ab2"
 
 # 臂 → (ff_lag, 有效 blend, 残余滞后[帧], 标注)
 CFG = {
@@ -40,7 +39,29 @@ CFG = {
 
 
 def load(a):
-    return np.array(json.load(open(SC / f"g3_{a}.json")))[:, 0]
+    """直接从真机日志算每集 gap/帧。
+
+    2026-08-04 改: 原来读一个会话临时目录下的 g3_*.json, 那个目录早已不存在,
+    脚本实际是坏的。现在自算, 与 analyze_ab 同口径(逐位复现已发布数字)。
+    """
+    import re
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from analyze_ab import load_run
+    from lerobot.common.policies.act.b_runtime import IdealChunkRenderer
+    global _R, _REND
+    try:
+        _R
+    except NameError:
+        _R = np.array(json.loads((ROOT / "outputs/p2_labels/pp2-deploy/manifest.json"
+                                  ).read_text())["R"], np.float32)
+        _REND = IdealChunkRenderer()
+    fs = sorted(AB2.glob(f"{a}_ep*.json"),
+                key=lambda p: int(re.search(r"ep(\d+)", p.name).group(1)))
+    fs = [f for f in fs
+          if json.loads(f.read_text())["summary"]["frames"] > 500][:10]
+    return np.array([(lambda r: r["energy"] / r["n"])(load_run(f, _R, _REND))
+                     for f in fs])
 
 
 def main():
@@ -75,11 +96,11 @@ def main():
     draw(ax[1], ["B3", "B3b8", "B3b13"], [2, 5, 10], "有效 blend（帧）",
          "② 有效 blend 扫描　ff_lag 固定 = 3")
     v = E["B3b13r2"]
-    ax[1].errorbar(10.6, v.mean(), yerr=v.std(ddof=1) / np.sqrt(len(v)),
+    ax[1].errorbar(11.3, v.mean(), yerr=v.std(ddof=1) / np.sqrt(len(v)),
                    fmt="s", ms=8, capsize=5, lw=2, color="tab:orange",
-                   label=f"独立重复 {v.mean():.4f}")
+                   label=f"独立重复 {v.mean():.4f}（p=0.94）")
     ax[1].legend(fontsize=8.5)
-    ax[1].set_xticks([2, 5, 10]); ax[1].set_xlim(1, 12.5)
+    ax[1].set_xticks([2, 5, 10]); ax[1].set_xlim(1, 13.2)
 
     # ③ 机制：残余滞后 vs ff_lag
     lags = [0, 2, 3]
@@ -88,8 +109,10 @@ def main():
     for x, y in zip(lags, res):
         ax[2].annotate(f"{y} 帧", (x, y), textcoords="offset points",
                        xytext=(9, 4), fontsize=9)
-    ax[2].plot([0, 3], [2.74, -0.26], ":", c="gray", lw=1.5,
-               label="理论：2.74 − ff_lag\n（亚帧实测真值 2.74 帧 = 137 ms）")
+    # 亚帧真值用**与本图同一批 ab2 数据**重测的 2.82 帧(141 ms)。
+    # 旧标注写的 2.74/137 ms 出自更早的估计器, 与其余数字不同源(2026-08-04 统一)。
+    ax[2].plot([0, 3], [2.82, -0.18], ":", c="gray", lw=1.5,
+               label="理论：2.82 − ff_lag\n（同批数据亚帧实测 2.82 帧 = 141 ms）")
     ax[2].axhline(0, c="k", lw=.8)
     ax[2].set_xlabel("ff_lag（帧）"); ax[2].set_ylabel("残余滞后（帧）")
     ax[2].set_title("③ 机制：残余滞后随 ff_lag 精确抵消\n（由对齐移位扫描独立测得）",
