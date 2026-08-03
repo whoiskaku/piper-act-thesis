@@ -32,7 +32,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from lerobot.common.policies.act.b_runtime import IdealChunkRenderer
 
 ROOT = Path(__file__).resolve().parents[1]
-AB2 = ROOT / "outputs/ab2"
 FPS = 20.0
 STYLE = {"A": ("tab:blue", "裸 ACT"), "B": ("tab:green", "FF lag=2 有效blend2"),
          "D": ("tab:red", "ACT + π (FF 关闭)"),
@@ -49,10 +48,11 @@ def _bp():
     return _shared()
 
 
-def eps(arm):
-    fs = sorted(AB2.glob(f"{arm}_ep*.json"),
+def eps(arm, root, min_frames=500, n=10):
+    fs = sorted(Path(root).glob(f"{arm}_ep*.json"),
                 key=lambda p: int(re.search(r"ep(\d+)", p.name).group(1)))
-    return [f for f in fs if json.loads(f.read_text())["summary"]["frames"] > 500][:10]
+    return [f for f in fs
+            if json.loads(f.read_text())["summary"]["frames"] > min_frames][:n]
 
 
 def load(path, R):
@@ -69,15 +69,20 @@ def load(path, R):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--other", default="B", help="与 A 对比的臂: B / D / B3")
+    ap.add_argument("--other", default="B", help="与 A 对比的臂: B / D / B3 / B3b13 …")
     ap.add_argument("--ep", type=int, default=6,
                     help="配对序号（两张图用同一个，使 A 面板一致）")
+    ap.add_argument("--task", default="pp2", help="pp2 / ins —— 决定用哪个 manifest 的 R")
+    ap.add_argument("--root", default="outputs/ab2")
+    ap.add_argument("--min-frames", type=int, default=500)
     a_ = ap.parse_args()
     O = a_.other
-    R = np.array(json.loads((ROOT / "outputs/p2_labels/pp2-deploy/manifest.json"
+    AB2 = ROOT / a_.root
+    R = np.array(json.loads((ROOT / f"outputs/p2_labels/{a_.task}-deploy/manifest.json"
                              ).read_text())["R"], np.float32)
     bp = _bp()
-    fA, fO = eps("A"), eps(O)
+    fA, fO = eps("A", AB2, a_.min_frames), eps(O, AB2, a_.min_frames)
+    STYLE.setdefault(O, ("tab:brown", O))       # 新臂名不必预先登记
     k = min(a_.ep, len(fA) - 1, len(fO) - 1)
     rA, iA = load(fA[k], R)
     rO, iO = load(fO[k], R)

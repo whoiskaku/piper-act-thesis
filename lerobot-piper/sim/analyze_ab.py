@@ -29,7 +29,22 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 FIG = ROOT / "reports/figures"
 FPS, CHUNK = 20.0, 100
-ARMS = ("A", "B", "C")
+ARMS = ("A", "B", "C")            # 原三臂设计的默认值; 可用 --arms 覆盖
+
+
+def arm_episodes(root: Path, arm: str, min_frames: int, n: int | None):
+    """按**采集次序**取该臂的有效集。
+
+    两处必须这样做, 否则配对会错位(2026-08-04 修):
+      · 排序用 ep 后的整数, 不能用字典序 —— ep10 会排到 ep2 前面, ≥10 集必错
+      · 过滤掉中断集(frames 过少), 与 plot_arm_compare/gcheck 的口径一致
+    """
+    import re
+    fs = sorted(root.glob(f"{arm}_ep*.json"),
+                key=lambda p: int(re.search(r"ep(\d+)", p.name).group(1)))
+    fs = [f for f in fs
+          if json.loads(f.read_text()).get("summary", {}).get("frames", 0) > min_frames]
+    return fs[:n] if n else fs
 
 
 def _bp():
@@ -86,33 +101,48 @@ def synth_runs(n=10, seed=0):
     return {"A": base * noise(), "B": base * 0.80 * noise(), "C": base * 0.68 * noise()}
 
 
-def report(E, task):
-    print(f"\n═══ {task} ═══   (每臂 {len(E['A'])} 集, 配对)")
-    print(f"{'臂':>4}{'gap 能量(均值)':>16}{'相对 A':>10}")
-    for a in ARMS:
-        print(f"{a:>4}{np.mean(E[a]):>16.4g}{np.mean(E[a])/np.mean(E['A'])*100-100:>9.1f}%")
+def report(E, task, arms=ARMS):
+    n = min(len(E[a]) for a in arms)
+    print(f"\n═══ {task} ═══   (每臂 {n} 集, 按采集次序配对)")
+    print(f"{'臂':>8}{'gap 能量(均值)':>16}{'相对 A':>10}{'改善集数':>10}")
+    for a in arms:
+        imp = int(np.sum(np.array(E[a][:n]) < np.array(E["A"][:n]))) if a != "A" else 0
+        print(f"{a:>8}{np.mean(E[a]):>16.4g}"
+              f"{np.mean(E[a])/np.mean(E['A'])*100-100:>9.1f}%"
+              f"{(f'{imp}/{n}' if a != 'A' else '—'):>10}")
+
+    # 比较对: 每个非 A 臂 vs A, 再加相邻臂之间(看逐步增益)
+    pairs = [("A", a, f"{a}−A") for a in arms if a != "A"]
+    rest = [a for a in arms if a != "A"]
+    pairs += [(rest[i], rest[i + 1], f"{rest[i+1]}−{rest[i]}  (逐步增益)")
+              for i in range(len(rest) - 1)]
+
     res = {}
-    for lo, hi, name in [("A", "B", "B−A  逆算案的效果"),
-                         ("B", "C", "C−B  **反馈的净增值**"),
-                         ("A", "C", "C−A  整体效果")]:
-        m, t, p, ci = paired(E[lo], E[hi])
-        rel = m / np.mean(E[lo]) * 100
+    for lo, hi, name in pairs:
+        m, t, p, ci = paired(E[lo][:n], E[hi][:n])
+        rel = m / np.mean(E[lo][:n]) * 100
         sig = "✓ 显著" if p < 0.05 else "✗ 不显著"
-        print(f"  {name:<26} {rel:+6.1f}%   t={t:+.2f}  p={p:.4f}  {sig}")
+        print(f"  {name:<28} {rel:+6.1f}%   t={t:+.2f}  p={p:.4f}  {sig}")
         res[f"{hi}-{lo}"] = {"rel_pct": rel, "t": t, "p": p, "ci": list(ci)}
-    p_cb = res["C-B"]["p"]
-    if p_cb >= 0.05:
+
+    # 淘汰条款只对**原三臂设计**成立, 不能套到任意臂集上
+    if tuple(arms) == ("A", "B", "C") and res.get("C-B", {}).get("p", 1) >= 0.05:
         print("\n  ⚠ **预注册淘汰条款触发**: C−B 不显著 ⇒ π 无净增值,")
-        print("     按事前约定砍掉 π, 保留 FF 层毕业。")
+        print("     按事前约定砍掉 π, 保留 FF 层毕业。**是否执行由用户决定。**")
     return res
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="outputs/ab")
-    ap.add_argument("--task", default="ins")
+    ap.add_argument("--task", default="ins", help="pp2 / ins —— 决定用哪个 manifest 的 R")
+    ap.add_argument("--arms", default="A,B,C", help="逗号分隔, 第一个必须是基线 A")
+    ap.add_argument("--n", type=int, default=10, help="每臂取前 n 集(按采集次序)")
+    ap.add_argument("--min-frames", type=int, default=500, help="低于此帧数视为中断集, 剔除")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
+    arms = tuple(s.strip() for s in a.arms.split(",") if s.strip())
+    assert arms[0] == "A", f"第一个臂必须是基线 A, 收到 {arms}"
 
     if a.self_test:
         print("=== 自检: 合成三臂 (注入 B比A好20%, C比B再好15%) ===")
@@ -129,17 +159,24 @@ def main():
     from lerobot.common.policies.act.b_runtime import IdealChunkRenderer
     rend = IdealChunkRenderer()
     E, S = {}, {}
-    for arm in ARMS:
-        fs = sorted(root.glob(f"{arm}_*.json"))
-        assert fs, f"未找到 {root}/{arm}_*.json"
+    for arm in arms:
+        fs = arm_episodes(root, arm, a.min_frames, a.n)
+        assert fs, f"未找到 {root}/{arm}_ep*.json (或全部短于 {a.min_frames} 帧)"
         rs = [load_run(f, R, rend) for f in fs]
         E[arm] = [r["energy"] / r["n"] for r in rs]            # 每帧能量(消除长度差)
         S[arm] = rs
+        sm = rs[0]["summary"]
         print(f"{arm}: {len(fs)} 集  ‖δa‖={np.mean([r['da_rms'] for r in rs]):.2f}mrad "
-              f"峰={max(r['da_peak'] for r in rs):.1f}mrad")
-    res = report(E, a.task)
+              f"峰={max(r['da_peak'] for r in rs):.1f}mrad  "
+              f"ff_lag={sm.get('ff_lag','?')} ff_blend={sm.get('ff_blend','?')}"
+              f"(有效{sm.get('ff_blend_effective','?')}) mode={sm.get('mode','?')}")
+    if len({len(E[x]) for x in arms}) > 1:
+        print(f"  ⚠ 各臂集数不等 {[len(E[x]) for x in arms]} ⇒ 配对截断到最短")
+    res = report(E, a.task, arms)
     (root / "ab_result.json").write_text(json.dumps(
-        {"per_arm_energy": {k: list(map(float, v)) for k, v in E.items()},
+        {"arms": list(arms),
+         "per_arm_energy": {k: list(map(float, v)) for k, v in E.items()},
+         "per_arm_summary": {k: [r["summary"] for r in S[k]] for k in arms},
          "tests": res}, indent=1))
     print(f"\n→ {root/'ab_result.json'}")
     return 0
