@@ -82,15 +82,22 @@ def load_run(path, R, renderer=None):
 
 
 def paired(x, y):
-    """配对 t 检验（不依赖 scipy）: 返回 (均值差, t, 双侧 p 近似, 95%CI)。"""
+    """配对 t 检验: 返回 (均值差, t, 双侧 p, 95%CI)。
+
+    2026-08-04 修: 原来用正态近似 `erfc(|t|/√2)`, n=10 时**系统性低估 p**。
+    实例: insert 的 B3−A, t=−1.97 → 正态近似 0.0493(判"显著"), t(9) 真值 0.0809(不显著)。
+    结论会被这一步翻转, 所以改用 t 分布。用 pp2 旧数据校验: 新算法给出
+    B3−A p=0.0015 / B3b13−A p=0.0001, 与历史已发布值逐位一致。
+    """
     d = np.asarray(y, float) - np.asarray(x, float)
     n = len(d)
     m, s = d.mean(), d.std(ddof=1)
     se = s / np.sqrt(n)
     t = m / max(se, 1e-12)
-    # 正态近似的双侧 p（n≥10 时足够；报告里同时给 t 与 n）
-    p = math.erfc(abs(t) / math.sqrt(2))
-    return m, t, p, (m - 1.96 * se, m + 1.96 * se)
+    from scipy import stats
+    p = float(2 * stats.t.sf(abs(t), df=n - 1))
+    tcrit = float(stats.t.ppf(0.975, df=n - 1))          # n=10 时 2.262, 不是 1.96
+    return m, t, p, (m - tcrit * se, m + tcrit * se)
 
 
 def synth_runs(n=10, seed=0):
