@@ -49,6 +49,13 @@ chunk 开头 10 帧的 gap² 是中段的 4.40×（判据口径）。
 **有效 blend = ff_blend − ff_lag**（先 blend 后移位，前 lag 帧被丢弃）。
 原设 `blend=4, lag=2` 名义 4 帧、实际只有 2 帧起作用 —— 这是原设只有 −12.5% 的主因之一。
 
+**FF 的作用边界（分段分析，`PP2_PHASE_FINDING.md`）**：全程唯一变差的是
+**夹爪合拢完成后的 0.5 s**（+52.5%，p=0.020，由 `lag` 造成）。
+判别实验排除了"臂/爪失同步"（另两个夹爪事件 FF 正常：−46.5%、−69.2%），
+区别在于只有该事件是**接过负载**。候选解释是 `ff_lag` 标定于空载动力学、
+而 `ideal` 不含负载模型 —— **未验证**。消掉它值约 3.4 pp（−33.0% → −36.4%）。
+接触相位本身 FF 效果最好（抓取 −44.4%、松开 −49.6%，非接触运动仅 −24.3%）。
+
 **blend 的作用越出它修改的帧**：只比 B3b13 与 B3（lag 相同，只差 blend），
 中段 30–89 仍降 7.2%（pp2）/ 31.0%（insert）⇒ 接缝瞬态响铃到作用面之外。
 
@@ -106,6 +113,7 @@ pp2 静止帧 43.6%，运动段 0.09526 → 0.06448（**−32.3%**），静止�
 | `outputs/ab2/FF_sweep.png` | **主图**：ff_lag 扫描 / 有效 blend 扫描 / 残余滞后机制 |
 | `outputs/ab2/AB_curves.png` … `AB3b13_curves.png` | 四联波形（A 面板跨图一致，可对照） |
 | `outputs/ab2/AD_curves.png`、`AD_gap.png` | π 臂 |
+| `outputs/ab2/pp2_phase.png` | **分段分析**：相位柱状 / 抓取对齐 / 逐时 / 三事件判别实验 |
 | `outputs/ab_ins/FF_two_task_summary.png` | 两任务对照（含运动/静止分段） |
 
 脚本：`analyze_ab.py`（主判据）、`plot_ff_sweep.py`（主图）、`ff_decompose.py`（位置分解）、
