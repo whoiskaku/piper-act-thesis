@@ -37,7 +37,10 @@ STYLE = {"A": ("tab:blue", "裸 ACT"), "B": ("tab:green", "FF lag=2 有效blend2
          "D": ("tab:red", "ACT + π (FF 关闭)"),
          "B3": ("tab:orange", "FF lag=3 有效blend2"),
          "B3b8": ("tab:purple", "FF lag=3 有效blend5"),
-         "B3b13": ("tab:brown", "FF lag=3 有效blend10")}
+         "B3b13": ("tab:brown", "FF lag=3 有效blend10"),
+         "A2": ("tab:cyan", "裸 ACT（同会话对照）"),
+         "E": ("tab:purple", "π 直接回归（FF 关闭）"),
+         "F": ("tab:olive", "FF + π 直接回归")}
 
 
 def _bp():
@@ -75,13 +78,16 @@ def main():
     ap.add_argument("--task", default="pp2", help="pp2 / ins —— 决定用哪个 manifest 的 R")
     ap.add_argument("--root", default="outputs/ab2")
     ap.add_argument("--min-frames", type=int, default=500)
+    ap.add_argument("--base", default="A", help="基线臂名。ab3 用同会话对照 A2")
     a_ = ap.parse_args()
     O = a_.other
     AB2 = ROOT / a_.root
     R = np.array(json.loads((ROOT / f"outputs/p2_labels/{a_.task}-deploy/manifest.json"
                              ).read_text())["R"], np.float32)
     bp = _bp()
-    fA, fO = eps("A", AB2, a_.min_frames), eps(O, AB2, a_.min_frames)
+    B = a_.base
+    fA, fO = eps(B, AB2, a_.min_frames), eps(O, AB2, a_.min_frames)
+    STYLE.setdefault(B, ("tab:blue", B))
     STYLE.setdefault(O, ("tab:brown", O))       # 新臂名不必预先登记
     k = min(a_.ep, len(fA) - 1, len(fO) - 1)
     rA, iA = load(fA[k], R)
@@ -97,37 +103,37 @@ def main():
 
     c_o, lab_o = STYLE[O]
     fig, ax = plt.subplots(4, 1, figsize=(13, 11))
-    ttl = (f"A(裸 ACT) vs {O}({lab_o}) —— **同一配对序号 第{k}集**"
-           f"（AB / AD 两图共用，A 面板一致）\n"
+    ttl = (f"{B}({STYLE[B][1]}) vs {O}({lab_o}) —— **同一配对序号 第{k}集**"
+           f"（同 --ep 的各图基线面板一致）\n"
            f"陀螺 y 轴，gap 未对齐口径　|　闭环策略 ⇒ 两臂轨迹并非逐点相同，作分布对照")
     fig.suptitle(ttl, fontsize=11)
 
     t, t2 = np.arange(len(rA)) / FPS, np.arange(len(rO)) / FPS
     ax[0].plot(t, iA[:, 1], lw=.9, c="k", alpha=.7, label="ideal（ACT 指令渲染）")
-    ax[0].plot(t, rA[:, 1], lw=.9, c="tab:blue", alpha=.85, label="real A（裸）")
-    ax[0].set_title(f"① A 臂 real vs ideal　gap/帧 {eA:.4f}（全集均值 {mA:.4f}）", fontsize=10)
+    ax[0].plot(t, rA[:, 1], lw=.9, c=STYLE[B][0], alpha=.85, label=f"real {B}（{STYLE[B][1]}）")
+    ax[0].set_title(f"① {B} 臂 real vs ideal　gap/帧 {eA:.4f}（全集均值 {mA:.4f}）", fontsize=10)
     ax[1].plot(t2, iO[:, 1], lw=.9, c="k", alpha=.7, label="ideal")
     ax[1].plot(t2, rO[:, 1], lw=.9, c=c_o, alpha=.85, label=f"real {O}（{lab_o}）")
     ax[1].set_title(f"② {O} 臂 real vs ideal　gap/帧 {eO:.4f}"
-                    f"（全集均值 {mO:.4f}，相对 A {mO/mA*100-100:+.1f}%）", fontsize=10)
+                    f"（全集均值 {mO:.4f}，相对 {B} {mO/mA*100-100:+.1f}%）", fontsize=10)
     for a2 in ax[:2]:
         a2.set_ylabel("ω_y (rad/s)"); a2.legend(fontsize=9); a2.grid(alpha=.3); a2.set_xlim(0, 17)
 
-    ax[2].plot(t, gA[:, 1], lw=.9, c="tab:blue", alpha=.85, label=f"A gap")
+    ax[2].plot(t, gA[:, 1], lw=.9, c=STYLE[B][0], alpha=.85, label=f"{B} gap")
     ax[2].plot(t2, gO[:, 1], lw=.9, c=c_o, alpha=.85, label=f"{O} gap")
     ax[2].set_title("③ gap = real − ideal（0.5–9 Hz 带通）", fontsize=10)
     ax[2].set_ylabel("gap ω_y (rad/s)"); ax[2].set_xlabel("时间 (s)")
     ax[2].legend(fontsize=9); ax[2].grid(alpha=.3); ax[2].set_xlim(0, 17)
 
     P = {}
-    for arm, fl in (("A", fA), (O, fO)):
+    for arm, fl in ((B, fA), (O, fO)):
         acc = []
         for f in fl:
             r, i = load(f, R)
             fq, p = welch(np.linalg.norm(bp(r - i), axis=1), fs=FPS, nperseg=256)
             acc.append(p)
         P[arm] = np.mean(acc, 0)
-    ax[3].semilogy(fq, P["A"], c="tab:blue", lw=1.4, label="A 裸")
+    ax[3].semilogy(fq, P[B], c=STYLE[B][0], lw=1.4, label=f"{B} {STYLE[B][1]}")
     ax[3].semilogy(fq, P[O], c=c_o, lw=1.4, label=f"{O} {lab_o}")
     ax[3].axvspan(0.5, 9, color="gray", alpha=.12); ax[3].set_xlim(0, 10)
     ax[3].set_xlabel("频率 (Hz)"); ax[3].set_ylabel("PSD")
@@ -135,13 +141,13 @@ def main():
     ax[3].legend(fontsize=9); ax[3].grid(alpha=.3)
 
     fig.tight_layout(rect=[0, 0, 1, 0.945])
-    out = AB2 / f"A{O}_curves.png"
+    out = AB2 / f"{B}{O}_curves.png"
     fig.savefig(out, dpi=140)
     print(f"→ {out.relative_to(ROOT.parent)}   (两臂均用第 {k} 集)")
-    print(f"  {O}/A 逐频段 PSD 比（<1 = 改善）:")
+    print(f"  {O}/{B} 逐频段 PSD 比（<1 = 改善）:")
     for lo, hi in [(0.5, 2), (2, 4), (4, 6), (6, 8), (8, 9)]:
         m = (fq >= lo) & (fq < hi)
-        print(f"    {lo}-{hi} Hz: {P[O][m].sum() / P['A'][m].sum():.3f}")
+        print(f"    {lo}-{hi} Hz: {P[O][m].sum() / P[B][m].sum():.3f}")
     return 0
 
 
