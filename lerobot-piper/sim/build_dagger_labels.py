@@ -77,6 +77,10 @@ def main():
     ap.add_argument("--eps", type=int, default=10)
     ap.add_argument("--repo", default=None, help="只跑这一个 repo(与 --tag 配对)")
     ap.add_argument("--tag", default=None)
+    ap.add_argument("--lag", type=int, default=None,
+                    help="强制对齐 L(默认由 lag_corr_ch 自测)。**FF 臂必须显式指定**: "
+                         "FF 已消掉部分滞后, 自测会给 L=2, 而部署侧 FeatureAssembler "
+                         "与 build_offline 固定用 L=3 —— 不统一就是训练/部署口径错配。")
     args = ap.parse_args()
     ds = [(args.repo, args.tag)] if args.repo else DATASETS
     import mujoco
@@ -94,7 +98,10 @@ def main():
             cache.append((kin[:T], d["imu_real"][:T], d["action"][:T], qenc[:T]))
             lags, _ = lag_corr_ch(kin[:T], d["imu_real"][:T])
             lag_votes.extend(lags[3:])
-        L = int(np.median(lag_votes))
+        L_auto = int(np.median(lag_votes))
+        L = int(args.lag) if args.lag is not None else L_auto
+        if args.lag is not None and L != L_auto:
+            print(f"  [{tag}] 对齐 L: 自测 {L_auto} → **强制 {L}**(与部署侧一致)")
         Gi = np.concatenate([k[:-L, 3:] for k, r, a, _q in cache])
         Gr = np.concatenate([r[L:, 3:] for k, r, a, _q in cache])
         sel = np.linalg.norm(Gi, axis=1) > 0.15

@@ -42,7 +42,8 @@ from lerobot.common.policies.act.b_runtime import build_offline
 ROOT = Path(__file__).resolve().parents[1]
 LROOT = ROOT / "outputs/p2_labels"
 OUT = ROOT / "outputs/p2_pi"
-TAGS = ["pp2-deploy", "ins-deploy"]
+TAGS = [s.strip() for s in
+        __import__("os").environ.get("PI_TAGS", "pp2-deploy,ins-deploy").split(",")]
 TRAIN_EPS, VAL_EPS = list(range(8)), [8, 9]
 LSHIFT, FEAT, EPS_B = 3, 51, 0.010
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -118,10 +119,15 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--compare", action="store_true", help="只对比已部署 π 与标签")
+    ap.add_argument("--name", default=None,
+                    help="检查点名。默认由 PI_TAGS 推断(ff/bare) —— 两套标签必须分开存, "
+                         "否则后训的会覆盖先训的。")
     a_ = ap.parse_args()
+    name = a_.name or ("ff" if any("ff" in t for t in TAGS) else "bare")
 
     from bakeoff_backbones import TCN
     tr, va = load_split(TRAIN_EPS), load_split(VAL_EPS)
+    print(f"[{name}] 标签源 {TAGS}")
     print(f"device={DEV}  train {sum(len(e['X']) for e in tr)} / "
           f"val {sum(len(e['X']) for e in va)} 帧")
 
@@ -168,10 +174,10 @@ def main():
     show("直接回归 (本次)", q_new)
     show("pi_v1_s0 (Ĝ训练)", q_old)
 
-    ck = OUT / f"pi_direct_s{a_.seed}.pt"
+    ck = OUT / f"pi_direct_{name}_s{a_.seed}.pt"
     torch.save(model.state_dict(), ck)
-    (OUT / f"pi_direct_s{a_.seed}.json").write_text(json.dumps(
-        {"direct": q_new, "g_trained_baseline": q_old,
+    (OUT / f"pi_direct_{name}_s{a_.seed}.json").write_text(json.dumps(
+        {"name": name, "tags": TAGS, "direct": q_new, "g_trained_baseline": q_old,
          "steps": a_.steps, "lr": a_.lr, "seed": a_.seed}, indent=1))
     print(f"\n→ {ck.relative_to(ROOT.parent)}")
     print("\n判读：留出方向相关若 ≫ 0（比如 >0.7），说明 δa* 是**可从因果特征预测的**，")
