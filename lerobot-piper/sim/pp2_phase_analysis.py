@@ -86,14 +86,26 @@ def load(path, R, rend, bp):
     return g, raw[:n, 6], np.linalg.norm(ide[:, 3:6], axis=1)
 
 
+MIN_OPEN_FRAMES = 5          # 0.25 s
+MIN_OPEN_PEAK = 0.5          # 相对全集最大张开度
+
+
 def events(grip):
-    """从夹爪指令找两个张开区间 → 边界即相位切点。找不到第二个则返回 None。"""
+    """从夹爪指令找两个张开区间 → 边界即相位切点。找不到两个合格区间则返回 None。
+
+    2026-08-04 修：原来只按 0.3×max 阈值取连通区间，会把**短暂抖动**当成张开。
+    实测 A_ep0(4.95 s, 仅 0.05 s)、A_ep7(4.90 s, 仅 0.10 s) 两集因此把 `close1`
+    定到 ~5.0 s，而真正的抓取在 ~7.3 s —— 两集的相位切点整体错位约 2.3 s。
+    现在要求区间**时长 ≥0.25 s 且峰值 ≥0.5×max**，把抖动排除。
+    """
     th = max(grip.max() * 0.3, 1e-4)
     on = grip > th
     # 连通区间
     idx = np.where(np.diff(on.astype(int)) != 0)[0] + 1
     segs = np.split(np.arange(len(grip)), idx)
-    segs = [s for s in segs if on[s[0]]]
+    segs = [s for s in segs if on[s[0]]
+            and len(s) >= MIN_OPEN_FRAMES
+            and grip[s].max() >= MIN_OPEN_PEAK * grip.max()]
     if len(segs) < 2:
         return None
     s1, s2 = segs[0], segs[1]
