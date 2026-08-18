@@ -46,6 +46,9 @@ from lerobot.common.policies.act.b_runtime import (
     CHUNK, DT, EPS_B, FEAT_DIM, WIN, FeatureAssembler, IdealChunkRenderer,
     apply_ff12, load_tcn,
 )
+from lerobot.common.policies.act.step1_seam_pulse import (
+    SeamPulseRuntime, SeamPulseTheta,
+)
 from lerobot.common.policies.act.step1_correction_runtime import (
     Step1CorrectionRuntime,
     Step1Frame,
@@ -54,7 +57,7 @@ from lerobot.common.policies.act.step1_correction_runtime import (
 _MDEG_TO_RAD = math.pi / 180.0 / 1000.0
 _GRIP_SCALE = 1.0 / 800000.0        # 与 refine_deploy 一致
 MODES = ("off", "ff", "pi_only", "full", "record", "probe",
-         "step1_b", "step1_c")
+         "step1_b", "step1_c", "step1_v2")
 
 
 PROBE_N = 2000                   # 100 s @20Hz —— 覆盖 30 s 一集, 正常不会绕回
@@ -114,7 +117,8 @@ class BCorrectionDeployWrapper:
 
     def __init__(self, act_policy, pi_ckpt, device, R, b, mode="full",
                  lag=3, ff_lag=2, ff_blend=4, log_path=None, verbose=True,
-                 probe_seed=0, probe_mrad=3.0, probe_seeds=None):
+                 probe_seed=0, probe_mrad=3.0, probe_seeds=None,
+                 theta_path=None):
         assert mode in MODES, f"mode 须为 {MODES}"
         self.act = act_policy
         self.device = device
@@ -123,7 +127,10 @@ class BCorrectionDeployWrapper:
         self.verbose = verbose
         self.use_pi = mode in ("full", "pi_only", "record")
         self.use_step1 = mode in ("step1_b", "step1_c")
-        self.apply_delta = mode in ("full", "pi_only", "probe", "step1_b", "step1_c")
+        # v2: 接缝脉冲, **不读 IMU、不用任何模型**(PREREG_STEP1_V2.md)
+        self.use_seam = mode == "step1_v2"
+        self.apply_delta = mode in ("full", "pi_only", "probe", "step1_b", "step1_c",
+                                    "step1_v2")
         self.use_ff = mode in ("full", "ff")
         # probe: 外生激励, **不读 IMU、不经 π** —— 序列由种子完全决定
         # **逐集换 seed**(PREREG_STEP1.md §8): 旧实现整批只有 1 个噪声实现 ——
@@ -139,6 +146,14 @@ class BCorrectionDeployWrapper:
         self.probe = None
         if mode in ("probe",):
             self._load_probe()
+
+        self.seam = None
+        if self.use_seam:
+            src = theta_path if theta_path else pi_ckpt
+            if not src:
+                raise ValueError("step1_v2 需要 θ 文件: 设 BCORR_THETA 或 BCORR_CKPT")
+            self.theta_path = str(src)
+            self.seam = SeamPulseRuntime(SeamPulseTheta.load(src), verbose=verbose)
 
         self.pi = load_tcn(pi_ckpt).to(device) if self.use_pi else None
         self.step1 = (Step1CorrectionRuntime(
@@ -174,6 +189,7 @@ class BCorrectionDeployWrapper:
                   f"feat={FEAT_DIM} win={WIN} π={'on' if self.use_pi else 'off'} "
                   f"ff={'on' if self.use_ff else 'off'} "
                   f"step1={'B' if mode == 'step1_b' else ('C' if mode == 'step1_c' else 'off')}"
+                  + (" seam=on(v2: 运行时不读 IMU)" if self.use_seam else "")
                   + (f" probe: {len(self.probe_seeds)} seeds "
                      f"{self.probe_seeds[:4]}{'…' if len(self.probe_seeds) > 4 else ''} "
                      f"@{self.probe_mrad:g}mrad" if self.probe is not None else ""))
@@ -223,6 +239,8 @@ class BCorrectionDeployWrapper:
             self._chunks = []
         if self.asm is not None:
             self.asm.reset()
+        if self.seam is not None:
+            self.seam.reset()          # 每集清零, 不跨 episode 继承(v2 §2.5)
         if self.step1 is not None:
             # 与是否开日志无关：z/HP/H 历史绝不能跨 episode 继承。
             self.step1.reset()
@@ -259,6 +277,10 @@ class BCorrectionDeployWrapper:
         cmd = chunk[0].detach().cpu().numpy().astype(np.float32)            # (T,7)
         if self._log is not None:            # 原始 ACT 指令(FF/δa 之前) — A/B 分析的 ideal 基准
             self._chunks.append({"start": self.stats["frames"], "raw": cmd.tolist()})
+
+        if self.seam is not None:
+            # 用**原始 ACT 指令**算接缝差 —— 跳变是 ACT 输出的性质, 与我们自己加的 δa 无关
+            self.seam.set_chunk(cmd)
 
         if self.use_ff:
             cmd = apply_ff12(cmd, self._prev_tail, lag=self.ff_lag, blend=self.ff_blend)
@@ -357,6 +379,10 @@ class BCorrectionDeployWrapper:
             self._probe_i += 1
             a = a.clone()
             a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)
+        elif self.seam is not None:                      # v2 接缝脉冲: 不读 IMU
+            da = self.seam.step()
+            a = a.clone()
+            a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)
         elif self.use_pi or self.use_step1:
             da = self._delta_step1(batch) if self.use_step1 else self._delta(batch)
             if self.apply_delta:
@@ -395,7 +421,13 @@ class BCorrectionDeployWrapper:
         # ckpt/FF 状态必须落盘: C 臂那次没记, 事后无法确认用的是哪个 seed,
         # 也无法从日志本身判断 π 与 FF 的占比(2026-07-29)
         pr = self.probe is not None
+        seam = self.seam.summary() if self.seam is not None else {}
         out = {"mode": self.mode, "pi_ckpt": str(self.pi_ckpt),
+                **({"theta": seam["theta"], "theta_path": self.theta_path,
+                    "seam_corrected_pct": seam["corrected_pct"],
+                    "seam_contact_gated_pct": seam["contact_gated_pct"],
+                    "seam_first_chunk_skipped": seam["first_chunk_skipped"],
+                    "seam_chunks": seam["chunks"]} if self.seam is not None else {}),
                 # 逐集落盘**实际用的** seed 与波形 hash —— 事后核对 P3 是否真复用了 P1 激励
                 "probe_seed": self.probe_seed if pr else None,
                 "probe_hash": probe_hash(self.probe_seed) if pr else None,
@@ -439,7 +471,8 @@ class BCorrectionDeployWrapper:
 
 def build_b_correction_policy(act_policy, pi_ckpt, device, calib_json,
                               mode="full", log_path=None, ff_lag=None, ff_blend=None,
-                              probe_seed=None, probe_mrad=None, probe_seeds=None):
+                              probe_seed=None, probe_mrad=None, probe_seeds=None,
+                              theta_path=None):
     """calib_json: 含 {"R": 3x3, "b": 3} 的标定文件（p2_labels/<tag>/manifest.json 同格式）。"""
     m = json.loads(Path(calib_json).read_text())
     R = np.array(m["R"], np.float32)
@@ -460,5 +493,7 @@ def build_b_correction_policy(act_policy, pi_ckpt, device, calib_json,
         kw["probe_mrad"] = float(probe_mrad)
     if probe_seeds is not None:
         kw["probe_seeds"] = probe_seeds
+    if theta_path is not None:
+        kw["theta_path"] = theta_path
     return BCorrectionDeployWrapper(act_policy, pi_ckpt, device, R, b,
                                     mode=mode, log_path=log_path, **kw)

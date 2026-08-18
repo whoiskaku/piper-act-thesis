@@ -295,7 +295,8 @@ def record(
                                            ff_blend=os.environ.get("BCORR_FF_BLEND"),
                                    probe_seed=os.environ.get("BCORR_PROBE_SEED"),
                                    probe_mrad=os.environ.get("BCORR_PROBE_MRAD"),
-                                   probe_seeds=os.environ.get("BCORR_PROBE_SEEDS"))
+                                   probe_seeds=os.environ.get("BCORR_PROBE_SEEDS"),
+                                   theta_path=os.environ.get("BCORR_THETA"))
         logging.info(f"B/Step1 correction wrapper active (mode={_bmode}, artifact={_bcorr_ckpt})")
 
     # Build a HistoryBuffer when the loaded policy was trained with autoregressive
