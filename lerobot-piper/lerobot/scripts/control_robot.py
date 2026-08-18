@@ -370,6 +370,11 @@ def record(
         if events["stop_recording"]:
             break
 
+    # 最后一集没有后续 reset() 触发落盘 —— 显式收尾, 否则末集的 summary 只写到
+    # 最后一个 20 帧边界(逐 20 帧增量 flush), 尾部帧与最终统计会丢。
+    if policy is not None and hasattr(policy, "summary"):
+        policy.summary()
+
     log_say("Stop recording", cfg.play_sounds, blocking=True)
     stop_recording(robot, listener, cfg.display_cameras)
 

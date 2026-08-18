@@ -180,11 +180,12 @@ class BCorrectionDeployWrapper:
 
     def reset(self):
         # control_robot 每集开始调 reset() → 借此把上一集落盘并推进集号(多集独立文件)
-        # probe 的集号推进必须在**任何** stats 归零之前, 且不依赖是否开日志
+        # **顺序要紧**: 先 flush(写的是刚跑完那一集, 必须带**那一集**的 seed),
+        # 再推进集号并换波形。反过来会把下一集的 seed 写进上一集的日志。
+        self._flush()
         if self.probe is not None and self.stats["frames"] > 0:
             self._probe_ep += 1
             self._load_probe()
-        self._flush()
         if self._log:
             self._ep_count += 1
             self._log, self._chunks = [], []
