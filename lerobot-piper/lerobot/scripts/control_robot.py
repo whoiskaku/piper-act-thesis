@@ -273,10 +273,11 @@ def record(
                                             mode=_mode)
         logging.info(f"RefineNet deploy wrapper active (mode={_mode}, ckpt={_refine_ckpt})")
 
-    # B 校正模块部署(π v1, 默认关, env 门控)。三方 A/B:
-    #   A 裸 ACT:   不设 BCORR_CKPT
-    #   B 逆算前馈: BCORR_CKPT=<π.pt> BCORR_CALIB=<manifest.json> BCORR_MODE=ff
-    #   C 本方法:   BCORR_CKPT=<π.pt> BCORR_CALIB=<manifest.json> BCORR_MODE=full
+    # B/Step1 校正模块部署(默认关, env 门控):
+    #   Step1 A 裸 ACT: BCORR_CKPT=<candidate.npz> BCORR_MODE=off   (仅日志)
+    #   Step1 B:       BCORR_CKPT=<candidate.npz> BCORR_MODE=step1_b
+    #   Step1 C:       BCORR_CKPT=<candidate.npz> BCORR_MODE=step1_c
+    # 旧 π/FF 模式仍保留: ff / pi_only / full / record / probe。
     # 与 RefineNet 互斥(两者都改指令流, 同时开会混淆归因)。
     _bcorr_ckpt = os.environ.get("BCORR_CKPT")
     if policy is not None and _bcorr_ckpt:
@@ -295,7 +296,7 @@ def record(
                                    probe_seed=os.environ.get("BCORR_PROBE_SEED"),
                                    probe_mrad=os.environ.get("BCORR_PROBE_MRAD"),
                                    probe_seeds=os.environ.get("BCORR_PROBE_SEEDS"))
-        logging.info(f"B-correction wrapper active (mode={_bmode}, ckpt={_bcorr_ckpt})")
+        logging.info(f"B/Step1 correction wrapper active (mode={_bmode}, artifact={_bcorr_ckpt})")
 
     # Build a HistoryBuffer when the loaded policy was trained with autoregressive
     # history inputs. The buffer survives across episodes and is the runtime mirror

@@ -1,4 +1,4 @@
-# RUNBOOK：开环激励采集（2026-08-04）
+# RUNBOOK：开环激励采集（2026-08-04，2026-08-19 更新）
 
 按指導教員 Step 1「G無し、実世界の実測を元に補正を学ぶ」。
 
@@ -43,40 +43,66 @@ P2 要「同 seed 重复 2 集」、P3 要「复用 P1 的 seed」，递增式�
 （0.86–2.08）重合，且**触界 0.00%**；3.0 mrad 触界仅 0.11%。
 （4 mrad 以上触界 >1%，削顶会破坏线性，不可用。）
 
-## 命令
+## 命令与分阶段闸门
 
-先 `mkdir -p outputs/ab4`。各条只改 `BCORR_MODE / BCORR_PROBE_* / BCORR_LOG / repo_id / num_episodes`。
+先在 repo 根目录执行下面整段。`run_probe` 每次都调用完整的采集命令，
+不是只能粘在上一条后面的参数缩写。
 
 ```bash
-# ---- P0 基线 ----
-BCORR_CKPT=outputs/p2_pi/pi_direct_bare_s0.pt \
-BCORR_CALIB=outputs/p2_labels/pp2a-deploy/manifest.json \
-BCORR_MODE=off \
-BCORR_LOG=outputs/ab4/P0.json \
-python lerobot/scripts/control_robot.py \
-    --robot.type=piper --robot.inference_time=true --robot.enable_imu=true \
-    --control.type=record --control.fps=20 --control.single_task="pp2" \
-    --control.repo_id=$USER/eval_ab4_P0 \
-    --control.num_episodes=5 --control.warmup_time_s=2 \
-    --control.episode_time_s=30 --control.reset_time_s=10 \
-    --control.push_to_hub=false \
-    --control.policy.path=outputs/train/2026-07-01/ACT_pickplace2_noimu_seed42/checkpoints/100000/pretrained_model
+set -e  # P2/P3/离线闸门返回非零时，整段立即停止
+mkdir -p outputs/ab4 outputs/step1_candidate
 
-# ---- P1  逐集换 seed, 1.5 mrad, 8 集 ----
-BCORR_MODE=probe BCORR_PROBE_MRAD=1.5 \
-BCORR_PROBE_SEEDS=1000,1001,1002,1003,1004,1005,1006,1007 \
-BCORR_LOG=outputs/ab4/P1.json   --control.repo_id=$USER/eval_ab4_P1  --control.num_episodes=8
+POLICY=outputs/train/2026-07-01/ACT_pickplace2_noimu_seed42/checkpoints/100000/pretrained_model
+CALIB=outputs/p2_labels/pp2a-deploy/manifest.json
+PROBE_CKPT=outputs/p2_pi/pi_direct_bare_s0.pt
 
-# ---- P2  3 个未见 seed 各 2 集, 1.5 mrad, 6 集 ----
-BCORR_MODE=probe BCORR_PROBE_MRAD=1.5 \
-BCORR_PROBE_SEEDS=2000,2000,2001,2001,2002,2002 \
-BCORR_LOG=outputs/ab4/P2.json   --control.repo_id=$USER/eval_ab4_P2  --control.num_episodes=6
+COMMON_RECORD_ARGS=(
+  --robot.type=piper --robot.inference_time=true --robot.enable_imu=true
+  --control.type=record --control.fps=20 --control.single_task=pp2
+  --control.warmup_time_s=2 --control.episode_time_s=30 --control.reset_time_s=10
+  --control.push_to_hub=false --control.policy.path="$POLICY"
+)
 
-# ---- P3  复用 P1 前 4 个 seed, **3.0** mrad, 4 集 ----
-BCORR_MODE=probe BCORR_PROBE_MRAD=3.0 \
-BCORR_PROBE_SEEDS=1000,1001,1002,1003 \
-BCORR_LOG=outputs/ab4/P3.json   --control.repo_id=$USER/eval_ab4_P3  --control.num_episodes=4
+run_probe () {
+  local tier="$1" mode="$2" mrad="$3" seeds="$4" episodes="$5"
+  BCORR_CKPT="$PROBE_CKPT" \
+  BCORR_CALIB="$CALIB" \
+  BCORR_MODE="$mode" \
+  BCORR_PROBE_MRAD="$mrad" \
+  BCORR_PROBE_SEEDS="$seeds" \
+  BCORR_LOG="outputs/ab4/${tier}.json" \
+  python lerobot/scripts/control_robot.py \
+    "${COMMON_RECORD_ARGS[@]}" \
+    --control.repo_id="$USER/eval_ab4_${tier}" \
+    --control.num_episodes="$episodes"
+}
+
+# 阶段 1：先只收 P0/P1/P2
+run_probe P0 off   1.5 0                                             5
+run_probe P1 probe 1.5 1000,1001,1002,1003,1004,1005,1006,1007       8
+run_probe P2 probe 1.5 2000,2000,2001,2001,2002,2002                 6
+
+# P2 跨 seed 闸门；PASS 才继续，FAIL（退出码 2）则停止
+python sim/fit_step1_candidate.py \
+  --data-root outputs/ab4 \
+  --calib "$CALIB" \
+  --output outputs/step1_candidate/step1_linear_v1.npz \
+  --stage p2
+
+# 阶段 2：仅在上一步明确 PASS 后采 P3
+run_probe P3 probe 3.0 1000,1001,1002,1003                         4
+
+# P3 线性 + P0 ep3–4 离线 8% 闸门；全过才写出 candidate NPZ
+python sim/fit_step1_candidate.py \
+  --data-root outputs/ab4 \
+  --calib "$CALIB" \
+  --output outputs/step1_candidate/step1_linear_v1.npz \
+  --stage full
 ```
+
+**不得用单集 `rerecord` 补采。** 它会让数据集集号与 wrapper 的 seed/日志集号错位。
+发生纯技术故障时，废弃受影响的整个 P 档，用**原 seed 表**和新的 repo/log 名重开整批；
+不得只重跑某一集后混回原批。
 
 ## 跑的时候盯什么
 
@@ -106,19 +132,59 @@ P0: mode=off   ... π=off ff=off
 | 每集帧数 | ≈590（与 A2 同） | 明显偏少 = 控制环没跟上 |
 | 成功率 | 记录 | 1.5 mrad 比 π 的 δa 还小，应不受影响 |
 
-## 跑完之后要回答的三问
+## Candidate 通过后：A/B/C 部署示例
 
-1. **H 能不能在同条件内泛化？** P1 前 5 集训 / 后 3 集测
-   （现在这是**真正的**跨激励检验 —— 8 集是 8 个不同的噪声实现）
-2. **能不能跨 seed？** P1 训 → **P2 测**（3 个未见 seed）← 决定性，闭环数据这一关是崩的
-   统计时**先在 seed 内聚合**（各 2 集），以 **seed 为独立单位**
-3. **线性吗？** P1（1.5）训 → **P3（3.0）测**，同波形、幅值严格 ×2，看响应是否等比
+A/B/C 都指向**同一个已冻结 candidate**；A 用 `off`，B 用 `step1_b`，
+C 用 `step1_c`。下面是一个 `ABC` block 的完整可执行示例；正式 10 个 block
+必须按 `PREREG_STEP1.md` 附录 A 的冻结顺序调用，不得全部固定为 `ABC`。
 
-三问都过 ⇒ Step 1 路径 A（显式求解 δa）复活，且拿到了 H 性能的硬数据。
-任一不过 ⇒ 路径 A 判死，只剩路径 B（真机在环学习），受因果天花板 ≈30% 约束
-（`CAUSAL_CEILING.md`，其中测量侧经验值仅 3.7%）。
+```bash
+mkdir -p outputs/step1_confirm
+
+POLICY=outputs/train/2026-07-01/ACT_pickplace2_noimu_seed42/checkpoints/100000/pretrained_model
+CALIB=outputs/p2_labels/pp2a-deploy/manifest.json
+CANDIDATE=outputs/step1_candidate/step1_linear_v1.npz
+
+COMMON_CONFIRM_ARGS=(
+  --robot.type=piper --robot.inference_time=true --robot.enable_imu=true
+  --control.type=record --control.fps=20 --control.single_task=pp2
+  --control.num_episodes=1 --control.warmup_time_s=2
+  --control.episode_time_s=30 --control.reset_time_s=10
+  --control.push_to_hub=false --control.policy.path="$POLICY"
+)
+
+run_candidate () {
+  local tag="$1" mode="$2"
+  BCORR_CKPT="$CANDIDATE" \
+  BCORR_CALIB="$CALIB" \
+  BCORR_MODE="$mode" \
+  BCORR_LOG="outputs/step1_confirm/${tag}.json" \
+  python lerobot/scripts/control_robot.py \
+    "${COMMON_CONFIRM_ARGS[@]}" \
+    --control.repo_id="$USER/eval_step1_${tag}"
+}
+
+# 示例：会话 2，block 01 的顺序若为 ABC
+run_candidate S2_block01_A off
+run_candidate S2_block01_B step1_b
+run_candidate S2_block01_C step1_c
+```
+
+开跑前核对 B/C 日志中 `artifact_sha256` 相同，且 B/C 分别记为
+`step1_b` / `step1_c`。技术故障按预注册重跑**整个 triplet**，不单独补一臂。
+
+## 跑完后看哪些结果
+
+只以 `sim/fit_step1_candidate.py` 的统一输出为准：
+
+1. 在 P0 ep0–2 + P1 上做 episode 分组 5 折 CV，每折重走 `H → W → Θ`，选 ridge；
+2. P2 的 3 个未见 seed 验证 H 是否跨 seed（先在 seed 内聚合）；
+3. P3 检查同波形从 1.5 mrad 到 3.0 mrad 的幅值线性；
+4. P0 ep3–4 用完整因果卷积做独立离线闸门，要求预测中位降幅 ≥ 8%。
+
+P2 不过就不收 P3；P3 或 P0 闸门不过就不写 candidate NPZ，不跑三臂。
 
 > 采集与判据的完整预注册见 **`reports/PREREG_STEP1.md`**。
 > 本 runbook 只负责「怎么采」，「采了怎么判」以预注册为准。
 
-分析脚本：`sim/measure_da_response.py`、`sim/step1_gate.py`（改 `ARMS` 指向 `outputs/ab4`）。
+统一拟合/闸门脚本：`sim/fit_step1_candidate.py`。

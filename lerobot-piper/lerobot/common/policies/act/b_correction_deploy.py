@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -45,10 +46,15 @@ from lerobot.common.policies.act.b_runtime import (
     CHUNK, DT, EPS_B, FEAT_DIM, WIN, FeatureAssembler, IdealChunkRenderer,
     apply_ff12, load_tcn,
 )
+from lerobot.common.policies.act.step1_correction_runtime import (
+    Step1CorrectionRuntime,
+    Step1Frame,
+)
 
 _MDEG_TO_RAD = math.pi / 180.0 / 1000.0
 _GRIP_SCALE = 1.0 / 800000.0        # 与 refine_deploy 一致
-MODES = ("off", "ff", "pi_only", "full", "record", "probe")
+MODES = ("off", "ff", "pi_only", "full", "record", "probe",
+         "step1_b", "step1_c")
 
 
 PROBE_N = 2000                   # 100 s @20Hz —— 覆盖 30 s 一集, 正常不会绕回
@@ -116,7 +122,8 @@ class BCorrectionDeployWrapper:
         self.pi_ckpt = pi_ckpt
         self.verbose = verbose
         self.use_pi = mode in ("full", "pi_only", "record")
-        self.apply_delta = mode in ("full", "pi_only", "probe")   # record 只观测不施加
+        self.use_step1 = mode in ("step1_b", "step1_c")
+        self.apply_delta = mode in ("full", "pi_only", "probe", "step1_b", "step1_c")
         self.use_ff = mode in ("full", "ff")
         # probe: 外生激励, **不读 IMU、不经 π** —— 序列由种子完全决定
         # **逐集换 seed**(PREREG_STEP1.md §8): 旧实现整批只有 1 个噪声实现 ——
@@ -134,7 +141,18 @@ class BCorrectionDeployWrapper:
             self._load_probe()
 
         self.pi = load_tcn(pi_ckpt).to(device) if self.use_pi else None
-        self.renderer = IdealChunkRenderer() if self.use_pi else None
+        self.step1 = (Step1CorrectionRuntime(
+            pi_ckpt, mode="B" if mode == "step1_b" else "C")
+            if self.use_step1 else None)
+        if self.step1 is not None:
+            if not np.allclose(self.step1.artifact.R, R, atol=1e-6, rtol=0.0):
+                raise ValueError("Step1 artifact 的 R 与 BCORR_CALIB 不一致")
+            if not np.allclose(self.step1.artifact.b, b, atol=1e-6, rtol=0.0):
+                raise ValueError("Step1 artifact 的 b 与 BCORR_CALIB 不一致")
+            self._artifact_sha256 = hashlib.sha256(Path(pi_ckpt).read_bytes()).hexdigest()
+        else:
+            self._artifact_sha256 = None
+        self.renderer = IdealChunkRenderer() if (self.use_pi or self.use_step1) else None
         self.asm = FeatureAssembler(R, b, L=lag) if self.use_pi else None
         self.ff_lag, self.ff_blend = ff_lag, ff_blend
 
@@ -144,7 +162,9 @@ class BCorrectionDeployWrapper:
         self._prev_tail = None          # 上一 chunk 尾部(FF blend 用)
         self._k = 0                     # chunk 内帧号
         self.stats = {"frames": 0, "gated": 0, "sat": 0, "stale": 0, "nan": 0,
-                      "da_abs_sum": 0.0, "render_ms": [], "infer_ms": []}
+                      "da_abs_sum": 0.0, "render_ms": [], "infer_ms": [],
+                      "plan_ms": []}
+        self._last_step1_frame: Step1Frame | None = None
         self._log = [] if log_path else None
         self._chunks = [] if log_path else None
         self.log_path = Path(log_path) if log_path else None
@@ -152,7 +172,8 @@ class BCorrectionDeployWrapper:
         if verbose:
             print(f"[b_corr] mode={mode} ε={EPS_B*1000:.0f}mrad L={lag} "
                   f"feat={FEAT_DIM} win={WIN} π={'on' if self.use_pi else 'off'} "
-                  f"ff={'on' if self.use_ff else 'off'}"
+                  f"ff={'on' if self.use_ff else 'off'} "
+                  f"step1={'B' if mode == 'step1_b' else ('C' if mode == 'step1_c' else 'off')}"
                   + (f" probe: {len(self.probe_seeds)} seeds "
                      f"{self.probe_seeds[:4]}{'…' if len(self.probe_seeds) > 4 else ''} "
                      f"@{self.probe_mrad:g}mrad" if self.probe is not None else ""))
@@ -182,13 +203,15 @@ class BCorrectionDeployWrapper:
         # control_robot 每集开始调 reset() → 借此把上一集落盘并推进集号(多集独立文件)
         # **顺序要紧**: 先 flush(写的是刚跑完那一集, 必须带**那一集**的 seed),
         # 再推进集号并换波形。反过来会把下一集的 seed 写进上一集的日志。
+        had_frames = self.stats["frames"] > 0
         self._flush()
-        if self.probe is not None and self.stats["frames"] > 0:
+        if self.probe is not None and had_frames:
             self._probe_ep += 1
             self._load_probe()
         if self._log:
             self._ep_count += 1
             self._log, self._chunks = [], []
+        if had_frames:
             self.stats = {k: (0 if not isinstance(v, list) else [])
                           for k, v in self.stats.items()}
         self.act.reset()
@@ -200,6 +223,10 @@ class BCorrectionDeployWrapper:
             self._chunks = []
         if self.asm is not None:
             self.asm.reset()
+        if self.step1 is not None:
+            # 与是否开日志无关：z/HP/H 历史绝不能跨 episode 继承。
+            self.step1.reset()
+        self._last_step1_frame = None
 
     def to(self, device):
         self.act.to(device)
@@ -236,11 +263,16 @@ class BCorrectionDeployWrapper:
         if self.use_ff:
             cmd = apply_ff12(cmd, self._prev_tail, lag=self.ff_lag, blend=self.ff_blend)
 
-        if self.use_pi:
+        if self.use_pi or self.use_step1:
             t0 = time.perf_counter()
             ideal = self.renderer.render(cmd, self._prev_tail)              # (T,6) sim系
             self.stats["render_ms"].append((time.perf_counter() - t0) * 1e3)
-            self.asm.on_new_chunk(cmd, ideal)
+            if self.use_pi:
+                self.asm.on_new_chunk(cmd, ideal)
+            if self.use_step1:
+                t1 = time.perf_counter()
+                self.step1.set_chunk(cmd, ideal)
+                self.stats["plan_ms"].append((time.perf_counter() - t1) * 1e3)
 
         self._chunk_raw = cmd
         self._prev_tail = cmd.copy()
@@ -281,6 +313,30 @@ class BCorrectionDeployWrapper:
             self.stats["sat"] += 1
         return np.clip(da, -EPS_B, EPS_B)                                   # 冗余硬界
 
+    def _delta_step1(self, batch):
+        """Step1 B/C 一帧。IMU 异常时仍消费该帧，但跳过 LMS 更新。"""
+        imu6 = None
+        try:
+            value = batch["observation.imu_real"].detach().cpu().numpy().reshape(-1)
+            if value.shape == (6,) and np.isfinite(value).all():
+                imu6 = value.astype(np.float32)
+            else:
+                self.stats["stale"] += 1
+        except (KeyError, AttributeError):
+            self.stats["stale"] += 1
+
+        t0 = time.perf_counter()
+        frame = self.step1.step(imu6)
+        self.stats["infer_ms"].append((time.perf_counter() - t0) * 1e3)
+        self._last_step1_frame = frame
+        saturated = frame.b_saturated if self.mode == "step1_b" else frame.c_saturated
+        self.stats["sat"] += int(saturated)
+        self.stats["gated"] += int(frame.contact_gated)
+        if not np.isfinite(frame.delta).all():
+            self.stats["nan"] += 1
+            return np.zeros(6, np.float32)
+        return frame.delta
+
     @torch.no_grad()
     def select_action(self, batch):
         if len(self._queue) == 0:
@@ -301,8 +357,8 @@ class BCorrectionDeployWrapper:
             self._probe_i += 1
             a = a.clone()
             a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)
-        elif self.use_pi:
-            da = self._delta(batch)
+        elif self.use_pi or self.use_step1:
+            da = self._delta_step1(batch) if self.use_step1 else self._delta(batch)
             if self.apply_delta:
                 a = a.clone()
                 a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)     # 夹爪不动
@@ -310,11 +366,25 @@ class BCorrectionDeployWrapper:
         self.stats["da_abs_sum"] += float(np.abs(da).mean())
         if self._log is not None:
             imu = batch.get("observation.imu_real")
-            self._log.append({
+            row = {
                 "k": self._k, "da": da.tolist(),
                 "a": a[0].detach().cpu().numpy().tolist(),
                 "imu": imu.detach().cpu().numpy().reshape(-1).tolist() if imu is not None else None,
-                "state": batch["observation.state"].detach().cpu().numpy().reshape(-1).tolist()})
+                "state": batch["observation.state"].detach().cpu().numpy().reshape(-1).tolist()}
+            if self._last_step1_frame is not None:
+                sf = self._last_step1_frame
+                row.update({
+                    "da_preclip": sf.raw_delta_b.tolist(),
+                    "da_b": sf.delta_b.tolist(),
+                    "z_used": sf.z_used,
+                    "z_next": sf.z_next,
+                    "contact_gate": sf.contact_gated,
+                    "lms_update": sf.lms_update_mask,
+                    "gap_raw": sf.raw_gap.tolist() if sf.raw_gap is not None else None,
+                    "p_raw": (sf.predicted_response.tolist()
+                              if sf.predicted_response is not None else None),
+                })
+            self._log.append(row)
             if self.stats["frames"] % 20 == 0:      # 每 1s 增量落盘(不依赖有人调 summary)
                 self._flush()
         self._k += 1
@@ -325,7 +395,7 @@ class BCorrectionDeployWrapper:
         # ckpt/FF 状态必须落盘: C 臂那次没记, 事后无法确认用的是哪个 seed,
         # 也无法从日志本身判断 π 与 FF 的占比(2026-07-29)
         pr = self.probe is not None
-        return {"mode": self.mode, "pi_ckpt": str(self.pi_ckpt),
+        out = {"mode": self.mode, "pi_ckpt": str(self.pi_ckpt),
                 # 逐集落盘**实际用的** seed 与波形 hash —— 事后核对 P3 是否真复用了 P1 激励
                 "probe_seed": self.probe_seed if pr else None,
                 "probe_hash": probe_hash(self.probe_seed) if pr else None,
@@ -343,7 +413,13 @@ class BCorrectionDeployWrapper:
                 "stale": s["stale"], "nan": s["nan"],
                 "warmup": s.get("warmup", 0), "da_mean_mrad": 1e3 * s["da_abs_sum"] / n,
                 "infer_ms_p95": float(np.percentile(s["infer_ms"], 95)) if s["infer_ms"] else 0.0,
-                "render_ms_max": float(max(s["render_ms"])) if s["render_ms"] else 0.0}
+                "render_ms_max": float(max(s["render_ms"])) if s["render_ms"] else 0.0,
+                "plan_ms_max": float(max(s.get("plan_ms", []))) if s.get("plan_ms") else 0.0,
+                "use_step1": bool(self.use_step1),
+                "artifact_sha256": self._artifact_sha256}
+        if self.step1 is not None:
+            out["step1"] = self.step1.summary()
+        return out
 
     def _flush(self):
         """当前集落盘到 <stem>_ep<k>.<suf> (覆盖)。每 20 帧 + 每集 reset 时调用。"""
