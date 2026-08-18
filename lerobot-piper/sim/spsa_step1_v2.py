@@ -43,6 +43,7 @@ FINAL_AVG = 10               # 最终 θ = 最后 10 个中心的平均
 SEED = 20260819              # Δ 的采样种子(可复现)
 MIN_FRAMES = 550             # 预注册 §6 ⑥-3
 MAX_LAUNCH_ATTEMPTS = 8      # 本机偶发启动期 SIGSEGV 的重试上限
+MAX_PAIR_VOIDS = 3           # 同一轮因中途崩被作废重跑的上限(⑥-5 的自动化)
 
 OUT = ROOT / "outputs/spsa_v2"
 STATE = OUT / "state.json"
@@ -91,11 +92,15 @@ class State:
         self.history: list[dict] = list(d.get("history", []))
         self.baselines: list[dict] = list(d.get("baselines", []))
         self.episodes_used = int(d.get("episodes_used", 0))
+        # 作废掉的集也消耗了机时, 单独计账以便对齐 §4 的 100 集预算
+        self.episodes_wasted = int(d.get("episodes_wasted", 0))
+        self.voided: list[dict] = list(d.get("voided", []))
 
     def to_dict(self) -> dict:
         return {"x": self.x.tolist(), "round": self.round, "centers": self.centers,
                 "history": self.history, "baselines": self.baselines,
                 "episodes_used": self.episodes_used,
+                "episodes_wasted": self.episodes_wasted, "voided": self.voided,
                 "frozen": {"N_ROUNDS": N_ROUNDS, "PHASE1_ROUNDS": PHASE1_ROUNDS,
                            "C0": C0, "C_GAMMA": C_GAMMA, "A0": A0,
                            "A_SHIFT": A_SHIFT, "A_ALPHA": A_ALPHA, "TRUST": TRUST,
@@ -120,7 +125,14 @@ class State:
 
 # ══════════════════════════════════════════════════════════════════════════
 class PartialEpisode(RuntimeError):
-    """录到一部分才崩 —— 预注册 §6 ⑥-5 的 A 类技术故障, **整对作废重跑**。"""
+    """录到一部分才崩 —— 预注册 §6 ⑥-5 的 A 类技术故障, **整对作废重跑**。
+
+    `sides_ran`: 本轮已成功跑完但**数据将被丢弃**的 SPSA 侧集数(基线不算, 它会被保留)。
+    """
+
+    def __init__(self, msg: str, sides_ran: int = 0):
+        super().__init__(msg)
+        self.sides_ran = sides_ran
 
 
 def _frames_in(log: Path) -> int:
@@ -265,19 +277,23 @@ def one_round(st: State, sp, dry: bool, plan_only: bool) -> bool:
         return False
 
     # 每 BASELINE_EVERY 轮（含第 0 轮）先跑一集裸 ACT 控漂移
-    if k % BASELINE_EVERY == 0:
-        run_baseline(st, k, f"R{k:02d}base", dry)
+    if k % BASELINE_EVERY == 0 and not any(b["tag"] == f"R{k:02d}base" for b in st.baselines):
+        run_baseline(st, k, f"R{k:02d}base", dry)   # 已跑过就不重复(作废重跑时复用)
 
     res: dict[str, dict] = {}
+    sides_ran = 0            # 本轮已跑完的侧集; 只有整轮提交时才计入 episodes_used
     for side in order:
         th = thp if side == "p" else thm
         tag = f"R{k:02d}{side}"
         tf = OUT / f"{tag}_theta.json"
         th.save(tf, round=k, side=side, x=(xp if side == "p" else xm).tolist())
         print(f"  ── {tag}")
-        lg, tries, rc = run_episode(tag, tf, dry)
+        try:
+            lg, tries, rc = run_episode(tag, tf, dry)
+        except PartialEpisode as exc:
+            raise PartialEpisode(str(exc), sides_ran=sides_ran) from None
         d = loss_of(lg, dry, xp if side == "p" else xm)
-        st.episodes_used += 1
+        sides_ran += 1
         viol = safety_check(d)
         if viol:
             print(f"     ⚠ 安全门: {'; '.join(viol)}")
@@ -324,6 +340,7 @@ def one_round(st: State, sp, dry: bool, plan_only: bool) -> bool:
     st.x = x_new
     st.centers.append(x_new.tolist())
     st.round = k + 1
+    st.episodes_used += sides_ran        # 整轮提交, 侧集此刻才入账
     st.save()
     return True
 
@@ -422,12 +439,39 @@ def main() -> int:
 
     print(f"Step 1 v2 SPSA  —— 预注册 reports/PREREG_STEP1_V2.md")
     print(f"状态: {STATE.relative_to(ROOT)}  已完成 {st.round}/{N_ROUNDS} 轮, "
-          f"用了 {st.episodes_used} 集" + ("   [DRY-RUN]" if a.dry_run else ""))
+          f"在册 {st.episodes_used} 集 + 作废 {st.episodes_wasted} 集 "
+          f"= 机时 {st.episodes_used + st.episodes_wasted}/100" + ("   [DRY-RUN]" if a.dry_run else ""))
 
     budget = a.rounds if a.rounds is not None else N_ROUNDS
     done = 0
     while done < budget:
-        if not one_round(st, sp, a.dry_run, a.plan):
+        voids = 0
+        while True:
+            try:
+                ok = one_round(st, sp, a.dry_run, a.plan)
+                break
+            except PartialEpisode as exc:
+                # ⑥-5: 整对作废重跑。本轮未写入 state, 所以"重跑"就是再进一次。
+                # 只把**数据被丢弃**的集记作废: 本轮已跑完的 SPSA 侧集 + 崩掉那一集。
+                # 基线**不算** —— 它已提交进 st.baselines 且重跑时去重复用, 数据有效。
+                voids += 1
+                ran_ok = int(getattr(exc, "sides_ran", 0))
+                st.episodes_wasted += ran_ok + 1
+                st.voided.append({"round": st.round, "voids_this_round": voids,
+                                  "episodes_discarded": ran_ok + 1,
+                                  "reason": str(exc)})
+                st.save()
+                print(f"\n  ⚠ {exc}")
+                print(f"  ⇒ 本轮第 {voids}/{MAX_PAIR_VOIDS} 次作废重跑; 本次弃掉 "
+                      f"{ran_ok + 1} 集（{ran_ok} 侧集已跑完但轮次未提交 + 1 集崩掉）"
+                      f"{'; 基线保留复用' if st.round % BASELINE_EVERY == 0 else ''}")
+                print(f"     累计: 在册 {st.episodes_used} + 作废 {st.episodes_wasted} "
+                      f"= 机时 {st.episodes_used + st.episodes_wasted}/100")
+                if voids >= MAX_PAIR_VOIDS:
+                    print(f"  ✗ 同一轮已作废 {voids} 次 —— 不再自动重试, 先查环境")
+                    return 2
+                time.sleep(5)
+        if not ok:
             break
         done += 1
     if st.round >= N_ROUNDS:
