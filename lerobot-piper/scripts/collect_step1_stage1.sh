@@ -15,6 +15,24 @@ ROOT="$PWD"
 LOG_DIR="outputs/ab4/_logs"
 mkdir -p outputs/ab4 outputs/step1_candidate "$LOG_DIR"
 
+# ── libstdc++ 冲突修正 ──────────────────────────
+# 症状: control_robot 里 `import cv2` 报
+#   /usr/lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15' not found
+# 成因: ROS noetic 的 setup 把 /usr/lib/x86_64-linux-gnu 放在 LD_LIBRARY_PATH 最前,
+#   lerobot 的依赖先把**系统**旧 libstdc++(只到 CXXABI_1.3.12)载入进程; 之后 cv2
+#   再要 libstdc++ 时复用已加载的那个 ⇒ 缺符号。单独 `import cv2` 反而没事,
+#   因为那时系统库还没被载进来。
+# 修法: 预加载 conda env 自带的 libstdc++(CXXABI_1.3.15), 让它先占位。
+#   新版 libstdc++ 向后兼容, 已实测 control_robot 全链 + piper_sdk 均正常。
+#   只动 libstdc++, 不改 LD_LIBRARY_PATH ⇒ 不遮蔽 ROS 需要的其他系统库。
+_CONDA_LIBSTDCXX="${CONDA_PREFIX:-}/lib/libstdc++.so.6"
+if [ -e "$_CONDA_LIBSTDCXX" ]; then
+  export LD_PRELOAD="${_CONDA_LIBSTDCXX}${LD_PRELOAD:+:$LD_PRELOAD}"
+  echo "  [env] LD_PRELOAD=$_CONDA_LIBSTDCXX"
+else
+  echo "  [env] ⚠ 找不到 $_CONDA_LIBSTDCXX —— 没 conda activate lerobot?"
+fi
+
 POLICY=outputs/train/2026-07-01/ACT_pickplace2_noimu_seed42/checkpoints/100000/pretrained_model
 CALIB=outputs/p2_labels/pp2a-deploy/manifest.json
 PROBE_CKPT=outputs/p2_pi/pi_direct_bare_s0.pt
@@ -40,6 +58,21 @@ except Exception as exc:                            # noqa: BLE001
 print(f"  ✓ import OK; MODES={MODES}")
 assert "probe" in MODES, "probe 模式不在 MODES 里 —— 代码版本不对"
 PY
+  # **走真实的 control_robot import 链** —— cv2/libstdc++ 冲突只在这条链上暴露,
+  # 单独 import cv2 是好的, 所以自检必须按真实顺序走一遍。
+  python - <<'PYCHAIN' || ok=1
+import sys
+try:
+    import lerobot.scripts.control_robot            # noqa: F401
+    import cv2                                      # noqa: F401
+except Exception as exc:                             # noqa: BLE001
+    print(f"  ✗ control_robot 导入链失败: {type(exc).__name__}: {exc}")
+    if "CXXABI" in str(exc):
+        print("     → libstdc++ 冲突; 本脚本已设 LD_PRELOAD, 若仍失败请检查 CONDA_PREFIX")
+    sys.exit(1)
+print("  ✓ control_robot 全链 import OK (含 cv2)")
+PYCHAIN
+
   # seed 表能否正确解析(纯离线, 不建机器人)
   python - <<'PY' || ok=1
 import importlib.util, sys
