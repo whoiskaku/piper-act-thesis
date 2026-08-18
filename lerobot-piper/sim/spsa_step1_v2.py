@@ -41,6 +41,8 @@ BASELINE_EVERY = 5           # 每 5 轮插一集裸 ACT
 FAILED_LOSS_MULT = 2.0       # 任务失败集的 L = 2 × 最近裸 ACT L
 FINAL_AVG = 10               # 最终 θ = 最后 10 个中心的平均
 SEED = 20260819              # Δ 的采样种子(可复现)
+MIN_FRAMES = 550             # 预注册 §6 ⑥-3
+MAX_LAUNCH_ATTEMPTS = 8      # 本机偶发启动期 SIGSEGV 的重试上限
 
 OUT = ROOT / "outputs/spsa_v2"
 STATE = OUT / "state.json"
@@ -117,12 +119,58 @@ class State:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-def run_episode(tag: str, theta_file: Path | None, dry: bool) -> Path:
-    """跑一集真机, 返回日志路径。theta_file=None ⇒ 裸 ACT（mode=off）。"""
-    log = OUT / f"{tag}.json"
+class PartialEpisode(RuntimeError):
+    """录到一部分才崩 —— 预注册 §6 ⑥-5 的 A 类技术故障, **整对作废重跑**。"""
+
+
+def _frames_in(log: Path) -> int:
+    try:
+        return len(json.loads(log.read_text()).get("frames", []))
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def run_episode(tag: str, theta_file: Path | None, dry: bool,
+                max_attempts: int = MAX_LAUNCH_ATTEMPTS) -> tuple[Path, int]:
+    """跑一集真机, 返回 (日志路径, 用掉的启动次数)。theta_file=None ⇒ 裸 ACT。
+
+    **本机已知**: 偶发的启动期 SIGSEGV(退出码 −11), 随机, 重试即可
+    (见 `scripts/train_resilient.sh` 的同一绕法)。故区分两种失败:
+
+      · 一帧都没录到就崩 ⇒ 这一次**根本没产生 episode**, 原地重启, 不算协议事件
+      · 录到一部分才崩   ⇒ 抛 PartialEpisode ⇒ 按 ⑥-5 整对作废重跑
+
+    每次尝试用**独立的 repo_id**(带 _aN 后缀), 避免"数据集已存在"并且不删任何东西;
+    失败尝试留下的数据集约 16 MB/集, 可事后自行清理。
+    """
     ep_log = OUT / f"{tag}_ep0.json"          # wrapper 落盘的实际文件名
     if dry:
-        return ep_log
+        return ep_log, 1
+    for attempt in range(1, max_attempts + 1):
+        if ep_log.exists():
+            ep_log.unlink()                   # 上一次尝试的残留, 不能被当成本次结果
+        rc = _launch(tag, theta_file, attempt)
+        n = _frames_in(ep_log)
+        if rc == 0 and n >= MIN_FRAMES:
+            if attempt > 1:
+                print(f"     (第 {attempt} 次启动成功; 前 {attempt-1} 次为启动期 SIGSEGV)")
+            return ep_log, attempt
+        if n == 0:
+            if attempt < max_attempts:
+                print(f"     ⚠ 启动期崩溃(退出码 {rc}, 0 帧) —— 本次未产生 episode, "
+                      f"3s 后第 {attempt+1}/{max_attempts} 次尝试")
+                time.sleep(3)
+                continue
+            print(f"     ⚠ 启动期崩溃(退出码 {rc}, 0 帧) —— 已是第 {attempt}/{max_attempts} 次")
+            break
+        ep_log.unlink(missing_ok=True)
+        raise PartialEpisode(
+            f"{tag}: 录到 {n} 帧后崩溃(退出码 {rc}) ⇒ 按 §6 ⑥-5 整对作废重跑")
+    raise RuntimeError(f"{tag}: 连续 {max_attempts} 次启动期崩溃 —— 不是偶发, 请先查环境")
+
+
+def _launch(tag: str, theta_file: Path | None, attempt: int) -> int:
+    log = OUT / f"{tag}.json"
     env = dict(os.environ)
     env["BCORR_CALIB"] = CALIB
     if theta_file is None:
@@ -143,13 +191,10 @@ def run_episode(tag: str, theta_file: Path | None, dry: bool) -> Path:
            "--control.warmup_time_s=2", "--control.episode_time_s=30",
            "--control.reset_time_s=10", "--control.push_to_hub=false",
            f"--control.policy.path={POLICY}",
-           f"--control.repo_id={env.get('USER','u')}/eval_spsa_{tag}",
+           f"--control.repo_id={env.get('USER','u')}/eval_spsa_{tag}_a{attempt}",
            "--control.num_episodes=1"]
-    print(f"    → {' '.join(cmd[-3:])}")
-    r = subprocess.run(cmd, cwd=ROOT, env=env)
-    if r.returncode != 0:
-        raise RuntimeError(f"{tag}: control_robot 退出码 {r.returncode}（A 类技术故障）")
-    return ep_log
+    print(f"    → {tag} 第 {attempt} 次启动")
+    return subprocess.run(cmd, cwd=ROOT, env=env).returncode
 
 
 def loss_of(log: Path, dry: bool, dry_theta=None) -> dict:
@@ -218,7 +263,7 @@ def one_round(st: State, sp, dry: bool, plan_only: bool) -> bool:
         tf = OUT / f"{tag}_theta.json"
         th.save(tf, round=k, side=side, x=(xp if side == "p" else xm).tolist())
         print(f"  ── {tag}")
-        lg = run_episode(tag, tf, dry)
+        lg, tries = run_episode(tag, tf, dry)
         d = loss_of(lg, dry, xp if side == "p" else xm)
         st.episodes_used += 1
         viol = safety_check(d)
@@ -227,6 +272,7 @@ def one_round(st: State, sp, dry: bool, plan_only: bool) -> bool:
             if any("A 类" in v for v in viol):
                 raise RuntimeError(f"{tag}: A 类技术故障 ⇒ 整对作废重跑（不改 θ）")
             d["failed"] = True                 # B 类: 保留记录并按 §3.5 赋值
+        d["launch_attempts"] = tries
         res[side] = d
         print(f"     L={d['L']:.6f}  log L={d['log_L']:+.4f}"
               + ("  [B类失败, 将按 2×基线赋值]" if d["failed"] else ""))
@@ -271,10 +317,10 @@ def one_round(st: State, sp, dry: bool, plan_only: bool) -> bool:
 def run_baseline(st: State, k: int, tag: str, dry: bool) -> None:
     """一集裸 ACT, 用于漂移对照与 §3.5 的失败赋值基准。"""
     print(f"  ── 裸 ACT 基线 {tag}")
-    lg = run_episode(tag, None, dry)
+    lg, tries = run_episode(tag, None, dry)
     bd = loss_of(lg, dry, [0, 0, 0])
     st.episodes_used += 1
-    st.baselines.append({"round": k, "tag": tag,
+    st.baselines.append({"round": k, "tag": tag, "launch_attempts": tries,
                          **{kk: bd[kk] for kk in ("L", "log_L", "frames")}})
     print(f"     L={bd['L']:.6f}")
     st.save()
@@ -291,7 +337,7 @@ def final_check(st: State, sp, dry: bool, n: int = 5) -> None:
     rows = []
     for i in range(n):
         tag = f"FINAL{i}"
-        lg = run_episode(tag, f, dry)
+        lg, tries = run_episode(tag, f, dry)
         d = loss_of(lg, dry, th.to_x())
         st.episodes_used += 1
         viol = safety_check(d)
