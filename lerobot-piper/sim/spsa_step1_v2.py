@@ -131,8 +131,8 @@ def _frames_in(log: Path) -> int:
 
 
 def run_episode(tag: str, theta_file: Path | None, dry: bool,
-                max_attempts: int = MAX_LAUNCH_ATTEMPTS) -> tuple[Path, int]:
-    """跑一集真机, 返回 (日志路径, 用掉的启动次数)。theta_file=None ⇒ 裸 ACT。
+                max_attempts: int = MAX_LAUNCH_ATTEMPTS) -> tuple[Path, int, int]:
+    """跑一集真机, 返回 (日志路径, 启动次数, 退出码)。theta_file=None ⇒ 裸 ACT。
 
     **本机已知**: 偶发的启动期 SIGSEGV(退出码 −11), 随机, 重试即可
     (见 `scripts/train_resilient.sh` 的同一绕法)。故区分两种失败:
@@ -145,16 +145,25 @@ def run_episode(tag: str, theta_file: Path | None, dry: bool,
     """
     ep_log = OUT / f"{tag}_ep0.json"          # wrapper 落盘的实际文件名
     if dry:
-        return ep_log, 1
+        return ep_log, 1, 0
     for attempt in range(1, max_attempts + 1):
-        if ep_log.exists():
-            ep_log.unlink()                   # 上一次尝试的残留, 不能被当成本次结果
+        if ep_log.exists():                   # 上一次尝试的残留: **移开而非删除**
+            ep_log.rename(ep_log.with_name(f"{tag}_ep0.stale_{int(time.time())}.json"))
         rc = _launch(tag, theta_file, attempt)
         n = _frames_in(ep_log)
-        if rc == 0 and n >= MIN_FRAMES:
+        if n >= MIN_FRAMES:
+            # **数据完整就接受, 与退出码无关。**
+            # 本机会在**退出期**崩(Qt teardown + glibc "free(): invalid pointer",
+            # 退出码 −6/SIGABRT), 发生在录完、写完 parquet、机器人 disable、
+            # 打完 "Exiting" **之后** —— 与数据无关。
+            # (最终 flush 由 control_robot 在 record 循环后显式调 policy.summary() 完成,
+            #  所以此时日志已是完整的。)
+            if rc != 0:
+                print(f"     ⚠ 退出期崩溃(退出码 {rc}) —— 但 {n} 帧已完整录入,"
+                      f" 本集**有效**, 仅记录退出码")
             if attempt > 1:
-                print(f"     (第 {attempt} 次启动成功; 前 {attempt-1} 次为启动期 SIGSEGV)")
-            return ep_log, attempt
+                print(f"     (第 {attempt} 次启动成功; 前 {attempt-1} 次为启动期崩溃)")
+            return ep_log, attempt, rc
         if n == 0:
             if attempt < max_attempts:
                 print(f"     ⚠ 启动期崩溃(退出码 {rc}, 0 帧) —— 本次未产生 episode, "
@@ -163,9 +172,12 @@ def run_episode(tag: str, theta_file: Path | None, dry: bool,
                 continue
             print(f"     ⚠ 启动期崩溃(退出码 {rc}, 0 帧) —— 已是第 {attempt}/{max_attempts} 次")
             break
-        ep_log.unlink(missing_ok=True)
+        # **不删证据** —— 移开保留, 供事后判断到底断在哪
+        aside = ep_log.with_name(f"{tag}_ep0.partial_{int(time.time())}.json")
+        ep_log.rename(aside)
         raise PartialEpisode(
-            f"{tag}: 录到 {n} 帧后崩溃(退出码 {rc}) ⇒ 按 §6 ⑥-5 整对作废重跑")
+            f"{tag}: 只录到 {n} 帧(< {MIN_FRAMES})后崩溃(退出码 {rc}) "
+            f"⇒ 按 §6 ⑥-5 整对作废重跑; 残件留在 {aside.name}")
     raise RuntimeError(f"{tag}: 连续 {max_attempts} 次启动期崩溃 —— 不是偶发, 请先查环境")
 
 
@@ -263,7 +275,7 @@ def one_round(st: State, sp, dry: bool, plan_only: bool) -> bool:
         tf = OUT / f"{tag}_theta.json"
         th.save(tf, round=k, side=side, x=(xp if side == "p" else xm).tolist())
         print(f"  ── {tag}")
-        lg, tries = run_episode(tag, tf, dry)
+        lg, tries, rc = run_episode(tag, tf, dry)
         d = loss_of(lg, dry, xp if side == "p" else xm)
         st.episodes_used += 1
         viol = safety_check(d)
@@ -273,6 +285,7 @@ def one_round(st: State, sp, dry: bool, plan_only: bool) -> bool:
                 raise RuntimeError(f"{tag}: A 类技术故障 ⇒ 整对作废重跑（不改 θ）")
             d["failed"] = True                 # B 类: 保留记录并按 §3.5 赋值
         d["launch_attempts"] = tries
+        d["exit_code"] = rc
         res[side] = d
         print(f"     L={d['L']:.6f}  log L={d['log_L']:+.4f}"
               + ("  [B类失败, 将按 2×基线赋值]" if d["failed"] else ""))
@@ -306,6 +319,7 @@ def one_round(st: State, sp, dry: bool, plan_only: bool) -> bool:
                        "L_plus_used": res["p"]["L_used"],
                        "L_minus_used": res["m"]["L_used"],
                        "failed_plus": res["p"]["failed"], "failed_minus": res["m"]["failed"],
+                       "exit_plus": res["p"]["exit_code"], "exit_minus": res["m"]["exit_code"],
                        "g": g.tolist(), "step": step.tolist(), "x_new": x_new.tolist()})
     st.x = x_new
     st.centers.append(x_new.tolist())
@@ -317,10 +331,11 @@ def one_round(st: State, sp, dry: bool, plan_only: bool) -> bool:
 def run_baseline(st: State, k: int, tag: str, dry: bool) -> None:
     """一集裸 ACT, 用于漂移对照与 §3.5 的失败赋值基准。"""
     print(f"  ── 裸 ACT 基线 {tag}")
-    lg, tries = run_episode(tag, None, dry)
+    lg, tries, rc = run_episode(tag, None, dry)
     bd = loss_of(lg, dry, [0, 0, 0])
     st.episodes_used += 1
     st.baselines.append({"round": k, "tag": tag, "launch_attempts": tries,
+                         "exit_code": rc,
                          **{kk: bd[kk] for kk in ("L", "log_L", "frames")}})
     print(f"     L={bd['L']:.6f}")
     st.save()
@@ -337,11 +352,12 @@ def final_check(st: State, sp, dry: bool, n: int = 5) -> None:
     rows = []
     for i in range(n):
         tag = f"FINAL{i}"
-        lg, tries = run_episode(tag, f, dry)
+        lg, tries, rc = run_episode(tag, f, dry)
         d = loss_of(lg, dry, th.to_x())
         st.episodes_used += 1
         viol = safety_check(d)
-        rows.append({"tag": tag, **{k: d[k] for k in ("L", "frames", "sat_pct")},
+        rows.append({"tag": tag, "exit_code": rc,
+                     **{k: d[k] for k in ("L", "frames", "sat_pct")},
                      "violations": viol})
         print(f"  {tag}: L={d['L']:.6f}  sat={d['sat_pct']:.2f}%"
               + (f"  ⚠ {'; '.join(viol)}" if viol else "  ✓"))
