@@ -51,7 +51,32 @@ _GRIP_SCALE = 1.0 / 800000.0        # 与 refine_deploy 一致
 MODES = ("off", "ff", "pi_only", "full", "record", "probe")
 
 
-def make_probe(seed: int, mrad: float, n: int = 4000,
+PROBE_N = 2000                   # 100 s @20Hz —— 覆盖 30 s 一集, 正常不会绕回
+
+
+def probe_waveform(seed: int, n: int = PROBE_N, fs: float = 20.0,
+                   lo: float = 0.5, hi: float = 9.0) -> np.ndarray:
+    """**单位 RMS** 的带限白噪声波形 —— 只由 seed 决定, **与幅值无关**。
+
+    与 make_probe 分开是为了满足预注册(PREREG_STEP1.md §8)的两条要求:
+      · P3 复用 P1 的 seed 只放大幅值 ⇒ 波形必须逐点相同, 未触界处严格成比例
+      · 波形 hash 用于事后证明"确实是同一段激励" ⇒ hash 必须与幅值无关
+    """
+    from scipy.signal import butter, filtfilt
+    rng = np.random.default_rng(int(seed))
+    x = rng.standard_normal((int(n), 6))
+    ba = butter(3, [lo / (fs / 2), hi / (fs / 2)], "bandpass")
+    x = filtfilt(*ba, x, axis=0)
+    return (x / np.sqrt((x ** 2).mean())).astype(np.float32)
+
+
+def probe_hash(seed: int, n: int = PROBE_N) -> str:
+    """波形指纹(与幅值无关)。同 seed ⇒ 同 hash, 用于核对 P3 确实复用了 P1 的激励。"""
+    import hashlib
+    return hashlib.sha256(probe_waveform(seed, n).tobytes()).hexdigest()[:16]
+
+
+def make_probe(seed: int, mrad: float, n: int = PROBE_N,
                fs: float = 20.0, lo: float = 0.5, hi: float = 9.0) -> np.ndarray:
     """带限白噪声 δa —— **与状态无关的外生激励**，开环系统辨识专用。
 
@@ -61,14 +86,21 @@ def make_probe(seed: int, mrad: float, n: int = 4000,
     只有与状态无关的激励才能把被控对象与控制器分开。
 
     频带取 0.5–9 Hz(评分带), 六关节独立, 定种子可完全复现, 硬界 ε 兜底。
+    幅值 = 单位波形 × mrad, **再**裁剪 ⇒ 未触界处 mrad 加倍即输出严格加倍。
     """
-    from scipy.signal import butter, filtfilt
-    rng = np.random.default_rng(int(seed))
-    x = rng.standard_normal((int(n), 6))
-    ba = butter(3, [lo / (fs / 2), hi / (fs / 2)], "bandpass")
-    x = filtfilt(*ba, x, axis=0)
-    x *= (float(mrad) * 1e-3) / np.sqrt((x ** 2).mean())
-    return np.clip(x, -EPS_B, EPS_B).astype(np.float32)
+    w = probe_waveform(seed, n, fs, lo, hi)
+    return np.clip(w * (float(mrad) * 1e-3), -EPS_B, EPS_B).astype(np.float32)
+
+
+def parse_seed_schedule(spec, fallback: int) -> list[int]:
+    """"1000,1001,..." → [1000, 1001, ...]。空则退回单 seed(旧行为)。
+
+    **必须支持显式表**而非 base+ep_id: P2 要同 seed 重复两集("2000,2000,2001,..."),
+    P3 要复用 P1 的 seed("1000,1001,1002,1003") —— 递增式生成表达不了这两种。
+    """
+    if spec is None or str(spec).strip() == "":
+        return [int(fallback)]
+    return [int(s) for s in str(spec).replace(" ", "").split(",") if s]
 
 
 class BCorrectionDeployWrapper:
@@ -76,7 +108,7 @@ class BCorrectionDeployWrapper:
 
     def __init__(self, act_policy, pi_ckpt, device, R, b, mode="full",
                  lag=3, ff_lag=2, ff_blend=4, log_path=None, verbose=True,
-                 probe_seed=0, probe_mrad=3.0):
+                 probe_seed=0, probe_mrad=3.0, probe_seeds=None):
         assert mode in MODES, f"mode 须为 {MODES}"
         self.act = act_policy
         self.device = device
@@ -87,8 +119,19 @@ class BCorrectionDeployWrapper:
         self.apply_delta = mode in ("full", "pi_only", "probe")   # record 只观测不施加
         self.use_ff = mode in ("full", "ff")
         # probe: 外生激励, **不读 IMU、不经 π** —— 序列由种子完全决定
-        self.probe_seed, self.probe_mrad = int(probe_seed), float(probe_mrad)
-        self.probe = make_probe(probe_seed, probe_mrad) if mode == "probe" else None
+        # **逐集换 seed**(PREREG_STEP1.md §8): 旧实现整批只有 1 个噪声实现 ——
+        # probe 表在 __init__ 一次性生成, 而 reset() 把 frames 归零 ⇒ 每集从第 0 帧重放。
+        self.probe_mrad = float(probe_mrad)
+        self.probe_seeds = parse_seed_schedule(probe_seeds, probe_seed)
+        self.probe_seed = self.probe_seeds[0]
+        self._probe_ep = 0            # 集号(独立于 _ep_count, 不依赖是否开日志)
+        self._probe_i = 0             # 集内帧号(独立于 stats["frames"])
+        self._probe_wrapped = 0       # 集长超出波形长度的次数(应为 0)
+        self._probe_overrun = 0       # 集数超出 seed 表的次数(应为 0)
+        self._probe_clamped = False   # 本集是否因超表而沿用了末位 seed
+        self.probe = None
+        if mode in ("probe",):
+            self._load_probe()
 
         self.pi = load_tcn(pi_ckpt).to(device) if self.use_pi else None
         self.renderer = IdealChunkRenderer() if self.use_pi else None
@@ -110,17 +153,37 @@ class BCorrectionDeployWrapper:
             print(f"[b_corr] mode={mode} ε={EPS_B*1000:.0f}mrad L={lag} "
                   f"feat={FEAT_DIM} win={WIN} π={'on' if self.use_pi else 'off'} "
                   f"ff={'on' if self.use_ff else 'off'}"
-                  + (f" probe=seed{self.probe_seed}/{self.probe_mrad:g}mrad"
-                     f"(RMS {np.sqrt((self.probe**2).mean())*1e3:.2f}, "
-                     f"clip {np.mean(np.abs(self.probe) >= EPS_B*0.999)*100:.1f}%)"
-                     if self.probe is not None else ""))
+                  + (f" probe: {len(self.probe_seeds)} seeds "
+                     f"{self.probe_seeds[:4]}{'…' if len(self.probe_seeds) > 4 else ''} "
+                     f"@{self.probe_mrad:g}mrad" if self.probe is not None else ""))
 
     # ---- 透传 ACTPolicy 接口 ----
     def __getattr__(self, name):
         return getattr(self.__dict__["act"], name) if "act" in self.__dict__ else None
 
+    def _load_probe(self):
+        """按当前集号取 seed 表里的 seed, 生成本集波形。"""
+        i = self._probe_ep
+        # 超表只**标记**, 待本集真的产生帧时才计数 —— 否则末集之后的那次 reset()
+        # 会多记一次(集号已推进但那一集根本没跑)。
+        self._probe_clamped = i >= len(self.probe_seeds)
+        if self._probe_clamped:
+            i = len(self.probe_seeds) - 1
+        self.probe_seed = self.probe_seeds[i]
+        self.probe = make_probe(self.probe_seed, self.probe_mrad)
+        self._probe_i = 0
+        if self.verbose:
+            print(f"[b_corr] ep{self._probe_ep}: probe seed={self.probe_seed} "
+                  f"mrad={self.probe_mrad:g} hash={probe_hash(self.probe_seed)} "
+                  f"RMS={np.sqrt((self.probe**2).mean())*1e3:.3f}mrad "
+                  f"clip={np.mean(np.abs(self.probe) >= EPS_B*0.999)*100:.2f}%")
+
     def reset(self):
         # control_robot 每集开始调 reset() → 借此把上一集落盘并推进集号(多集独立文件)
+        # probe 的集号推进必须在**任何** stats 归零之前, 且不依赖是否开日志
+        if self.probe is not None and self.stats["frames"] > 0:
+            self._probe_ep += 1
+            self._load_probe()
         self._flush()
         if self._log:
             self._ep_count += 1
@@ -226,7 +289,15 @@ class BCorrectionDeployWrapper:
 
         da = np.zeros(6, np.float32)
         if self.probe is not None:                       # 开环激励: 与状态无关
-            da = self.probe[self.stats["frames"] % len(self.probe)]
+            if self._probe_i == 0 and self._probe_clamped:   # 本集确实跑了且超表
+                self._probe_overrun += 1
+                print(f"[b_corr] ⚠ 第 {self._probe_ep} 集超出 seed 表长度 "
+                      f"{len(self.probe_seeds)} —— 沿用末位 seed {self.probe_seed}, "
+                      f"已计入 probe_overrun。这是**协议偏离**, 分析时须剔除或说明。")
+            if self._probe_i >= len(self.probe):         # 集长超出波形 —— 正常不该发生
+                self._probe_wrapped += 1
+            da = self.probe[self._probe_i % len(self.probe)]
+            self._probe_i += 1
             a = a.clone()
             a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)
         elif self.use_pi:
@@ -252,9 +323,17 @@ class BCorrectionDeployWrapper:
         s, n = self.stats, max(self.stats["frames"], 1)
         # ckpt/FF 状态必须落盘: C 臂那次没记, 事后无法确认用的是哪个 seed,
         # 也无法从日志本身判断 π 与 FF 的占比(2026-07-29)
+        pr = self.probe is not None
         return {"mode": self.mode, "pi_ckpt": str(self.pi_ckpt),
-                "probe_seed": self.probe_seed if self.probe is not None else None,
-                "probe_mrad": self.probe_mrad if self.probe is not None else None,
+                # 逐集落盘**实际用的** seed 与波形 hash —— 事后核对 P3 是否真复用了 P1 激励
+                "probe_seed": self.probe_seed if pr else None,
+                "probe_hash": probe_hash(self.probe_seed) if pr else None,
+                "probe_mrad": self.probe_mrad if pr else None,
+                "probe_ep": self._probe_ep if pr else None,
+                "probe_seed_schedule": self.probe_seeds if pr else None,
+                "probe_rms_mrad": float(np.sqrt((self.probe ** 2).mean()) * 1e3) if pr else None,
+                "probe_clip_pct": float(np.mean(np.abs(self.probe) >= EPS_B * 0.999) * 100) if pr else None,
+                "probe_wrapped": self._probe_wrapped, "probe_overrun": self._probe_overrun,
                 "use_ff": bool(self.use_ff), "use_pi": bool(self.use_pi),
                 "ff_lag": int(self.ff_lag), "ff_blend": int(self.ff_blend),
                 "ff_blend_effective": int(max(self.ff_blend - self.ff_lag, 0)),
@@ -283,7 +362,7 @@ class BCorrectionDeployWrapper:
 
 def build_b_correction_policy(act_policy, pi_ckpt, device, calib_json,
                               mode="full", log_path=None, ff_lag=None, ff_blend=None,
-                              probe_seed=None, probe_mrad=None):
+                              probe_seed=None, probe_mrad=None, probe_seeds=None):
     """calib_json: 含 {"R": 3x3, "b": 3} 的标定文件（p2_labels/<tag>/manifest.json 同格式）。"""
     m = json.loads(Path(calib_json).read_text())
     R = np.array(m["R"], np.float32)
@@ -302,5 +381,7 @@ def build_b_correction_policy(act_policy, pi_ckpt, device, calib_json,
         kw["probe_seed"] = int(probe_seed)
     if probe_mrad is not None:
         kw["probe_mrad"] = float(probe_mrad)
+    if probe_seeds is not None:
+        kw["probe_seeds"] = probe_seeds
     return BCorrectionDeployWrapper(act_policy, pi_ckpt, device, R, b,
                                     mode=mode, log_path=log_path, **kw)
