@@ -48,14 +48,35 @@ from lerobot.common.policies.act.b_runtime import (
 
 _MDEG_TO_RAD = math.pi / 180.0 / 1000.0
 _GRIP_SCALE = 1.0 / 800000.0        # 与 refine_deploy 一致
-MODES = ("off", "ff", "pi_only", "full", "record")
+MODES = ("off", "ff", "pi_only", "full", "record", "probe")
+
+
+def make_probe(seed: int, mrad: float, n: int = 4000,
+               fs: float = 20.0, lo: float = 0.5, hi: float = 9.0) -> np.ndarray:
+    """带限白噪声 δa —— **与状态无关的外生激励**，开环系统辨识专用。
+
+    为什么必须外生: 此前 D/E/F 三条臂的 δa 都由 π 从状态算出(闭环), 于是辨识出的
+    "响应" H 里混着控制器 —— 实测 E 与 F(同日同机, 只差 FF 开关)的 H 互不通用,
+    用 E 的 H 求解、F 上评估会从 −86.7% 翻成 +187.8%(reports/STEP1_GATE.md)。
+    只有与状态无关的激励才能把被控对象与控制器分开。
+
+    频带取 0.5–9 Hz(评分带), 六关节独立, 定种子可完全复现, 硬界 ε 兜底。
+    """
+    from scipy.signal import butter, filtfilt
+    rng = np.random.default_rng(int(seed))
+    x = rng.standard_normal((int(n), 6))
+    ba = butter(3, [lo / (fs / 2), hi / (fs / 2)], "bandpass")
+    x = filtfilt(*ba, x, axis=0)
+    x *= (float(mrad) * 1e-3) / np.sqrt((x ** 2).mean())
+    return np.clip(x, -EPS_B, EPS_B).astype(np.float32)
 
 
 class BCorrectionDeployWrapper:
     """Drop-in policy: frozen ACT + 逐帧实时 δa 校正（IMU 在环）。"""
 
     def __init__(self, act_policy, pi_ckpt, device, R, b, mode="full",
-                 lag=3, ff_lag=2, ff_blend=4, log_path=None, verbose=True):
+                 lag=3, ff_lag=2, ff_blend=4, log_path=None, verbose=True,
+                 probe_seed=0, probe_mrad=3.0):
         assert mode in MODES, f"mode 须为 {MODES}"
         self.act = act_policy
         self.device = device
@@ -63,8 +84,11 @@ class BCorrectionDeployWrapper:
         self.pi_ckpt = pi_ckpt
         self.verbose = verbose
         self.use_pi = mode in ("full", "pi_only", "record")
-        self.apply_delta = mode in ("full", "pi_only")     # record 只观测不施加
+        self.apply_delta = mode in ("full", "pi_only", "probe")   # record 只观测不施加
         self.use_ff = mode in ("full", "ff")
+        # probe: 外生激励, **不读 IMU、不经 π** —— 序列由种子完全决定
+        self.probe_seed, self.probe_mrad = int(probe_seed), float(probe_mrad)
+        self.probe = make_probe(probe_seed, probe_mrad) if mode == "probe" else None
 
         self.pi = load_tcn(pi_ckpt).to(device) if self.use_pi else None
         self.renderer = IdealChunkRenderer() if self.use_pi else None
@@ -85,7 +109,11 @@ class BCorrectionDeployWrapper:
         if verbose:
             print(f"[b_corr] mode={mode} ε={EPS_B*1000:.0f}mrad L={lag} "
                   f"feat={FEAT_DIM} win={WIN} π={'on' if self.use_pi else 'off'} "
-                  f"ff={'on' if self.use_ff else 'off'}")
+                  f"ff={'on' if self.use_ff else 'off'}"
+                  + (f" probe=seed{self.probe_seed}/{self.probe_mrad:g}mrad"
+                     f"(RMS {np.sqrt((self.probe**2).mean())*1e3:.2f}, "
+                     f"clip {np.mean(np.abs(self.probe) >= EPS_B*0.999)*100:.1f}%)"
+                     if self.probe is not None else ""))
 
     # ---- 透传 ACTPolicy 接口 ----
     def __getattr__(self, name):
@@ -197,7 +225,11 @@ class BCorrectionDeployWrapper:
         a = self._queue.popleft()                                           # (1,7)
 
         da = np.zeros(6, np.float32)
-        if self.use_pi:
+        if self.probe is not None:                       # 开环激励: 与状态无关
+            da = self.probe[self.stats["frames"] % len(self.probe)]
+            a = a.clone()
+            a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)
+        elif self.use_pi:
             da = self._delta(batch)
             if self.apply_delta:
                 a = a.clone()
@@ -221,6 +253,8 @@ class BCorrectionDeployWrapper:
         # ckpt/FF 状态必须落盘: C 臂那次没记, 事后无法确认用的是哪个 seed,
         # 也无法从日志本身判断 π 与 FF 的占比(2026-07-29)
         return {"mode": self.mode, "pi_ckpt": str(self.pi_ckpt),
+                "probe_seed": self.probe_seed if self.probe is not None else None,
+                "probe_mrad": self.probe_mrad if self.probe is not None else None,
                 "use_ff": bool(self.use_ff), "use_pi": bool(self.use_pi),
                 "ff_lag": int(self.ff_lag), "ff_blend": int(self.ff_blend),
                 "ff_blend_effective": int(max(self.ff_blend - self.ff_lag, 0)),
@@ -248,7 +282,8 @@ class BCorrectionDeployWrapper:
 
 
 def build_b_correction_policy(act_policy, pi_ckpt, device, calib_json,
-                              mode="full", log_path=None, ff_lag=None, ff_blend=None):
+                              mode="full", log_path=None, ff_lag=None, ff_blend=None,
+                              probe_seed=None, probe_mrad=None):
     """calib_json: 含 {"R": 3x3, "b": 3} 的标定文件（p2_labels/<tag>/manifest.json 同格式）。"""
     m = json.loads(Path(calib_json).read_text())
     R = np.array(m["R"], np.float32)
@@ -263,5 +298,9 @@ def build_b_correction_policy(act_policy, pi_ckpt, device, calib_json,
         kw["ff_lag"] = int(ff_lag)
     if ff_blend is not None:
         kw["ff_blend"] = int(ff_blend)
+    if probe_seed is not None:
+        kw["probe_seed"] = int(probe_seed)
+    if probe_mrad is not None:
+        kw["probe_mrad"] = float(probe_mrad)
     return BCorrectionDeployWrapper(act_policy, pi_ckpt, device, R, b,
                                     mode=mode, log_path=log_path, **kw)

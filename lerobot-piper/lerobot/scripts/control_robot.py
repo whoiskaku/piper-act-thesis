@@ -291,7 +291,9 @@ def record(
                                            mode=_bmode,
                                            log_path=os.environ.get("BCORR_LOG"),
                                            ff_lag=os.environ.get("BCORR_FF_LAG"),
-                                           ff_blend=os.environ.get("BCORR_FF_BLEND"))
+                                           ff_blend=os.environ.get("BCORR_FF_BLEND"),
+                                   probe_seed=os.environ.get("BCORR_PROBE_SEED"),
+                                   probe_mrad=os.environ.get("BCORR_PROBE_MRAD"))
         logging.info(f"B-correction wrapper active (mode={_bmode}, ckpt={_bcorr_ckpt})")
 
     # Build a HistoryBuffer when the loaded policy was trained with autoregressive
