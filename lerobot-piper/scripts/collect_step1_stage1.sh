@@ -5,6 +5,7 @@
 #     bash scripts/collect_step1_stage1.sh              # 全跑
 #     bash scripts/collect_step1_stage1.sh --preflight  # 只做开跑前自检, 不碰机器人
 #     bash scripts/collect_step1_stage1.sh P1           # 只重开某一档(整档, 原 seed 表)
+#     bash scripts/collect_step1_stage1.sh P3           # 阶段 2: P2 闸门 PASS 后才跑
 #
 # 为什么是脚本而不是直接粘命令: `set -e` 粘进交互式终端后, 任何一条命令返回非零
 # 都会让**你的终端自己退出**。放进脚本里, 出错只退出脚本, 终端还在, 且有日志可看。
@@ -141,6 +142,8 @@ case "${1:-all}" in
   P0) preflight && run_probe P0 off   1.5 0                                       5 ;;
   P1) preflight && run_probe P1 probe 1.5 1000,1001,1002,1003,1004,1005,1006,1007 8 ;;
   P2) preflight && run_probe P2 probe 1.5 2000,2000,2001,2001,2002,2002           6 ;;
+  # P3 只有在 --stage p2 明确 PASS 之后才该跑(幅值线性检验, 复用 P1 前 4 个 seed)
+  P3) preflight && run_probe P3 probe 3.0 1000,1001,1002,1003                     4 ;;
   all)
     preflight
     run_probe P0 off   1.5 0                                       5
@@ -157,5 +160,5 @@ case "${1:-all}" in
     echo "PASS 才采 P3; FAIL(退出码 2) 则整条路径作废。"
     echo "════════════════════════════════════════════════════════"
     ;;
-  *) echo "用法: $0 [all|P0|P1|P2|--preflight]"; exit 64 ;;
+  *) echo "用法: $0 [all|P0|P1|P2|P3|--preflight]"; exit 64 ;;
 esac
