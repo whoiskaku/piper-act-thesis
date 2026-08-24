@@ -48,7 +48,7 @@ OUT = ROOT / "outputs/step1_v3_confirm"
 SCHEDULE = ROOT / "reports/step1_v3_confirm_schedule.json"
 STATE = OUT / "state.json"
 MAX_BLOCK_VOIDS = 3
-MATCH_TOL_RAD = np.deg2rad(0.5)      # 附录 B: 两臂各关节初始编码器差 ≤ 0.5°
+MATCH_TOL_DEG = 0.5                  # 附录 B: 两臂各关节初始编码器差 ≤ 0.5°
 H1_BAR = 0.15                        # §5 判据 1
 SIGN_MIN = 20                        # §5 判据 3: ≥20/30 (H0 下 α=0.0494)
 
@@ -143,11 +143,26 @@ def run_episode(tag: str, tf: Path | None, dry: bool) -> tuple[Path, int, int]:
 
 
 def init_state(log: Path, dry: bool) -> np.ndarray:
-    """frames[0].state 的前 6 维（关节初始编码器）。"""
+    """初始关节编码器（**度**）。
+
+    两个实测坑（2026-08-24 修）:
+      · `frames[0..1].state` 是**全零** —— 机器人状态流还没起来。取第 0 帧
+        会让「两臂差 ≤ 0.5°」变成 0 vs 0, **恒真、完全空转**。
+        故取**首个 `|state[:6]|` 非零的帧**（实测恒为第 2 帧）。
+      · `state` 的单位是**毫度**, 不是弧度
+        （实测 `|state|max/|a|max ≈ 57296 = 1000·180/π`, 而 `a` 是弧度）。
+
+    这是**代理**而非真正的复位位姿: 到第 2 帧手臂已动约 0.25°, 所以两臂之差里
+    混有一帧级的时序抖动。方向上是**保守的** —— 只会高估差值, 不会漏报。
+    """
     if dry:
         return np.zeros(6)
-    d = json.loads(log.read_text())
-    return np.asarray(d["frames"][0]["state"], float)[:6]
+    fr = json.loads(log.read_text())["frames"]
+    for f in fr:
+        s = np.asarray(f["state"], float)[:6]
+        if np.abs(s).sum() > 0:
+            return s / 1000.0                    # 毫度 → 度
+    return np.zeros(6)
 
 
 class BlockVoid(RuntimeError):
@@ -189,9 +204,9 @@ def one_block(st: State, blk: dict, cand: dict, dry: bool) -> None:
                 print(f"     ✓ L={d['L']:.6f}  帧={d['frames']}  sat={d['sat_pct']:.2f}%")
             # 附录 B: 两臂初始编码器差 ≤ 0.5°
             dv = np.abs(np.array(eps["A"]["init_state"]) - np.array(eps["B"]["init_state"]))
-            if dv.max() > MATCH_TOL_RAD:
+            if dv.max() > MATCH_TOL_DEG:
                 raise BlockVoid(f"matched 违规: 初始编码器最大差 "
-                                f"{np.rad2deg(dv.max()):.2f}° > 0.5° (附录 B)")
+                                f"{dv.max():.3f}° > {MATCH_TOL_DEG}° (附录 B)")
         except (PartialEpisode, BlockVoid) as ex:
             print(f"     ✗ {ex}\n     ⇒ **整个 block 作废重跑**（附录 B / ⑥-5）")
             st.d["voided"].append({"block": b, "session": s, "attempt": nv,
@@ -204,7 +219,7 @@ def one_block(st: State, blk: dict, cand: dict, dry: bool) -> None:
         bcl = eps["A"]["b_class"] or eps["B"]["b_class"]
         rec = {"block": b, "session": s, "order": order, "L_A": LA, "L_B": LB,
                "r": r, "b_class": bcl,
-               "init_diff_deg": float(np.rad2deg(dv.max())),
+               "init_diff_deg": float(dv.max()),
                "A": eps["A"], "B": eps["B"], "ts": time.time()}
         st.d["blocks"].append(rec)
         st.d["episodes_used"] += 2
@@ -265,7 +280,7 @@ def analyze(st: State) -> int:
     print(f"{'block':>6}{'会话':>5}{'顺序':>5}{'L_A':>10}{'L_B':>10}{'r':>9}{'初始差':>8}")
     for x in B:
         print(f"{x['block']:>6}{x['session']:>5}{x['order']:>5}{x['L_A']:>10.5f}"
-              f"{x['L_B']:>10.5f}{x['r']*100:>+8.1f}%{x['init_diff_deg']:>7.2f}°"
+              f"{x['L_B']:>10.5f}{x['r']*100:>+8.1f}%{x['init_diff_deg']:>7.3f}°"
               + ("  ⚠B类" if x["b_class"] else ""))
     med = float(np.median(r))
     tt = stats.ttest_1samp(r, 0.0)
