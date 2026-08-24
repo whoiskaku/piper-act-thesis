@@ -114,28 +114,50 @@ def _launch(tag: str, tf: Path | None, attempt: int) -> int:
          "--control.num_episodes=1"], cwd=ROOT, env=env, check=False).returncode
 
 
-def run_episode(tag: str, tf: Path | None, dry: bool) -> tuple[Path, int, int]:
-    ep = OUT / f"{tag}_ep0.json"
+def episode_files(tag: str) -> list[tuple[int, Path]]:
+    """本 tag 的 `_ep{N}.json`（不含 stale/partial/orphan），按 N 升序。
+
+    **一次启动可能录多集**：lerobot 的 record 允许操作者按方向键重录，
+    wrapper 每次 `reset()` 都会写一个新的 `_ep{N}.json`。原实现硬编码读
+    `_ep0` —— 那是**第一次（被丢弃的）尝试**，真正保留的是最后一个。
+    实测 B10A 一次启动录出 `_ep0`=219 / `_ep1`=1 / `_ep2`=594 帧。
+    """
+    out = []
+    for f in OUT.glob(f"{tag}_ep*.json"):
+        s = f.name[len(tag) + 3:-5]                  # "_ep" .. ".json"
+        if s.isdigit():
+            out.append((int(s), f))
+    return sorted(out)
+
+
+def run_episode(tag: str, tf: Path | None, dry: bool) -> tuple[Path, int, int, int]:
+    """→ (采用的日志, 启动次数, 退出码, **本次启动录出的集数**)。"""
     if dry:
-        return ep, 1, 0
+        return OUT / f"{tag}_ep0.json", 1, 0, 1
     for a in range(1, MAX_LAUNCH_ATTEMPTS + 1):
-        if ep.exists():
-            ep.rename(ep.with_name(f"{tag}_ep0.stale_{int(time.time())}.json"))
+        for _, f in episode_files(tag):              # 残留全部移开, **不删**
+            f.rename(f.with_name(f"{f.stem}.stale_{int(time.time())}.json"))
         rc = _launch(tag, tf, a)
+        eps = episode_files(tag)
+        ep = eps[-1][1] if eps else OUT / f"{tag}_ep0.json"
         n = _frames_in(ep)
         if n >= MIN_FRAMES:
+            if len(eps) > 1:
+                print(f"     ⚠ 本次启动录出 {len(eps)} 集 "
+                      f"({', '.join(f'ep{i}={_frames_in(f)}帧' for i, f in eps)})")
+                print(f"       ⇒ 操作者重录过。采用最后一集 {ep.name}")
             if rc != 0:
                 print(f"     ⚠ 退出期崩溃(退出码 {rc}) —— {n} 帧完整, 本集**有效**")
             if a > 1:
                 print(f"     (第 {a} 次启动成功)")
-            return ep, a, rc
+            return ep, a, rc, len(eps)
         if n == 0:
             if a < MAX_LAUNCH_ATTEMPTS:
                 print(f"     ⚠ 启动期崩溃(退出码 {rc}, 0 帧) —— 3s 后第 {a+1} 次")
                 time.sleep(3)
                 continue
             break
-        aside = ep.with_name(f"{tag}_ep0.partial_{int(time.time())}.json")
+        aside = ep.with_name(f"{ep.stem}.partial_{int(time.time())}.json")
         ep.rename(aside)
         raise PartialEpisode(f"{tag}: 只录到 {n} 帧(<{MIN_FRAMES}), 退出码 {rc} "
                              f"⇒ A 类, **整个 block 作废重跑**; 残件 {aside.name}")
@@ -185,7 +207,13 @@ def one_block(st: State, blk: dict, cand: dict, dry: bool) -> None:
                 tf = None if arm == "A" else theta_path(cand)
                 print(f"  ── {arm} 臂 ({'裸 ACT' if tf is None else cand['corner']})")
                 t0 = time.time()
-                log, att, rc = run_episode(tag, tf, dry)
+                log, att, rc, n_eps = run_episode(tag, tf, dry)
+                if n_eps > 1:
+                    # **暂行规则(待批准)**: 一次启动录出多集 ⇒ 操作者重录过。
+                    # 判 A 类, 整 block 作废重跑。理由: 重录是**按结果选择**的通道,
+                    # 若两臂重录次数不同就会直接偏倚 r。作废只花机时, 绝不偏倚。
+                    raise BlockVoid(f"{arm} 臂一次启动录出 {n_eps} 集(操作者重录) "
+                                    f"⇒ 判 A 类【暂行规则, 见 docstring】")
                 ran += 1
                 d = loss_of(log, dry, dry_theta=[0.0, 0.0, 0.0] if tf is None
                             else [cand["a_prox"] / 2, cand["a_wrist"] / 2,
@@ -198,6 +226,7 @@ def one_block(st: State, blk: dict, cand: dict, dry: bool) -> None:
                             "stale": d["stale"], "nan": d["nan"],
                             "launch_attempts": att, "exit_code": rc,
                             "wall_s": round(time.time() - t0, 1),
+                            "n_eps_in_launch": n_eps, "ep_file": log.name,
                             "b_class": bool([x for x in bad if "B 类" in x]),
                             "b_class_detail": [x for x in bad if "B 类" in x],
                             "init_state": init_state(log, dry).tolist()}
@@ -230,8 +259,46 @@ def one_block(st: State, blk: dict, cand: dict, dry: bool) -> None:
         return
 
 
+def sweep_orphans(st: State, sc: dict) -> None:
+    """把上次崩溃留在盘上的、属于**下一个未提交 block** 的 episode 文件正式作废。
+
+    编排器可能在任意时刻被本机的偶发 SIGSEGV 杀掉（⑥-5b 同类）。此前的行为是：
+    重跑时用**同一个 tag**、把上次的日志改名成 `.stale` —— 于是那次尝试
+    既没进 `voided`、也没计入浪费机时，而且下一次仍用 nv=0 的 tag。
+    更糟的是，跨崩溃把两臂配对会违反 matched（中间物体已被重新摆放）。
+
+    实测代价：block 10 的两种配法给出 r = −11.4% 与 +13.5%（相差 25pp，
+    落在分布两端）—— 配对选择直接决定答案，故只能整块作废。
+    """
+    nxt = next((b for b in sc["blocks"] if not st.done(b["block"])), None)
+    if nxt is None:
+        return
+    b = nxt["block"]
+    nv = st.voids(b)
+    found = []
+    for arm in "AB":
+        tag = f"B{b:02d}{arm}" + (f"_v{nv}" if nv else "")
+        found += [f for _, f in episode_files(tag)]
+    if not found:
+        return
+    ts = int(time.time())
+    print(f"⚠ 发现 block {b} 的孤儿 episode {len(found)} 个（上次运行被中断）")
+    for f in found:
+        f.rename(f.with_name(f"{f.stem}.orphan_{ts}.json"))
+        print(f"    保留为 {f.stem}.orphan_{ts}.json")
+    st.d["voided"].append({"block": b, "session": nxt["session"], "attempt": nv,
+                           "reason": f"编排器中断留下 {len(found)} 个孤儿 episode "
+                                     f"⇒ A 类, 整 block 作废（跨中断配对会违反 matched）",
+                           "episodes_ran": len(found)})
+    st.d["episodes_wasted"] += len(found)
+    st.save()
+    print(f"    ⇒ block {b} 第 {nv+1} 次尝试作废；下次用 _v{nv+1} 标签重跑\n")
+
+
 def collect(st: State, dry: bool, session: int | None, nb: int | None) -> None:
     sc = sched()
+    if not dry:
+        sweep_orphans(st, sc)
     todo = [b for b in sc["blocks"] if not st.done(b["block"])
             and (session is None or b["session"] == session)]
     if nb:
