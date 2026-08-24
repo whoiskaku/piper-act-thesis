@@ -45,32 +45,49 @@ def load():
                          "L": h["L_plus"] if side == "p" else h["L_minus"],
                          "x": h["x_plus"] if side == "p" else h["x_minus"],
                          "base": False})
-    rows.sort(key=lambda r: (r["rd"], r["o"]))
-    return s, rows
+    # **実際の時刻**で並べ、最大時間間隔をセッション境界とする。
+    # 5 日超の中断は L に**階段状**の変化を生む ⇒ 線形 t では吸収できず、
+    # 放置すると θ 係数がその段差を吸ってしまう（偽信号）。
+    for r in rows:
+        f = OUT / f"{r['tag']}_ep0.json"
+        r["mt"] = f.stat().st_mtime if f.exists() else None
+    rows = [r for r in rows if r["mt"] is not None]
+    rows.sort(key=lambda r: r["mt"])
+    mt = np.array([r["mt"] for r in rows])
+    k = int(np.argmax(np.diff(mt)))
+    for i, r in enumerate(rows):
+        r["sess"] = 0 if i <= k else 1
+    return s, rows, float(np.diff(mt)[k])
 
 
 def fit(rows):
-    """log L ~ 1 + t + x1 + x2 + x3（補正エピソードのみ）。t はドリフト共変量。"""
+    """log L ~ 1 + t + **session** + x1 + x2 + x3（補正エピソードのみ）。
+
+    `session` ダミーは必須。5 日超の中断による**階段状**の水準変化を線形 t は
+    吸収できず、抜くと θ 係数がその段差を吸って偽の有意性が出る（実測: これを
+    抜くと x1 が t=+2.10、入れると +1.52 に落ちる）。
+    """
     t = np.arange(len(rows), dtype=float)
     y = np.log(np.array([r["L"] for r in rows]))
     isc = np.array([not r["base"] for r in rows])
+    sess = np.array([float(r["sess"]) for r in rows])
     X = np.array([r["x"] if r["x"] is not None else [0., 0., 0.] for r in rows])
-    A = np.column_stack([np.ones(int(isc.sum())), t[isc], X[isc]])
+    A = np.column_stack([np.ones(int(isc.sum())), t[isc], sess[isc], X[isc]])
     beta, *_ = np.linalg.lstsq(A, y[isc], rcond=None)
     res = y[isc] - A @ beta
-    cov = np.sum(res ** 2) / (len(y[isc]) - 4) * np.linalg.inv(A.T @ A)
-    return t, y, isc, X, beta, cov, res
+    cov = np.sum(res ** 2) / (len(y[isc]) - A.shape[1]) * np.linalg.inv(A.T @ A)
+    return t, y, isc, X, beta, cov, res, sess
 
 
 def effect(beta, cov, xa, xb):
     """x=xa → x=xb に動かしたときの Δlog L と SE（θ 項のみ）。"""
-    c = np.concatenate([[0., 0.], np.asarray(xb) - np.asarray(xa)])
+    c = np.concatenate([[0., 0., 0.], np.asarray(xb) - np.asarray(xa)])   # 1, t, session
     return float(c @ beta), float(np.sqrt(c @ cov @ c))
 
 
 def main() -> int:
-    s, rows = load()
-    t, y, isc, X, beta, cov, res = fit(rows)
+    s, rows, brk = load()
+    t, y, isc, X, beta, cov, res, sess = fit(rows)
     L = np.array([r["L"] for r in rows])
     nb, nc = int((~isc).sum()), int(isc.sum())
     done = s["round"]
@@ -81,7 +98,7 @@ def main() -> int:
         f"実機 {s['episodes_used']}+{s['episodes_wasted']} = "
         f"{s['episodes_used']+s['episodes_wasted']}/100 エピソード）\n"
         f"gap = real[t+3] − ideal_cal[t], 0.5–9 Hz, ジャイロ3軸;  L = mean‖·‖²  "
-        f"— G も H も未使用", fontsize=11)
+        f"— G も H も未使用;  回帰は**会話ダミー込み**（{brk/86400:.1f} 日の中断）", fontsize=11)
 
     # ── ① 時系列 ─────────────────────────────────────────────
     a = ax[0, 0]
@@ -98,8 +115,13 @@ def main() -> int:
 
     # ── ② ドリフト除去後の分布 ────────────────────────────────
     a = ax[0, 1]
-    rc = y[isc] - (sl * t[isc] + ic)
-    rb = y[~isc] - (sl * t[~isc] + ic)
+    # 会話ごとに基線水準を引く（段差を残すと分布が二峰になる）
+    off = np.zeros(len(rows))
+    for g in (0, 1):
+        mb = (~isc) & (sess == g)
+        off[sess == g] = np.log(L[mb]).mean() if mb.sum() else np.log(L[~isc]).mean()
+    rc = y[isc] - off[isc]
+    rb = y[~isc] - off[~isc]
     allr = np.concatenate([rc, rb])
     lim = float(np.percentile(np.abs(allr), 96)) * 1.15
     bins = np.linspace(-lim, lim, 24)
@@ -118,8 +140,8 @@ def main() -> int:
               label=f"補正の平均 {rc.mean()*100:+.2f}%")
     a.axvspan((rc.mean() - 1.96 * sem) * 100, (rc.mean() + 1.96 * sem) * 100,
               color="#3b7dd8", alpha=.15, label="95% CI")
-    a.set_xlabel("ドリフト線からの残差  Δlog L (%)"); a.set_ylabel("エピソード数")
-    a.set_title(f"② ドリフト除去後 — p={tt.pvalue:.3f}（有意差なし）", fontsize=10)
+    a.set_xlabel("会話内基線からの残差  Δlog L (%)"); a.set_ylabel("エピソード数")
+    a.set_title(f"② 会話内基線を除去後 — 補正 {rc.mean()*100:+.1f}%, p={tt.pvalue:.3f}", fontsize=10)
     a.legend(fontsize=8); a.grid(alpha=.3)
 
     # ── ③ θ の軌跡 ───────────────────────────────────────────
@@ -154,7 +176,7 @@ def main() -> int:
     g = np.array([np.mean([h["g"][j] for h in s["history"]
                            if not (j == 2 and h["round"] < 10)]) for j in range(3)])
     x40 = np.clip(xc - rem * g, -1, 1)
-    xopt = np.clip(-np.sign(beta[2:5]), -1, 1)
+    xopt = np.clip(-np.sign(beta[3:6]), -1, 1)
     items = [(f"現在 ({done} ラウンド)", xc), (f"{N_ROUNDS} ラウンド投影", x40),
              ("界内最適（線形外挿）", xopt)]
     for i, (nm, xx) in enumerate(items):
@@ -185,7 +207,10 @@ def main() -> int:
     print(f"\n数値（図と同一）:")
     print(f"  基線 n={nb} 中央値 {np.median(L[~isc]):.5f} | "
           f"補正 n={nc} 中央値 {np.median(L[isc]):.5f}")
-    print(f"  基線ドリフト {sl*100:+.2f}%/ep")
+    print(f"  基線ドリフト {sl*100:+.2f}%/ep;  会話境界 {brk/86400:.2f} 日")
+    for nm, i in (("t", 1), ("session", 2), ("x1", 3), ("x2", 4), ("x3", 5)):
+        se = np.sqrt(cov[i, i])
+        print(f"    {nm:<8} {beta[i]:+.4f} ± {se:.4f}  t={beta[i]/se:+.2f}")
     print(f"  ドリフト除去後の補正残差 {rc.mean()*100:+.2f}% ± {sem*100:.2f}% (SEM), p={tt.pvalue:.3f}")
     for nm, xx in items:
         d, sd = effect(beta, cov, x0, xx)
