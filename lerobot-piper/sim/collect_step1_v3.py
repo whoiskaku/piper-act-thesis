@@ -247,17 +247,26 @@ def analyze(st: State) -> int:
     slot = np.array([(r["slot"] - 10.5) / 9.5 for r in done], float)
     Dm = np.array([[1.0 if r["corner"] == c else 0.0 for c in CORNERS] for r in done])
     keep = [j for j in range(8) if Dm[:, j].sum() > 0]
-    A = np.column_stack([np.ones(len(y)), sess, slot, Dm[:, keep]])
+    # 中期分析(只有一个会话)时 sess 是常数 ⇒ 与截距共线, inv(AᵀA) 会炸。
+    # **主分析(40 集, 两会话)不受影响**; 这里只是让中期也能看。
+    cov_cols = [("session", sess)] if len({r["session"] for r in done}) > 1 else []
+    if not cov_cols:
+        print("⚠ 只有一个会话 ⇒ 已剔除 session 项（中期分析；主分析需两会话）\n")
+    cov_cols.append(("slot", slot))
+    A = np.column_stack([np.ones(len(y))] + [c for _, c in cov_cols] + [Dm[:, keep]])
+    n_cov = len(cov_cols)
     beta, *_ = np.linalg.lstsq(A, y, rcond=None)
     dof = len(y) - A.shape[1]
     res = y - A @ beta
     s2 = float(res @ res) / dof
     C = s2 * np.linalg.inv(A.T @ A)
-    eff = {CORNERS[j]: (beta[3 + i], float(np.sqrt(C[3 + i, 3 + i])))
+    off = 1 + n_cov                               # 截距 + 协变量
+    eff = {CORNERS[j]: (beta[off + i], float(np.sqrt(C[off + i, off + i])))
            for i, j in enumerate(keep)}
     dq = {r["corner"] for r in done if r.get("b_class")}
 
-    print(f"{'═'*70}\n§4.1 筛选 —— 顶点 vs 裸 ACT（含 session 与 slot 调整, dof={dof}）\n")
+    print(f"{'═'*70}\n§4.1 筛选 —— 顶点 vs 裸 ACT"
+          f"（调整项: {', '.join(nm for nm, _ in cov_cols)}; dof={dof}; n={len(y)}）\n")
     print(f"{'顶点':<8}{'n':>3}{'ΔlogL':>9}{'SE':>7}{'L 变化':>10}{'t':>7}  资格")
     for c in CORNERS:
         if c not in eff:
@@ -268,7 +277,7 @@ def analyze(st: State) -> int:
               f"{b/se:>+7.2f}  {'✗ B类失格' if c in dq else '✓'}")
 
     # ── Dunnett 单侧临界值（MC, 用实际拟合协方差）──
-    idx = [3 + i for i in range(len(keep))]
+    idx = [off + i for i in range(len(keep))]
     Cs = C[np.ix_(idx, idx)]
     se_v = np.sqrt(np.diag(Cs))
     rng = np.random.default_rng(20260824)
@@ -311,6 +320,69 @@ def analyze(st: State) -> int:
     return 0
 
 
+def sensitivity(st: State) -> int:
+    """留一法敏感性分析 —— 主分析**不变**, 这是并列报告的附加信息。
+
+    预注册没有离群剔除条款, 所以任何一集都**不会**被剔出主分析。此处只回答
+    「结论有多依赖单独某一集」。对照臂只有 8 集(中期 4 集), 单点杠杆很大,
+    所以这个检查是必要的, 而不是可选的。
+    """
+    done = st.d["done"]
+    base = _corner_effects(done)
+    if base is None:
+        print("集数太少。")
+        return 1
+    gm = float(np.mean([v[0] for v in base.values()]))
+    print(f"{'═'*70}\n留一法敏感性 —— 逐集剔除后「顶点均值 vs 对照」的变化")
+    print(f"主分析（协议，全部在册）: {(np.exp(gm)-1)*100:+.1f}%\n")
+    print(f"{'剔除':<22}{'顶点均值':>10}{'变化':>10}")
+    rows = []
+    for i, r in enumerate(done):
+        e = _corner_effects([x for j, x in enumerate(done) if j != i])
+        if e is None or len(e) < len(base):
+            continue                              # 剔掉后某顶点没数据了, 跳过
+        g = float(np.mean([v[0] for v in e.values()]))
+        rows.append((abs(g - gm), r, g))
+    rows.sort(reverse=True)
+    for dv, r, g in rows[:5]:
+        print(f"{(r['corner'] or '裸')+' slot'+str(r['slot']):<22}"
+              f"{(np.exp(g)-1)*100:>+9.1f}%{(np.exp(g)-np.exp(gm))*100:>+9.1f}pp")
+    print(f"  …（共 {len(rows)} 集，只列影响最大的 5 集）")
+    dv, r, g = rows[0]
+    share = 1 - (1 - np.exp(g)) / (1 - np.exp(gm)) if abs(1 - np.exp(gm)) > 1e-9 else 0.0
+    print(f"\n最有影响的一集: {r['corner'] or '裸 ACT'} slot {r['slot']} "
+          f"(L={r['L']:.5f}, {'对照臂' if r['arm']=='bare' else '顶点臂'})")
+    print(f"  剔除它 ⇒ 顶点均值 {(np.exp(gm)-1)*100:+.1f}% → {(np.exp(g)-1)*100:+.1f}%"
+          f"   ⇒ 表观效应的 **{share*100:.0f}%** 来自这一集")
+    if r["arm"] == "bare" and share > 0.5:
+        print("  ⚠ 它在**对照臂**上 —— 对照被抬高会让**所有**顶点一起显得偏好。")
+        print("    对照臂集数: 中期 4 集 ⇒ 单点杠杆 1/4；全 40 集为 8 集 ⇒ 杠杆减半。")
+    return 0
+
+
+def _corner_effects(rows: list[dict]) -> dict | None:
+    """顶点 vs 裸 ACT 的效应（含 slot 调整, 两会话时含 session）。"""
+    if len(rows) < 12:
+        return None
+    y = np.array([r["log_L"] for r in rows])
+    cols = [np.ones(len(y))]
+    if len({r["session"] for r in rows}) > 1:
+        cols.append(np.array([r["session"] - 1.5 for r in rows], float))
+    cols.append(np.array([(r["slot"] - 10.5) / 9.5 for r in rows], float))
+    Dm = np.array([[1.0 if r["corner"] == c else 0.0 for c in CORNERS] for r in rows])
+    keep = [j for j in range(8) if Dm[:, j].sum() > 0]
+    A = np.column_stack(cols + [Dm[:, keep]])
+    if np.linalg.matrix_rank(A) < A.shape[1] or len(y) <= A.shape[1]:
+        return None
+    b, *_ = np.linalg.lstsq(A, y, rcond=None)
+    res = y - A @ b
+    s2 = float(res @ res) / (len(y) - A.shape[1])
+    C = s2 * np.linalg.inv(A.T @ A)
+    off = len(cols)
+    return {CORNERS[j]: (b[off + i], float(np.sqrt(C[off + i, off + i])))
+            for i, j in enumerate(keep)}
+
+
 def _p1(t: float, dof: int) -> float:
     from scipy import stats
     return float(stats.t.cdf(t, dof))            # 单侧(改善方向 = t 为负)
@@ -325,6 +397,8 @@ def main() -> int:
     ap.add_argument("--slots", type=int, help="只跑接下来 N 集")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--analyze", action="store_true")
+    ap.add_argument("--sensitivity", action="store_true",
+                    help="留一法：结论有多依赖单独某一集（主分析不变）")
     ap.add_argument("--reset", action="store_true", help="清空状态(需二次确认)")
     a = ap.parse_args()
     sched = load_schedule()
@@ -351,6 +425,8 @@ def main() -> int:
     if a.status:
         status(st, sched)
         return 0
+    if a.sensitivity:
+        return sensitivity(st)
     if a.analyze:
         return analyze(st)
     collect(st, sched, a.dry_run, a.session, a.slots)
