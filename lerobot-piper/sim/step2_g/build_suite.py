@@ -226,16 +226,37 @@ def main() -> int:
 
     if a.save:
         OUT.mkdir(parents=True, exist_ok=True)
+        # **manifest 先写**: npz 先写会在 manifest 失败时留下「90 个 npz + 无
+        # manifest」的半成品 —— 文件都在, 看起来像成功了。实测这么坏过一次
+        # (meta 里的字符串 "envelope" 被 float() 硬转而抛错)。
+        man = {s.name: {"kind": s.kind, "target": list(s.target), "sha": s.sha,
+                        "frames": len(s.cmd),
+                        # meta 值可能是字符串(如 envelope 的出处), **不要硬转 float**
+                        **{k: (float(v) if isinstance(v, (int, float)) else str(v))
+                           for k, v in s.meta.items()}}
+               for s in seqs}
+        tmp = OUT / "manifest.json.tmp"
+        tmp.write_text(json.dumps(man, ensure_ascii=False, indent=1))
         for s in seqs:
             np.savez(OUT / f"{s.name}.npz", cmd7=s.cmd.astype(np.float32),
                      da=np.zeros((len(s.cmd), 6), np.float32),
                      tag=s.name, kind=s.kind, target=np.array(s.target),
                      pose=s.pose_distal, sha=s.sha)
-        (OUT / "manifest.json").write_text(json.dumps(
-            {s.name: {"kind": s.kind, "target": list(s.target), "sha": s.sha,
-                      "frames": len(s.cmd), **{k: float(v) for k, v in s.meta.items()}}
-             for s in seqs}, ensure_ascii=False, indent=1))
-        print(f"\n→ {OUT.relative_to(ROOT)}/  ({len(seqs)} 个 npz + manifest.json)")
+        tmp.replace(OUT / "manifest.json")          # 全部 npz 落地后才生效
+        # 自验: 每条 manifest 都要有对应 npz, 且 npz 里的 sha 与 manifest 一致
+        bad = []
+        for nm, v in man.items():
+            f = OUT / f"{nm}.npz"
+            if not f.exists():
+                bad.append(f"{nm}: npz 缺失")
+                continue
+            z = np.load(f, allow_pickle=True)
+            if str(z["sha"]) != v["sha"]:
+                bad.append(f"{nm}: npz sha {z['sha']} ≠ manifest {v['sha']}")
+        if bad:
+            raise SystemExit(f"落盘自验失败:\n  " + "\n  ".join(bad))
+        print(f"\n→ {OUT.relative_to(ROOT)}/  ({len(seqs)} 个 npz + manifest.json)"
+              f"   自验 ✅ 逐条 sha 一致")
 
     if not a.analyze:
         return 0
