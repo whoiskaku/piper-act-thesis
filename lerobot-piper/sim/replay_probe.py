@@ -119,7 +119,7 @@ def safety_checks(cmd7, da, model_path=None):
 
 
 def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
-        outdir=None, robot_type="piper"):
+        outdir=None, robot_type="piper", settle_probe=0.0):
     cmd7, da, z = load_seq(seqfile, b2)
     import re
     is_bare = bool(re.fullmatch(r"A\d+", arm))      # A1/A2/A3/A4… 全是裸复放
@@ -177,6 +177,11 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     #          (b) 偏差 ≤ 该关节"指令超出可达范围的量" + 1° 的裕度。
     # 六臂之间的一致性由门禁③(state_init 离散 <0.5°)把关, 那才是真正要保证的。
     PREMOVE_S, PRESETTLE_S = 3.0, 1.5
+    if settle_probe > 0:
+        # **观测模式**: 只做预移动 + 长时间静置采样, 然后退出, **不跑激励**。
+        # 用来回答「j4 的粘滑会不会自己停」—— 这是实测题, 不是判断题。
+        # 协议默认值(1.5s)与安全门(0.5°/s)都**不改动**。
+        PRESETTLE_S = float(settle_probe)
     PRE_VEL_TOL = np.radians(0.5)                  # °/s
     q_now = (obs0["observation.state"].numpy()[:6] * np.pi / 180 / 1000).astype(np.float32)
     q_tgt = cmd7[0, :6].astype(np.float32)
@@ -196,11 +201,55 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         settle.append(robot.capture_observation()["observation.state"].numpy()[:6]
                       * np.pi / 180 / 1000)
         time.sleep(DT)
+    if settle_probe > 0:
+        s = np.degrees(np.asarray(settle, float))
+        v = np.abs(np.diff(s, axis=0) * FPS)
+        jump = np.where(v.max(1) > np.degrees(PRE_VEL_TOL))[0]
+        print(f"\n[静置观测 {PRESETTLE_S:.0f}s] {len(s)} 个采样 @ {FPS:.0f} Hz")
+        print(f"  逐关节位移范围(度): {np.round(s.max(0) - s.min(0), 4)}")
+        print(f"  逐关节峰速(度/s)  : {np.round(v.max(0), 3)}")
+        print(f"  超阈事件 {len(jump)} 次（阈 {np.degrees(PRE_VEL_TOL):.1f}°/s）")
+        for k in jump:
+            j = int(v[k].argmax())
+            print(f"    t={k/FPS:5.2f}s  j{j+1}  {v[k, j]:.3f}°/s "
+                  f"(位移 {v[k, j]/FPS:+.4f}°)")
+        if len(jump) >= 2:
+            half = len(s) // 2
+            e1 = int((v[:half - 1].max(1) > np.degrees(PRE_VEL_TOL)).sum())
+            e2 = int((v[half:].max(1) > np.degrees(PRE_VEL_TOL)).sum())
+            print(f"  **前半段 {e1} 次 vs 后半段 {e2} 次** ⇒ "
+                  f"{'在衰减(疑似应力释放瞬态)' if e2 < e1 else '未衰减(持续现象)'}")
+        _d = (outdir or PROBE) / f"settle_probe_{tag}{arm}_{int(time.time())}.json"
+        _d.parent.mkdir(parents=True, exist_ok=True)
+        _d.write_text(json.dumps({
+            "mode": "settle_probe", "arm": arm, "seqfile": str(seqfile),
+            "settle_s": PRESETTLE_S, "fps": FPS,
+            "settle_deg": s.tolist(), "vel_deg_s": v.tolist(),
+            "jump_idx": jump.tolist(),
+        }, ensure_ascii=False, indent=1))
+        print(f"  ⤷ {_d.name}")
+        print("  （观测模式：**未跑激励序列**，安全门与协议默认值均未改动）")
+        robot.disconnect()
+        return 0
+
     obs0 = robot.capture_observation()                    # 起始状态改在**预移动后**取
     q_pre = obs0["observation.state"].numpy()[:6] * np.pi / 180 / 1000
     # (a) 稳定: 末段 0.5s 的关节速度
     tail = np.asarray(settle[-int(0.5 * FPS):], float)
-    vmax = float(np.abs(np.diff(tail, axis=0) * FPS).max()) if len(tail) > 1 else 0.0
+    vel = np.abs(np.diff(tail, axis=0) * FPS) if len(tail) > 1 else np.zeros((1, 6))
+    vmax = float(vel.max())
+    # **单次毛刺 vs 持续振荡**必须分得开: 前者 max≫median、只占一两个采样;
+    # 后者两者接近。此前只报一个 max, 分不出来也留不下证据(断言在落盘之前触发)。
+    v_med = float(np.median(vel))
+    # `vel` 形状是 (采样, 关节) —— 此前把返回值赋成 (关节, 采样), 报错信息里
+    # 的关节号是错的（实测把 j4 报成了 j2）。
+    k_v, j_v = np.unravel_index(int(vel.argmax()), vel.shape)
+    # 判「毛刺 vs 持续」必须看**整个稳定段**, 不能只看末段窗口: 实测 P03 全程
+    # 有 3 次离散跳变, 只有 1 次落在末段窗口内 ⇒ 按窗口计数会误判成「单次毛刺、
+    # 可重试」, 而它其实是可复现的粘滑/齿隙释放。
+    vel_all = np.abs(np.diff(np.asarray(settle, float), axis=0) * FPS)
+    n_over_all = int((vel_all > PRE_VEL_TOL).sum())
+    n_over = int((vel > PRE_VEL_TOL).sum())
     # (b) 偏差 ≤ 指令超出可达范围的量 + 1°
     from make_probe_b2 import reach_limits
     klo, khi = reach_limits()
@@ -210,6 +259,29 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     j_bad = int(np.argmax(dev - tol))
     print(f"  预移动后: 末段峰速 {np.degrees(vmax):.3f}°/s (阈 {np.degrees(PRE_VEL_TOL):.1f})"
           f"  {'✓稳定' if vmax <= PRE_VEL_TOL else '✗未稳定'}")
+    print(f"    峰值出现在 **j{j_v+1}** 末段第 {k_v+1}/{len(vel)} 个采样; "
+          f"中位速度 {np.degrees(v_med):.3f}°/s; 超阈采样 末段 {n_over}/{vel.size}, "
+          f"**全稳定段 {n_over_all}/{vel_all.size}**")
+    print(f"    逐关节峰速 {np.round(np.degrees(vel.max(0)), 3)}°/s")
+    if vmax > PRE_VEL_TOL:
+        _d = (outdir or PROBE) / f"settle_fail_{tag}{arm}_{int(time.time())}.json"
+        _d.parent.mkdir(parents=True, exist_ok=True)
+        _d.write_text(json.dumps({
+            "arm": arm, "seqfile": str(seqfile),
+            "settle_deg": np.degrees(np.asarray(settle, float)).tolist(),
+            "tail_vel_deg_s": np.degrees(vel).tolist(),
+            "vmax_deg_s": float(np.degrees(vmax)),
+            "v_median_deg_s": float(np.degrees(v_med)),
+            "peak_sample_in_tail": int(k_v) + 1,
+            "n_over_tail": n_over, "n_samples_tail": int(vel.size),
+            "n_over_full_settle": n_over_all, "n_samples_full": int(vel_all.size),
+            "peak_joint_1based": int(j_v) + 1,
+            "verdict": ("疑似单次毛刺 —— 可重试一次"
+                        if n_over_all <= 1 and vmax > 3 * max(v_med, 1e-9)
+                        else f"**全稳定段有 {n_over_all} 次超阈 ⇒ 可复现现象, "
+                             f"不是毛刺; 不要靠重试绕过**"),
+        }, ensure_ascii=False, indent=1))
+        print(f"    ⤷ 稳定段轨迹已落盘: {_d.name}（断言在落盘前触发会丢证据，故先存）")
     print(f"    逐关节 |偏差| {np.round(np.degrees(dev), 3)}°  容差 {np.round(np.degrees(tol), 3)}°"
           f"  (含指令超出可达范围 {np.round(np.degrees(unreach), 3)}°)")
     assert vmax <= PRE_VEL_TOL, f"预移动后仍在动 ({np.degrees(vmax):.3f}°/s) —— 停机排查"
@@ -295,11 +367,14 @@ if __name__ == "__main__":
                     help="机器人类型, 传给 make_robot（此前 docstring 写了它但 CLI 没定义）")
     ap.add_argument("--seqfile", help="**显式**序列 npz 路径; 给了就不再从 --ep/--b2 推导")
     ap.add_argument("--outdir", help="落盘目录; 默认 outputs/probe（--b2 时 outputs/probe_b2）")
+    ap.add_argument("--settle-probe", type=float, default=0.0, metavar="SEC",
+                    help="**观测模式**: 预移动后静置 SEC 秒并记录, 然后退出, "
+                         "不跑激励序列。用于测「粘滑会不会自己停」。")
     a = ap.parse_args()
     if a.seqfile:                                  # 显式路径优先, 直接跑
         raise SystemExit(run(a.arm, a.dry_run, seqfile=a.seqfile, tag="",
                              b2=a.b2, outdir=Path(a.outdir) if a.outdir else None,
-                             robot_type=a.robot))
+                             robot_type=a.robot, settle_probe=a.settle_probe))
     if a.b2:
         import re as _re
         cfg = ("j2_" + a.amp + "_p" if _re.fullmatch(r"A\d+", a.arm)
