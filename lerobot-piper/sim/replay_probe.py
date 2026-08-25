@@ -224,7 +224,26 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     # 修订: 改测**位置带**(运动是否有界在可接受范围内), 不对 j4/j6 做隐藏豁免。
     PREMOVE_S, PRESETTLE_S = 3.0, 5.0              # 稳定时间 1.5 → 5.0 s
     BAND_WINDOW_S = 2.0                            # 判据只看**最后 2 s**
-    BAND_TOL = np.radians(0.5)                     # 每个关节 R_j = max−min ≤ 0.5°
+    # ── 位置带阈值（2026-08-26 修订并冻结；又一次**失败之后**的门槛修订）──────
+    # 起因: 主套件第 28 条 S_j2_p0_r5_f0.35 被 0.5° 拦下 (j4 R=0.554°)。
+    # 证据(27 条已收 + 该次失败 + 同位形 20s 静置探针):
+    #   · **j1/j2/j3 在 27 条里全部精确 0.000°** ⇒ 现象纯在腕部, 与近端无关
+    #   · **有界**: 20s 探针累积带宽 2s 内饱和, 之后 18s 增量全为 0.0000
+    #   · **非位形决定**: 同一位形三次给出 0.119 / 0.241 / 0.554°
+    #   · 与会话时长无关(r = −0.12/−0.24/+0.08); 与腕部离桌高度无关
+    #     (r = +0.367 且**方向反**: 最大的两个带宽出现在离桌 694 mm 处)
+    #     ⇒ 排除「跑久了变热」与「腕上设备撞桌」两种解释
+    #   · 机制: 量子化步长 ~0.107°, 偶发 2 倍双跳, 速率 1.15–3.40 次/s
+    #   · 另: 打开碰撞用真实 mesh 跑完 90 条全时间线, **零接触**(臂/桌/地)
+    # 即门禁拦下的是已定性的**腕部粘滑极限环**, 不是「预移动余振没停」。
+    # 预移动峰速 19.9°/s ⇒ 真没停会是**度**级带宽, 不是 0.5°。
+    # 28 次尝试的腕部上尾: 0.554(失败) / 0.465 / 0.459 / 0.415 / 0.368 ——
+    # 0.5° 落在这个分布**中间**, 已有两条通过贴到阈值的 93%。
+    # 修订(用户 2026-08-26 决定): **近端保持 0.5°, 腕部单独定 0.8°**。
+    #   近端实测恒为 0.000 ⇒ 任何非零都有意义, **不放宽**;
+    #   腕部 0.8° 较实测最大 0.554° 留 44% 余量, 仍远低于真正未稳定的度级带宽。
+    # 判据仍是 max−min, 与已收 27 条**可比**; 逐关节带宽继续完整报告与落盘。
+    BAND_TOL = np.radians(np.array([0.5, 0.5, 0.5, 0.8, 0.8, 0.8]))
     if settle_probe > 0:
         # **观测模式**: 只做预移动 + 长时间静置采样, 然后退出, **不跑激励**。
         # 用来回答「j4 的粘滑会不会自己停」—— 这是实测题, 不是判断题。
@@ -281,7 +300,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         print(f"  **累积**位置带 j{jw+1}(度): {np.round(cum[:, jw], 4)}"
               f"  ⇒ {'趋于上界(有界)' if cum[-1, jw] < 1.15 * cum[nseg//2, jw] else '**仍在增长**'}")
         print(f"  全程位置带(度): {np.round(s.max(0) - s.min(0), 4)}"
-              f"   门禁阈 {np.degrees(BAND_TOL):.1f}°")
+              f"   门禁阈 {np.round(np.degrees(BAND_TOL), 1)}°")
         _d = (outdir or PROBE) / f"settle_probe_{tag}{arm}_{int(time.time())}.json"
         _d.parent.mkdir(parents=True, exist_ok=True)
         _d.write_text(json.dumps({
@@ -290,7 +309,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             "settle_deg": s.tolist(), "vel_deg_s": v.tolist(),
             "jump_idx": jump.tolist(),
             "band_full_deg": (s.max(0) - s.min(0)).tolist(),
-            "band_tol_deg": float(np.degrees(BAND_TOL)),
+            "band_tol_deg": np.degrees(BAND_TOL).tolist(),
         }, ensure_ascii=False, indent=1))
         print(f"  ⤷ {_d.name}")
         print("  （观测模式：**未跑激励序列**，安全门与协议默认值均未改动）")
@@ -349,7 +368,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     dev = np.abs(q_pre - q_tgt)
     j_bad = int(np.argmax(dev - tol))
     print(f"  预移动后 [判据: 最后 {BAND_WINDOW_S:.0f}s 位置带 R_j ≤ "
-          f"{np.degrees(BAND_TOL):.1f}°]")
+          f"{np.round(np.degrees(BAND_TOL), 1)}° (近端/腕部)]")
     print(f"    R_j = {np.round(np.degrees(band), 4)}°"
           f"   {'✓ 全部在带内' if not band_bad.any() else '✗ 超限 j' + str(int(band_bad.argmax()) + 1)}")
     print(f"    —— 以下仅报告, **不决定通过/失败** ——")
@@ -383,7 +402,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             "n_over_full_settle": n_over_all, "n_samples_full": int(vel_all.size),
             "peak_joint_1based": int(j_v) + 1,
             "band_deg": np.degrees(band).tolist(),
-            "band_tol_deg": float(np.degrees(BAND_TOL)),
+            "band_tol_deg": np.degrees(BAND_TOL).tolist(),
             "band_window_s": BAND_WINDOW_S, "settle_s": PRESETTLE_S,
             "gate": "position-band (2026-08-24 修订冻结)",
             "passed": bool(not band_bad.any()),
@@ -397,9 +416,13 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     print(f"    逐关节 |偏差| {np.round(np.degrees(dev), 3)}°  容差 {np.round(np.degrees(tol), 3)}°"
           + (f"  (含指令超出可达范围 {np.round(np.degrees(unreach), 3)}°)"
              if unreach.max() > 0 else ""))
+    # 逐关节阈值下, 「第一个超标的关节」与「带宽最大的关节」可能**不是同一个**
+    # (例: j3 0.6°>0.5 超标, j4 0.7°<0.8 合规, 带宽最大的却是 j4)。
+    # 必须报真正超标那一个及**它自己的**阈值, 否则错误信息张冠李戴。
+    _jb = int(np.argmax(np.where(band_bad, band - BAND_TOL, -np.inf)))
     assert not band_bad.any(), (
-        f"稳定段位置带超限: j{int(band_bad.argmax())+1} R={np.degrees(band.max()):.3f}° "
-        f"> {np.degrees(BAND_TOL):.1f}° —— **立即停机, 不自动重试**")
+        f"稳定段位置带超限: j{_jb+1} R={np.degrees(band[_jb]):.3f}° "
+        f"> {np.degrees(BAND_TOL[_jb]):.1f}° —— **立即停机, 不自动重试**")
     assert (dev <= tol).all(), (
         f"预移动未到位: j{j_bad+1} 偏差 {np.degrees(dev[j_bad]):.3f}° > 容差 "
         f"{np.degrees(tol[j_bad]):.3f}° —— 停机排查, 六臂起始位姿必须一致")
