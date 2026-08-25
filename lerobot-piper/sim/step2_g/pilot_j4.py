@@ -90,7 +90,9 @@ def ladder(m) -> list[Seq]:
             # 但仍要带上 proven_amp_deg 以便与其余条目同表打印。
             cmd = place(m, cmd, J)
             # 修订项的两次重复按用户规格命名为 P05b / P06b（不是 _r1/_r2）
-            for r, nm in enumerate(("P05b_step_rise10", "P06b_step_rise10")):
+            _names = {"P05b": ("P05b_step_rise10", "P06b_step_rise10"),
+                      "P07c": ("P07c_step_rise7", "P08c_step_rise7")}[tag]
+            for r, nm in enumerate(_names):
                 out.append(Seq(nm, phase, (J,), cmd, pose,
                                {"level": level, "phase": phase, "rep": r + 1,
                                 "proven_amp_deg": round(proven["amp"], 3), **meta}))
@@ -150,6 +152,20 @@ def ladder(m) -> list[Seq]:
         smooth_step(J, pose, a_slow, 10),
         {"amp_deg": round(a_slow, 3), "rise_frames": 10,
          "revision": "replaces P05/P06; rise 5→10 to cut dynamic intensity"})
+
+    # ── 设计试探 P07c/P08c（2026-08-26）: rise=7，补 2–6 Hz 的激励缺口 ──
+    # 触发条件是 P05b/P06b 定稿时预设的「若后续发现激励强度不足」，现已满足:
+    #   逐频段**信号能量**(陀螺, 绝对值)实测 ——
+    #     0.5–2 Hz : 2.061°rise5 0.94 | 4.122°rise5 3.82 | 8.245°rise10 **11.52**
+    #     2–3.5 Hz : 0.67 | **2.17** | 0.80(×0.37)
+    #     3.5–6 Hz : 0.35 | **0.84** | **0.24(×0.28)**
+    #   rise 5→10 把 2–6 Hz 的激励压掉 63–72%，可重复性 81.4% → 54.1%。
+    #   8.245°rise10 的总分 96.6% 高，是**低频能量 ×3 把加权拉上去**，
+    #   不是处处更好 —— 而 **2–6 Hz 正是转子惯量与伺服带宽的信息所在**。
+    # rise=7 落在**已验证干净的 28.6°/s** 与**失败的 52.4°/s** 之间。
+    add("P07c", "试探(rise7)", 1.00, smooth_step(J, pose, a_slow, 7),
+        {"amp_deg": round(a_slow, 3), "rise_frames": 7,
+         "revision": "probe: fill 2–6 Hz gap left by rise10"})
 
     # ── 阶段 D: 多关节多正弦（最后） ──
     amps = {j: 2.0 for j in range(6)}
