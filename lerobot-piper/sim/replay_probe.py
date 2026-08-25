@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -95,17 +96,36 @@ def safety_checks(cmd7, da, model_path=None):
         lo = np.maximum(mlo - 0.035, rlo)
         hi = np.minimum(mhi + 0.035, rhi)
         base, tot = cmd7[:, :6], cmd7[:, :6] + da
-        exc = lambda x: np.maximum(np.maximum(lo - x, x - hi), 0.0)
-        e_b, e_t = exc(base), exc(tot)
+        exc = lambda x, a, b: np.maximum(np.maximum(a - x, x - b), 0.0)
+
+        # ── 两条限位必须**分开报**(2026-08-26) ────────────────────────────
+        # 合并报会得到「✓ 余量 −61.21°」这种挂着对勾的负余量: 真正的模型限位
+        # 越界会被淹没。step2_g 激励套件 73/90 条**按设计**走出 pp2 实测包络
+        # (j4 在 pp2 里从没动过), 那不是安全问题; 越模型限位才是。
+        #   模型限位 ±2° = 硬安全界, 判 ✓/✗;
+        #   pp2 实测包络 = 提示性, 只说明「臂没去过这里」。
+        # ±2° 松量沿用原注: pp2 的 j2 指令实到 −1.9°, 低于模型写死的 0° 下界。
+        mlo2, mhi2 = mlo - 0.035, mhi + 0.035
+        e_m = exc(tot, mlo2, mhi2)
+        assert e_m.max() <= 1e-9, (
+            "**越模型限位**: j"
+            f"{int(np.unravel_index(e_m.argmax(), e_m.shape)[1]) + 1} "
+            f"最深 {np.degrees(e_m.max()):.3f}°")
+        mar_m = float(np.minimum(tot - mlo2, mhi2 - tot).min())
+        jm = int(np.unravel_index(np.minimum(tot - mlo2, mhi2 - tot).argmin(),
+                                  tot.shape)[1])
+        msgs.append(f"✓ 离**模型限位**最小余量 {np.degrees(mar_m):.2f}° (j{jm+1})")
+
+        # 探针不得加深「合成限位」下的越界 —— 原门禁, 语义不变
+        e_b, e_t = exc(base, lo, hi), exc(tot, lo, hi)
         worse = float((e_t - e_b).max())
         assert worse <= 1e-9, f"探针使越界加深 {np.degrees(worse):.3f}°"
+        msgs.append(f"✓ 探针不加深越界 (最坏 {np.degrees(worse):.4f}°)")
         if e_b.max() > 0:
             j = int(np.unravel_index(e_b.argmax(), e_b.shape)[1])
-            msgs.append(f"⚠ 基准指令本身越界 j{j+1} 最深 {np.degrees(e_b.max()):.2f}° "
-                        f"({int((e_b > 0).any(1).sum())} 帧) — 真机已执行过, 非探针所致")
-        msgs.append(f"✓ 探针不加深越界 (最坏 {np.degrees(worse):.4f}°)")
-        mar = float(np.minimum(tot - lo, hi - tot).min())
-        msgs.append(f"✓ 加探针后离限位最小余量 {np.degrees(mar):.2f}°")
+            msgs.append(f"· 出 pp2 实测包络 j{j+1} 最远 {np.degrees(e_b.max()):.2f}° "
+                        f"({int((e_b > 0).any(1).sum())} 帧) — 提示性, "
+                        f"非安全判定; 模型限位见上行")
     except ImportError as e:                                      # noqa: BLE001
         msgs.append(f"⚠ 跳过限位检查（{type(e).__name__}: {e}）")
         degraded.append("关节限位检查被跳过")
@@ -155,15 +175,31 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     from lerobot.common.robot_devices.robots.utils import make_robot
     # 探针只需 IMU+关节: inference_time=True(推理模式,无手柄teleop) · enable_imu=True(默认关!)
     # · cameras={}(不读图, 省循环开销且避开已知的 ffmpeg SIGABRT)
-    robot = make_robot(robot_type, inference_time=True, enable_imu=True, cameras={})
-    if not robot.is_connected:
-        robot.connect()
-    # IMU 连接自检: 动之前先确认 IMU 活着, 否则白跑 59s
-    obs0 = robot.capture_observation()
-    if "observation.imu_real" not in obs0:
-        raise RuntimeError("IMU 未启用! 检查 enable_imu / TSND 设备 /dev/ttyACM0")
-    imu0 = obs0["observation.imu_real"].numpy()
-    assert np.isfinite(imu0).all(), f"IMU 首帧异常: {imu0}"
+    # ── 退出码 3 = 「机器还没动就失败」(2026-08-26 冻结) ────────────────────
+    # 建机器人 / 连接 / IMU 自检**全部发生在任何运动之前**: 失败时机时为 0、
+    # 无数据产生, 因此它对「这条序列能不能跑」不提供任何信息。编排器据此记为
+    # **环境失败**, **不计入该序列的作废额度**, 并立即停整轮等人修环境 ——
+    # 而不是对着一个 CAN 故障连撞 MAX_VOIDS 次(2026-08-26 实际发生过)。
+    # 越过这一段之后的任何失败, 判据仍是**帧数**(⑥-5b), 按正常作废处理。
+    try:
+        robot = make_robot(robot_type, inference_time=True, enable_imu=True,
+                           cameras={})
+        if not robot.is_connected:
+            robot.connect()
+        # IMU 连接自检: 动之前先确认 IMU 活着, 否则白跑 59s
+        obs0 = robot.capture_observation()
+        if "observation.imu_real" not in obs0:
+            raise RuntimeError("IMU 未启用! 检查 enable_imu / TSND 设备 /dev/ttyACM0")
+        imu0 = obs0["observation.imu_real"].numpy()
+        if not np.isfinite(imu0).all():
+            raise RuntimeError(f"IMU 首帧异常: {imu0}")
+    except Exception as e:                                        # noqa: BLE001
+        traceback.print_exc()
+        print(f"\n  ✗✗ **环境失败(运动前)**: {type(e).__name__}: {e}")
+        print("      机器未动、无数据产生 ⇒ 不计入该序列作废额度。")
+        print("      常见: CAN 未起(ip -br link show can0) / 臂未上电 / "
+              "TSND 未插(/dev/ttyACM0)")
+        return 3
     print(f"  IMU 自检 ✓  acc={np.round(imu0[:3],2)}  gyro={np.round(imu0[3:],3)}")
 
     # ---- 预移动: 缓慢移到轨迹首帧位姿, 稳定后才开始记录 ----

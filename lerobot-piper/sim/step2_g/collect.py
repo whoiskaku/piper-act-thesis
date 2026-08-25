@@ -42,6 +42,9 @@ STATE = OUT / "state.json"
 SIGNOFF = ROOT / "reports/step2_g_signoff.json"
 PY = sys.executable
 MAX_VOIDS = 3
+# 不占用作废额度的类别: env=运动前的环境失败(机时 0、无数据);
+# artifact=编排器自身的记账错误产生的假记录(非真实事件)。
+NOT_COUNTED = ("env", "artifact")
 
 
 def load_plan() -> list[dict]:
@@ -71,7 +74,11 @@ class State:
         return any(r["name"] == n for r in self.d["done"])
 
     def voids(self, n: str) -> int:
-        return sum(1 for r in self.d["voided"] if r["name"] == n)
+        """计入 MAX_VOIDS 的作废数。**环境失败(cls="env")不计** ——
+        它发生在任何运动之前, 机时为 0、无数据产生, 对「这条序列能不能跑」
+        不提供信息, 不该占用额度。"""
+        return sum(1 for r in self.d["voided"]
+                   if r["name"] == n and r.get("cls") not in NOT_COUNTED)
 
 
 def sweep_orphans(st: State, plan: list[dict]) -> None:
@@ -80,8 +87,12 @@ def sweep_orphans(st: State, plan: list[dict]) -> None:
     if nxt is None:
         return
     nm = nxt["name"]
-    found = [f for f in OUT.glob(f"replay_{nm}.json")]
-    found += [f for f in OUT.glob(f"settle_{nm}_*.json")]
+    # **必须排除已扫过的孤儿** —— settle 的通配 `settle_{nm}_*.json` 会匹配
+    # 重命名后的 `settle_{nm}_….orphan_….json`, 于是每跑一次就把同一个文件再改名
+    # 一次、再记一条作废。2026-08-26 实际发生: C_j1_p2 因此累积 5 层 .orphan_
+    # 后缀和 4 条假作废记录, 在环境完全正常的情况下把 MAX_VOIDS 撞满并锁死。
+    found = [f for f in OUT.glob(f"replay_{nm}.json") if ".orphan_" not in f.name]
+    found += [f for f in OUT.glob(f"settle_{nm}_*.json") if ".orphan_" not in f.name]
     if not found:
         return
     ts = int(time.time())
@@ -126,6 +137,13 @@ def run_one(st: State, p: dict, dry: bool) -> None:
             [PY, str(ROOT / "sim/replay_probe.py"),
              "--seqfile", str(SUITE / f"{nm}.npz"), "--arm", nm,
              "--outdir", str(OUT)], cwd=ROOT, check=False).returncode
+        if rc == 3:            # 运动前的环境失败, 见 replay_probe.py 的冻结约定
+            st.d["voided"].append({"name": nm, "reason": "环境失败(运动前)",
+                                   "cls": "env", "rc": rc, "ts": time.time()})
+            st.save()             # wasted 不加: 没有机时被浪费
+            raise SystemExit(
+                f"\n{nm}: **环境失败** —— 机器未动、无数据产生, 不计入作废额度。\n"
+                "  修好环境后重跑同一条命令, 会从断点接上。")
         log = OUT / f"replay_{nm}.json"
         n = 0
         if log.exists():
