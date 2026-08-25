@@ -85,7 +85,19 @@ def sweep_orphans(st: State, plan: list[dict]) -> None:
     if not found:
         return
     ts = int(time.time())
-    print(f"⚠ 发现 {nm} 的孤儿结果 {len(found)} 个（上次运行被中断）")
+    # 报出**为什么**判为孤儿 —— 「上次被中断」不等于「数据一定坏」。
+    # 判据仍是**帧数**(同 ⑥-5b): 录满就有效, 只是记账没跟上。
+    why = []
+    for f in found:
+        if f.name.startswith("replay_"):
+            try:
+                d = json.loads(f.read_text())
+                why.append(f"{len(d.get('imu', []))} 帧"
+                           + (f", stopped={d['stopped']}" if d.get("stopped") else ""))
+            except Exception:                                     # noqa: BLE001
+                why.append("无法解析")
+    print(f"⚠ 发现 {nm} 的孤儿结果 {len(found)} 个（上次运行被中断）"
+          + (f" —— {'; '.join(why)}" if why else ""))
     for f in found:
         f.rename(f.with_name(f"{f.stem}.orphan_{ts}.json"))
         print(f"    保留为 {f.stem}.orphan_{ts}.json")
