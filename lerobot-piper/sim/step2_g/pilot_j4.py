@@ -44,10 +44,25 @@ REPEATS = 2
 PURPOSE = "development/safety pilot — NOT for calibration, NOT for validation"
 
 # 放行门槛（每级过关才升级）。都是从录到的日志能直接算的量。
+# ── 跟踪判据（2026-08-24 修订并冻结；**失败后修订**，理由见下）────────────
+# 起因: P03 的 p99 = 2.705° > 2.0° 判否。实测三条:
+#     P01 幅值 2.061°  p99 1.443°  最优滞后 2 帧  补后 0.121°  (滞后占 92%)
+#     P02 幅值 2.061°  p99 1.212°  最优滞后 2 帧  补后 0.314°  (滞后占 74%)
+#     P03 幅值 4.122°  p99 2.705°  最优滞后 2 帧  补后 0.239°  (滞后占 91%)
+# 幅值 ×2.00 ⇒ p99 ×1.87, 滞后恒为 2 帧, 补后残差始终 <0.32°
+# ⇒ 原判据用**绝对阈值**去量一个正比于**速度**的量(滞后 × 速度), 在幅值阶梯上
+#    必然在某一级撞墙, 且撞的是量纲错误而非物理极限。滞后本身是 G 要建模的
+#    对象, 不是故障。
+# 修订: 固定补偿 **2 帧(100 ms)**, 判 p99(|e_t|) ≤ 0.5°, 其中
+#     e_t = q_state[t + LAG] − q_cmd[t]
+# **不逐条搜索最优滞后** —— 那会把异常延迟一起拟合掉, 使门禁失效。
+# 若真实滞后变化, 固定 2 帧后的残差会增大并触发门禁, 不会被自动隐藏。
+LAG_FRAMES = 2                         # 冻结; 实测 P01/P02/P03 的最优滞后均为 2
 GATE = {
     "min_frames": 100,
     "max_stale": 0, "max_nan": 0,
-    "track_err_p99_deg": 2.0,          # |state − cmd| 的 p99
+    "track_err_p99_deg": 0.5,          # p99(|q_state[t+2] − q_cmd[t]|)
+    "lag_frames": LAG_FRAMES,
     "limit_margin_deg": LIMIT_MARGIN_DEG,
 }
 
@@ -122,15 +137,24 @@ def check(log: Path) -> int:
     st = np.asarray(d["state"], float)[:, :6] / 1000.0        # 毫度 → 度
     n = min(len(cmd), len(st))
     m = mujoco.MjModel.from_xml_path(str(MODEL))
-    err = np.abs(np.rad2deg(cmd[:n]) - st[:n])
+    # **固定** LAG_FRAMES 帧补偿（不逐条搜索最优滞后）
+    L = GATE["lag_frames"]
+    k = n - L
+    err = np.abs(np.rad2deg(cmd[:k]) - st[L:L + k])
+    err_raw = np.abs(np.rad2deg(cmd[:n]) - st[:n])
+    # 最优滞后仅**报告**, 不参与门禁 —— 它变了正是要看见的信号
+    _best = min(((np.percentile(np.abs(np.rad2deg(cmd[:n - q]) - st[q:n]), 99), q)
+                 for q in range(9)))
     lo = np.rad2deg(m.jnt_range[:6, 0]) + GATE["limit_margin_deg"]
     hi = np.rad2deg(m.jnt_range[:6, 1]) - GATE["limit_margin_deg"]
     v = np.abs(np.diff(st[:n], axis=0)) * FPS
     rows = [
         ("帧数", n, f"≥ {GATE['min_frames']}", n >= GATE["min_frames"]),
         ("IMU 样本(100Hz)", len(d.get("imu100", [])), "> 0", len(d.get("imu100", [])) > 0),
-        ("跟踪误差 p99 (度)", round(float(np.percentile(err[:, J], 99)), 3),
-         f"≤ {GATE['track_err_p99_deg']}", float(np.percentile(err[:, J], 99)) <= GATE["track_err_p99_deg"]),
+        (f"跟踪误差 p99 (度, 固定补 {L} 帧)",
+         round(float(np.percentile(err[:, J], 99)), 3),
+         f"≤ {GATE['track_err_p99_deg']}",
+         float(np.percentile(err[:, J], 99)) <= GATE["track_err_p99_deg"]),
         ("实测位置越限", int(((st[:n] < lo) | (st[:n] > hi)).sum()), "= 0",
          not ((st[:n] < lo) | (st[:n] > hi)).any()),
         ("实测 max|v| j4 (度/s)", round(float(v[:, J].max()), 1),
@@ -138,6 +162,10 @@ def check(log: Path) -> int:
         ("提前终止", d.get("stopped") or "无", "无", d.get("stopped") is None),
     ]
     print(f"{log.name}\n{'项':<24}{'实测':>16}{'门槛':>12}   ")
+    print(f"{'  [报告] 未补偿 p99 (度)':<24}"
+          f"{round(float(np.percentile(err_raw[:, J], 99)), 3):>16}{'—':>12}   ")
+    print(f"{'  [报告] 本集最优滞后 (帧)':<24}{_best[1]:>16}"
+          f"{f'冻结 {L}':>12}   {'⚠ 与冻结值不符' if _best[1] != L else ''}")
     ok = True
     for nm, val, thr, good in rows:
         ok &= bool(good)
