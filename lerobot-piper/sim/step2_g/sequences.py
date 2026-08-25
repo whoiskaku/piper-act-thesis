@@ -214,9 +214,8 @@ def pick_distal_poses(m, j: int, n: int = 3, n_sample: int = 20000,
         不留这个倍数会选出「运动学摆得动、动力学一摆就触底」的位形。
         """
         c = place(m, smooth_step(j, q, MIN_USABLE_AMP_DEG * DYN_GUARD, 5), j)
-        f, _ = full_timeline(c)
-        return all(lowest_geom_z(m, d, f[k, :6]) >= need
-                   for k in range(0, len(f), 5))
+        f, sp = full_timeline(c)
+        return timeline_z_ok(m, d, f, sp, need, 5)   # 两段式, 见 timeline_z_ok
 
     def best_in(seq):
         """在给定的一档里，取**离台面最高**的那个位形。
@@ -401,6 +400,39 @@ def place(m, cmd: np.ndarray, j: int, s: float = 1.0) -> np.ndarray:
     return out
 
 
+
+# ── 工作空间判据分两段（2026-08-26）────────────────────────────────────────
+# `full_timeline` 两端改成真机的**停放位姿**之后, 保守的包围球判据会把
+# 停放位姿本身判成违规: safe_disable 处 `lowest_geom_z` 读数是**离桌 −81.6 mm**,
+# 而 Z_CLEAR 要求 +20 mm。于是预移动的头 26/40 帧、末段归位与停放全部不合格,
+# `fit_workspace` 把所有幅值都判否, `pick_distal_poses` 进而报「没有可行位形」。
+#
+# 但同一条时间线的**真实 mesh 接触数 = 0** —— 那是包围球(geom_rbound 是包住
+# mesh 的球, 比实体大得多)作为保守代理的假警报, 不是真问题: 臂天天停在那儿。
+#
+# 原则: **停放位姿是硬件给定的(SDK 的 safe_disable_position), 不是套件设计的。**
+# 套件的责任是「不做得比停放位姿更差」, 而不是「让停放位姿合规」。故:
+#   · **设计段**(稳定 / 激励): 离桌 ≥ need —— 不变, 严格;
+#   · **转运段**(预移动 / 归位 / 停放): 只要求不低于停放位姿自身的余量。
+DESIGN_SPANS = ("稳定", "激励")
+
+
+def park_z(m, d) -> float:
+    """停放位姿自身的最低 geom z（保守包围球口径）。"""
+    return lowest_geom_z(m, d, np.deg2rad(SAFE_DISABLE_DEG))
+
+
+def timeline_z_ok(m, d, full, spans, need: float, stride: int = 1) -> bool:
+    """两段式工作空间判据。见上方注释。"""
+    pz = park_z(m, d) - 1e-9
+    for a, b, nm in spans:
+        lim = need if nm in DESIGN_SPANS else pz
+        for k in range(a, b, stride):
+            if lowest_geom_z(m, d, full[k, :6]) < lim:
+                return False
+    return True
+
+
 def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarray, float]:
     """把关节 j 的幅值二分缩小，直到全程所有 geom 都在台面之上。
 
@@ -412,13 +444,21 @@ def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarr
     need = TABLE_Z + Z_CLEAR + BISECT_MARGIN      # 目标留余量, 别收敛到边界
 
     def kin_ok(s: float) -> bool:
-        c, _ = full_timeline(place(m, cmd, j, s))      # 查**全程**, 含预移动/回停
-        return all(lowest_geom_z(m, d, c[k, :6]) >= need
-                   for k in range(0, len(c), stride))
+        c, sp = full_timeline(place(m, cmd, j, s))     # 查**全程**, 含预移动/归位
+        return timeline_z_ok(m, d, c, sp, need, stride)
 
     def dyn_z(s: float) -> float:
-        """跑动力学, 返回**完整上机时间线**仿真位形的最低 geom z。"""
-        c, _ = full_timeline(place(m, cmd, j, s))
+        """跑动力学, 返回**完整上机时间线**仿真位形的最低 geom z。
+
+        与 `kin_ok` 同样分两段: 转运段(预移动/归位/停放)只要求不低于**停放位姿
+        自身**的余量, 故这里把它们的裕度折算回来 —— 返回值仍与 `need` 比较,
+        转运段的读数先加上 (need − park_z) 再参与取最小。见 `timeline_z_ok`。
+        """
+        c, sp = full_timeline(place(m, cmd, j, s))
+        off = need - park_z(m, d)                  # 转运段允许比 need 低这么多
+        span_of = np.empty(len(c), dtype=object)
+        for a, b, nm in sp:
+            span_of[a:b] = nm
         dd = mujoco.MjData(m)
         dd.qpos[:6] = c[0, :6]
         mujoco.mj_forward(m, dd)
@@ -430,8 +470,11 @@ def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarr
             for _ in range(sub):
                 mujoco.mj_step(m, dd)
             if k % stride == 0:
-                z = min(z, float((dd.geom_xpos[m.geom_bodyid != 0, 2]
-                                  - m.geom_rbound[m.geom_bodyid != 0]).min()))
+                zk = float((dd.geom_xpos[m.geom_bodyid != 0, 2]
+                            - m.geom_rbound[m.geom_bodyid != 0]).min())
+                if span_of[k] not in DESIGN_SPANS:
+                    zk += off                      # 转运段: 折算回 need 口径
+                z = min(z, zk)
         return z
 
     # 先用**运动学**二分快速定位(便宜), 再对**动力学**二分(准确)。
