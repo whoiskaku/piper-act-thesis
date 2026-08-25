@@ -36,6 +36,12 @@ from sim.step2_g.sequences import (                                   # noqa: E4
 )
 
 MODEL = ROOT / "sim/piper_model.xml"
+# j4 的阶跃包络: 由真机分级 pilot 实测确定, 不走通用的 (rise 2/5 × frac) 规则。
+# A 补 2–6 Hz, B 补 0.5–2 Hz; 详见 reports/STEP2_PILOT_GATE_REVISION.md C 节。
+J4 = 3
+J4_ENVELOPES = ((4.122, 5), (8.245, 10))
+J4_AMP_MAX = 8.245        # pilot 测过的最大幅值; 慢扫封到此(动态本就合规)
+J4_CHIRP_PENDING = True   # j4 扫频**移出主套件**, 待其单独 pilot 通过后再加回
 OUT = ROOT / "outputs/step2_g"
 
 
@@ -66,20 +72,49 @@ def build(m) -> list[Seq]:
     for j in range(6):
         for pi, pose in enumerate(poses[j]):
             # ── 平滑阶跃: 两个上升时间(快/慢) × 两个幅值 ──
-            for rise in (2, 5):
-                amax = max_amp(m, j, lambda a, r=rise: smooth_step(j, pose, a, r))
-                for frac in (0.35, 1.0):          # 阶梯取**可达最大值的比例**
-                    a_ = amax * frac
-                    add(f"S_j{j+1}_p{pi}_r{rise}_f{frac:.2f}", "step", j,
+            # ── j4 的阶跃包络由真机 pilot 定死（2026-08-26）──────────────
+            # 见 reports/STEP2_PILOT_GATE_REVISION.md C 节。j4 在 pp2 里从未动过,
+            # 故其包络不能沿用通用规则, 必须用 pilot 实测的**已验证干净区间**:
+            #   ✓ ≤30.2°/s / ≤342°/s²    ✗ ≥46.0°/s / 383°/s²
+            # 且**单包络覆盖不了全带** —— rise=10 在 3.5–6 Hz 的激励只有 rise=5 的
+            # 0.28 倍(该段正是转子惯量与伺服带宽的信息所在), 而 rise=5 在 0.5–2 Hz
+            # 只有 rise=10 的 1/3。故用双包络, 每个频段都不弱于任一单包络。
+            # rise=7 试探被否: 两次重复跨在阈值两侧(0.492 过 / 0.608 否) ⇒ 系统性贴线。
+            if j == J4:
+                for a_, rise in J4_ENVELOPES:
+                    add(f"S_j4_p{pi}_rise{rise}_a{a_:.1f}", "step", j,
                         smooth_step(j, pose, a_, rise), pose,
-                        {"amp_deg": round(a_, 3), "rise_frames": rise})
+                        {"amp_deg": a_, "rise_frames": rise,
+                         "envelope": "pilot-validated (STEP2_PILOT_GATE_REVISION C)"})
+            else:
+                # **不能用 `continue`** —— 它会跳过本位形剩下的慢扫与扫频生成,
+                # 实测那样会连带丢掉 j4 的 6 条 W_ 和 3 条 C_(套件 96→84)。
+                # 只替换**阶跃**分支, 其余基元照常生成。
+                for rise in (2, 5):
+                    amax = max_amp(m, j, lambda a, r=rise: smooth_step(j, pose, a, r))
+                    for frac in (0.35, 1.0):      # 阶梯取**可达最大值的比例**
+                        a_ = amax * frac
+                        add(f"S_j{j+1}_p{pi}_r{rise}_f{frac:.2f}", "step", j,
+                            smooth_step(j, pose, a_, rise), pose,
+                            {"amp_deg": round(a_, 3), "rise_frames": rise})
             # ── 慢速双向扫描: 两档低速（为 fc） ──
             for sp in (2.0, 8.0):
                 aw = max_amp(m, j, lambda a, v=sp: slow_sweep(j, pose, a, v))
+                if j == J4:
+                    # 动态强度本就合规(2°/s / 40°/s²), 但 19.125° 是 pilot 测过的
+                    # 最大幅值 8.245° 的 2.3 倍 —— **没测过就是没测过**, 封顶。
+                    aw = min(aw, J4_AMP_MAX)
                 add(f"W_j{j+1}_p{pi}_v{sp:.0f}", "sweep", j,
                     slow_sweep(j, pose, aw, sp), pose,
                     {"speed_dps": sp, "amp_deg": round(aw, 3)})
             # ── 扫频 ──
+            if j == J4 and J4_CHIRP_PENDING:
+                # j4 扫频实测 **53.7°/s / 1700°/s²** —— 是被判否的 P05(683)的 2.5 倍、
+                # 已验证上限(342)的 5 倍。**目视审查看不出加速度**, 这条本会直接上机。
+                # 扫频是**连续激励**而非单次瞬态, 失效机理未必与阶跃相同, 故不套用
+                # 阶跃的界, 也不简单封顶(封到 342 后幅值只剩 0.7°, 激励掉一个数量级),
+                # 而是移出主套件、单独跑 pilot(sim/step2_g/pilot_j4_chirp.py)。
+                continue
             ac = max_amp(m, j, lambda a: chirp(j, pose, a))
             add(f"C_j{j+1}_p{pi}", "chirp", j, chirp(j, pose, ac), pose,
                 {"amp_deg": round(ac, 3)})
