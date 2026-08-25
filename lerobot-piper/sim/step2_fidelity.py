@@ -81,6 +81,7 @@ plt.rcParams["axes.unicode_minus"] = False
 
 # dataviz 校验通过的三色(黄=理想 / 蓝=现实 / 绿=仿真)
 C_IDEAL, C_REAL, C_DYN = "#eda100", "#2a78d6", "#008300"
+C_NEW = "#8b2fb0"        # 新 G(限幅器 ⊕ 更硬伺服), 与 accel_limit.py 同色
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#d8d8d4"
 FPS = 20.0
 SEAM_W = 10                 # 机理定义的难处宽度(帧)
@@ -90,7 +91,7 @@ OUT = ROOT / "outputs/step2_g/legacy_fidelity"
 
 
 def episode_traces(log: Path, R: np.ndarray, limiter: str = "none",
-                   kpmul: float | None = None):
+                   kpmul: float | None = None, vs: float | None = None):
     """→ dict: 三条带通后的陀螺轨迹(已对齐) + 接缝位置。"""
     d = json.loads(log.read_text())
     fr = d["frames"]
@@ -106,7 +107,13 @@ def episode_traces(log: Path, R: np.ndarray, limiter: str = "none",
     hi, fs = dyn_replay_cmd(apply_limiter(act, limiter), jkp)
     dyn = aa_down(hi, fs, len(fr))[:, 3:6] @ R.T
     n = min(n, len(dyn))
-    return {
+    dyn2 = None
+    if vs is not None:                       # 第二个变体: 限幅器 ⊕ kp×vs
+        jkp2 = {j: float(_m0.actuator_gainprm[j, 0]) * vs for j in range(6)}
+        hi2, fs2 = dyn_replay_cmd(apply_limiter(act, "a"), jkp2)
+        dyn2 = aa_down(hi2, fs2, len(fr))[:, 3:6] @ R.T
+        n = min(n, len(dyn2))
+    out = {
         "ideal": bandpass41(kin[:n, 3:6] @ R.T),
         "real": bandpass41(real[ALIGN_L:ALIGN_L + n]),
         "dyn": bandpass41(dyn[:n]),
@@ -114,6 +121,9 @@ def episode_traces(log: Path, R: np.ndarray, limiter: str = "none",
                   if 0 <= c["start"] - ALIGN_L < n],
         "n": n, "name": log.stem,
     }
+    if dyn2 is not None:
+        out["dyn2"] = bandpass41(dyn2[:n])
+    return out
 
 
 def regions(tr: dict) -> dict[str, np.ndarray]:
@@ -146,6 +156,8 @@ def main() -> int:
     ap.add_argument("--n", type=int, help="只算前 N 集")
     ap.add_argument("--limiter", choices=("none", "a", "ad"), default="none",
                     help="在 MuJoCo 之前插入固件 MOVE J 的加速度限幅")
+    ap.add_argument("--vs", type=float, default=None,
+                    help="同时算第二个变体(限幅器 ⊕ kp×VS)并叠进波形图")
     ap.add_argument("--kpmul", type=float, default=None,
                     help="把**全部** kp 乘以该倍数(覆盖 j1 的 5000 手调值)。"
                          "真机静态刚度 ≥1.5e5 N·m/rad(无重力垂落), 而 XML 的 "
@@ -165,7 +177,7 @@ def main() -> int:
     acc: dict[str, list] = {}
     traces = []
     for p in logs:
-        tr = episode_traces(p, R, a.limiter, a.kpmul)
+        tr = episode_traces(p, R, a.limiter, a.kpmul, a.vs)
         traces.append(tr)
         for nm, m in regions(tr).items():
             acc.setdefault(nm, []).append(fidelity(tr, m))
@@ -235,7 +247,8 @@ def main() -> int:
                                          hspace=0.42, wspace=0.22)
     fig.suptitle(f"Step 2 · 手调 XML legacy 诊断（波形叠图 · 看难处 · 不看平均）\n"
                  f"{tr['name']}　{BAND[0]}–{BAND[1]} Hz 陀螺 {['ω_x','ω_y','ω_z'][J]}"
-                 f"　黄=理想 / 蓝=现实 / 绿=手调 XML（legacy）",
+                 f"　黄=理想 / 蓝=现实 / 绿=手调 XML（legacy）"
+                 + ("　/ 紫=新 G（加速度限幅 ⊕ kp×%g）" % a.vs if a.vs else ""),
                  fontsize=12, color=INK)
 
     ax = fig.add_subplot(gs[0, :])
@@ -244,9 +257,13 @@ def main() -> int:
     ax.plot(t, tr["ideal"][:, J], color=C_IDEAL, lw=2.4, label="理想（运动学）", zorder=3)
     ax.plot(t, tr["real"][:, J], color=C_REAL, lw=2.0, label="现实（真机 IMU）", zorder=4)
     ax.plot(t, tr["dyn"][:, J], color=C_DYN, lw=1.6, label="手调 XML 预测", zorder=5)
+    if "dyn2" in tr:
+        ax.plot(t, tr["dyn2"][:, J], color=C_NEW, lw=1.9, zorder=6,
+                label=f"新 G（限幅 ⊕ kp×{a.vs:g}）")
     for nm, yv, c, fx in (("理想", tr["ideal"], C_IDEAL, 0.045),
                           ("现实", tr["real"], C_REAL, 0.085),
-                          ("手调XML", tr["dyn"], C_DYN, 0.125)):
+                          ("手调XML", tr["dyn"], C_DYN, 0.125)) + (
+                          (("新G", tr["dyn2"], C_NEW, 0.165),) if "dyn2" in tr else ()):
         k = int(n * fx)
         ax.annotate(nm, (t[k], yv[k, J]), color=c, fontsize=9.5, fontweight="bold",
                     xytext=(2, 7), textcoords="offset points")
@@ -263,9 +280,16 @@ def main() -> int:
         axz.plot(t[z], tr["ideal"][z, J], color=C_IDEAL, lw=2.6, zorder=3)
         axz.plot(t[z], tr["real"][z, J], color=C_REAL, lw=2.2, zorder=4)
         axz.plot(t[z], tr["dyn"][z, J], color=C_DYN, lw=1.8, zorder=5)
+        if "dyn2" in tr:
+            axz.plot(t[z], tr["dyn2"][z, J], color=C_NEW, lw=2.0, zorder=6)
         m = np.zeros(n, bool); m[s:min(n, s + SEAM_W)] = True
         _, _, f = fidelity(tr, m)
-        axz.set_title(f"② 难处放大 · 接缝 @{s/FPS:.1f}s　相对变化 {f*100:+.0f}%",
+        f2 = ""
+        if "dyn2" in tr:
+            ei = float(np.square(tr["real"][m] - tr["ideal"][m]).sum())
+            e2 = float(np.square(tr["real"][m] - tr["dyn2"][m]).sum())
+            f2 = f" → 新 G {(1 - e2 / ei) * 100:+.0f}%"
+        axz.set_title(f"② 难处放大 · 接缝 @{s/FPS:.1f}s　手调 {f*100:+.0f}%{f2}",
                       fontsize=9.5, color=INK, loc="left")
         axz.set_xlabel("时间 (s)", color=INK2, fontsize=9)
         if i == 0:
