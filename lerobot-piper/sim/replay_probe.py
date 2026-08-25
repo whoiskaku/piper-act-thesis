@@ -382,6 +382,12 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
                 rec["imu100"].append([float(ht), int(ms), *map(float, ac), *map(float, gy)])
             rdr.stop_recording()
         p = (outdir or PROBE) / f"replay_{tag}{arm}.json"   # tag 含 ep 与轮次
+        if p.exists():
+            # **移开, 不覆盖**。判据修订后重跑同一条序列会同名 —— 原始数据仍然
+            # 有效(激励段本身没问题, 只是稳定段判据变了), 覆盖掉就再也回不去了。
+            _old = p.with_name(f"{p.stem}.superseded_{int(time.time())}.json")
+            p.rename(_old)
+            print(f"  ⚠ 已存在同名结果, 移开保留为 {_old.name}")
         rec["stopped"] = stopped
         rec["seqfile"] = seqfile
         p.write_text(json.dumps(rec))
