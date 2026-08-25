@@ -56,6 +56,32 @@ class Seq:
         return hashlib.sha256(np.round(self.cmd, 9).tobytes()).hexdigest()[:12]
 
 
+TABLE_Z = -0.001                     # deco_table 台面高度(m)
+Z_CLEAR = 0.02                       # 台面之上要留的余量(m)
+
+
+def lowest_geom_z(m, d, q6: np.ndarray) -> float:
+    """给定位形下**所有 geom 的保守最低点** z。
+
+    用 `geom_xpos - geom_rbound`（包围球）而非 body 原点：连杆的几何体比原点低，
+    只看原点会漏判。
+
+    **只看手臂自己的 geom**（`geom_bodyid != 0`）。模型里的 `deco_floor/table/
+    tray/cube/battery/slot_*` 都挂在 `world` 上、本来就位于台面高度或以下 ——
+    把它们算进来会让任何位形都判为「低于台面」（实测最小 z−rbound = −0.575，
+    全部来自装饰件）。
+
+    这仍是**粗粒度几何护栏**，不是碰撞判定（模型碰撞是关闭的），
+    人工目视签字仍然必需。
+    """
+    d.qpos[:6] = q6
+    d.qpos[6] = d.qpos[7] = 0.0
+    mujoco.mj_forward(m, d)
+    arm = m.geom_bodyid != 0                      # 排除 world 上的静态装饰件
+    return float((d.geom_xpos[arm, 2] - m.geom_rbound[arm]).min())
+
+
+
 # ── 位形选择 ────────────────────────────────────────────────────────────
 def link_inertia(m, d, M, q6: np.ndarray) -> np.ndarray:
     d.qpos[:6] = q6
@@ -67,9 +93,17 @@ def link_inertia(m, d, M, q6: np.ndarray) -> np.ndarray:
 
 def pick_distal_poses(m, j: int, n: int = 3, n_sample: int = 3000,
                       seed: int = 20260824) -> list[np.ndarray]:
-    """为激励关节 `j` 选 n 个**远端**配置，使 `I_link[j]` 的跨度尽量大。
+    """为激励关节 `j` 选 n 个**远端**配置，使 `I_link[j]` 的跨度尽量大 ——
+    但**只在工作空间可行的位形里选**。
 
     近端关节固定在 pp2 的典型姿态（不影响 `I_link[j]`，但决定重力负载）。
+
+    **必须先筛可行再取极值**：惯量最极端的位形往往正是把手臂折进桌面的那些。
+    实测未筛时 j1 的最大惯量位形(j2=170°, j3=−164°)在 HOME 处 z=−0.059、
+    j2 的最小惯量位形(j3=−6°, j4=−13°) z=−0.016 —— 都是**静止时就在桌下**，
+    先取极值再筛只会得到空集或幅值被压到 0。
+    可行性在**摆动中心(目标关节置 HOME)**上判；整条轨迹的余量由
+    `fit_workspace()` 再缩幅保证。
     """
     d, M = mujoco.MjData(m), np.zeros((m.nv, m.nv))
     lo = m.jnt_range[:6, 0] + np.deg2rad(LIMIT_MARGIN_DEG)
@@ -80,6 +114,16 @@ def pick_distal_poses(m, j: int, n: int = 3, n_sample: int = 3000,
     rng = np.random.default_rng(seed + j)
     Q = rng.uniform(lo, hi, size=(n_sample, 6))
     Q[:, : j + 1] = home[: j + 1]                 # 近端停 HOME, 只变远端
+    need = TABLE_Z + Z_CLEAR
+    keep = []
+    for q in Q:
+        qc = q.copy()
+        qc[j] = np.deg2rad(HOME_DEG[j])            # 摆动中心
+        if lowest_geom_z(m, d, qc) >= need:
+            keep.append(q)
+    if not keep:
+        raise RuntimeError(f"j{j+1}: 没有工作空间可行的远端位形")
+    Q = np.array(keep)
     I = np.array([link_inertia(m, d, M, q)[j] for q in Q])
     order = np.argsort(I)
     idx = [order[0], order[-1]] if n <= 2 else \
@@ -217,17 +261,50 @@ def fit_limits(m, cmd: np.ndarray, j: int) -> tuple[np.ndarray, float]:
 
 
 def place(m, cmd: np.ndarray, j: int, s: float = 1.0) -> np.ndarray:
-    """把关节 j 的轨迹按 s 缩放, 并**整段平移**到限位区间内居中。
+    """把关节 j 的轨迹按 s 缩放, 并**锚定在 HOME 附近**, 仅在触限时最小平移。
 
-    比原来的 `safe_center` 正确: 后者假设摆动是关于起点对称的 ±amp, 而阶跃的
-    偏移范围是 [0, amp]、扫频是 [−amp, +amp] —— 形状不同, 居中点也不同。
+    **不能**居中到关节的机械量程中点: j2 的量程是 0–180°, 中点 90° 那个姿态
+    配上折叠的远端位形本身就在**桌面以下** —— 实测按量程居中会让工作空间二分
+    一路缩到幅值 0。锚在 HOME(pp2 已反复安全经过的姿态)才是对的参照。
+
+    比原来的 `safe_center` 也更正确: 后者假设摆动关于起点对称 ±amp, 而阶跃的
+    偏移范围是 [0, amp]、扫频是 [−amp, +amp] —— 形状不同, 锚点也不同。
     """
     out = cmd.copy()
     d = _dev(cmd, j) * s
+    q = np.deg2rad(HOME_DEG[j]) - (d.max() + d.min()) / 2 + d      # 摆动中心 = HOME
     lo = m.jnt_range[j, 0] + np.deg2rad(LIMIT_MARGIN_DEG)
     hi = m.jnt_range[j, 1] - np.deg2rad(LIMIT_MARGIN_DEG)
-    out[:, j] = (lo + hi) / 2 - (d.max() + d.min()) / 2 + d
+    q = q + max(0.0, lo - q.min()) - max(0.0, q.max() - hi)        # 触限才平移
+    out[:, j] = q
     return out
+
+
+def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarray, float]:
+    """把关节 j 的幅值二分缩小，直到全程所有 geom 都在台面之上。
+
+    起因：`W_j2_p1_v2` 的慢扫只受**行程**约束（j2 量程 0–180°），幅值涨到 132°，
+    配上折叠的远端位形把夹爪扫到 **z = −0.208 m**，即台面下 21 cm。
+    速度/加速度/关节限位三项检查都发现不了这个 —— 它是**工作空间**问题。
+    """
+    d = mujoco.MjData(m)
+    need = TABLE_Z + Z_CLEAR
+
+    def ok(s: float) -> bool:
+        c = place(m, cmd, j, s)
+        return all(lowest_geom_z(m, d, c[k, :6]) >= need
+                   for k in range(0, len(c), stride))
+
+    if ok(1.0):
+        return place(m, cmd, j), 1.0
+    lo_, hi_ = 0.0, 1.0
+    for _ in range(12):
+        mid = (lo_ + hi_) / 2
+        if ok(mid):
+            lo_ = mid
+        else:
+            hi_ = mid
+    return place(m, cmd, j, lo_), lo_
 
 
 def max_amp(m, j: int, gen, probe_deg: float = 1.0) -> float:

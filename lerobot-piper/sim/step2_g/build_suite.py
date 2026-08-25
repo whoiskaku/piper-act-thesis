@@ -31,8 +31,8 @@ sys.path.insert(0, str(ROOT))
 from sim.step2_g import params as PA                                  # noqa: E402
 from sim.step2_g.sequences import (                                   # noqa: E402
     FPS, Seq, check_limits, chirp, inertia_span, multisine,
-    HOME_DEG, check_limits, fit_limits, max_amp, pick_distal_poses, place,
-    safe_center, slow_sweep, smooth_step,
+    HOME_DEG, check_limits, fit_limits, fit_workspace, max_amp,
+    pick_distal_poses, place, safe_center, slow_sweep, smooth_step,
 )
 
 MODEL = ROOT / "sim/piper_model.xml"
@@ -42,8 +42,9 @@ OUT = ROOT / "outputs/step2_g"
 def build(m) -> list[Seq]:
     seqs: list[Seq] = []
     def add(name, kind, j, cmd, pose, meta):
-        cmd = place(m, cmd, j)                     # 按实际偏移范围居中到限位内
-        seqs.append(Seq(name, kind, (j,), cmd, pose, meta))
+        # 居中到限位内, 再按**工作空间**(台面上方)二分缩幅
+        cmd, ws = fit_workspace(m, cmd, j)
+        seqs.append(Seq(name, kind, (j,), cmd, pose, {**meta, "ws_scale": round(ws, 3)}))
     poses = {j: pick_distal_poses(m, j, n=3 if j < 4 else 1) for j in range(6)}
     # 幅值按各关节的量程与 pp2 包络取保守值
     amp = {0: 8.0, 1: 8.0, 2: 8.0, 3: 12.0, 4: 10.0, 5: 12.0}

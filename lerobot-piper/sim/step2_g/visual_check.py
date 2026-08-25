@@ -41,14 +41,15 @@ sys.path.insert(0, str(ROOT))
 
 from sim.step2_g import params as PA                                   # noqa: E402
 from sim.step2_g.build_suite import MODEL, build                       # noqa: E402
-from sim.step2_g.sequences import FPS, HOME_DEG                        # noqa: E402
+from sim.step2_g.sequences import (                                    # noqa: E402
+    FPS, HOME_DEG, TABLE_Z, Z_CLEAR, lowest_geom_z,
+)
 
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK JP", "Noto Sans CJK SC", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
 OUT = ROOT / "outputs/step2_g/visual"
 BANNER = "COLLISION DISABLED — VISUAL ONLY"
-TABLE_Z = -0.001                      # deco_table 台面高度(m)，仅作**几何邻近**参考
 PREMOVE_S, SETTLE_S, RETURN_S = 2.0, 1.0, 2.0
 VIEWS = (("正面", 0.0, -20.0), ("侧面", 90.0, -20.0), ("俯视", 0.0, -85.0))
 N_SHOT = 6
@@ -92,14 +93,13 @@ def roll(m, full: np.ndarray) -> np.ndarray:
 
 
 def lowest_z(m, q: np.ndarray) -> float:
-    """所有 body 原点的最低 z（**几何邻近**参考，不是碰撞判定）。"""
+    """手臂 geom 的保守最低点（**几何邻近**参考，不是碰撞判定）。
+
+    与 `sequences.lowest_geom_z` 用同一判据（包围球下界、排除 world 上的装饰件），
+    以免生成端与审查端两套标准。
+    """
     d = mujoco.MjData(m)
-    z = []
-    for qq in q[::5]:
-        d.qpos[:6] = qq
-        mujoco.mj_forward(m, d)
-        z.append(d.xpos[1:, 2].min())
-    return float(np.min(z))
+    return float(min(lowest_geom_z(m, d, qq) for qq in q[::5]))
 
 
 def sheet(m, s, q: np.ndarray, full: np.ndarray, spans, path: Path) -> dict:
@@ -198,13 +198,14 @@ def main() -> int:
         ov = (sr[1] - sr[0]) / max(cr[1] - cr[0], 1e-9)
         lz = lowest_z(m, q)
         sheet(m, s, q, full, spans, OUT / f"{s.name}.png")
-        flag = "  ⚠低于台面" if lz < TABLE_Z else ""
-        if lz < TABLE_Z:
+        flag = "  ⚠余量不足" if lz < TABLE_Z + Z_CLEAR else ""
+        if lz < TABLE_Z + Z_CLEAR:
             worst.append(s.name)
         print(f"{s.name:<22}{f'{cr[0]:7.1f}…{cr[1]:6.1f}':>16}"
               f"{f'{sr[0]:7.1f}…{sr[1]:6.1f}':>16}{ov:>6.2f}×{lz:>10.3f}{s.sha:>13}{flag}")
-    print(f"\n几何邻近（**非碰撞判定**）: 台面 z={TABLE_Z:.3f} m；"
-          f"{'低于台面的序列: ' + str(worst) if worst else '无 body 原点低于台面'}")
+    print(f"\n几何邻近（**非碰撞判定**，包围球下界，排除装饰件）: "
+          f"要求 z ≥ {TABLE_Z + Z_CLEAR:.3f} m；"
+          f"{'余量不足的序列: ' + str(worst) if worst else '全部序列满足'}")
     print(f"\n人工签字前请逐张核对 {OUT.relative_to(ROOT)}/*.png —— "
           f"每张都带 {BANNER} 与序列/模型 hash。")
     return 0
