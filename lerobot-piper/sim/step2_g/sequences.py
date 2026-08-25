@@ -63,8 +63,16 @@ Z_CLEAR = 0.02                       # 台面之上要留的余量(m)
 # 与审查端(visual_check 渲染仿真位形)量的是同一个东西, 不留口径差。
 # 局限: 用的是**未标定**模型的动力学, 过冲估计本身有不确定性 —— 又一条
 # 「人工目视签字仍然必需」的理由。
-WS_SHRINK = 0.8                      # 动力学校验不过时每轮收缩比
-WS_TRIES = 5
+WS_BISECT = 8                        # 动力学校验的二分轮数
+# 二分**不能停在阈值上**: 收敛到 dyn_z == need 时, 审查端 0.1–0.2 mm 的数值差
+# (采样相位/浮点次序)就会把结论翻到线下 —— 实测 3 条 j2 序列生成端 +0.0190、
+# 审查端 +0.0188~9, need 恰为 0.0190。留 10 倍于该差异的收敛余量。
+BISECT_MARGIN = 0.002
+# 位形能不能用, 不能靠「多留 X 米余量」这种硬阈值判 —— 定小了会选出「静止余量
+# 1 mm、一摆就触底」的位形, 定大了(实测 0.03 m)会把 j1 的候选**全部**筛掉。
+# 改为直接问「这个位形还摆得动多少」: 要求至少能摆 MIN_USABLE_AMP_DEG。
+MIN_USABLE_AMP_DEG = 1.0
+DYN_GUARD = 2.5                      # 位形筛选时给动力学过冲留的倍数(实测最高 2×)
 PREMOVE_S, SETTLE_S, RETURN_S = 2.0, 1.0, 2.0     # 上机时间线的三段
 
 
@@ -124,7 +132,7 @@ def link_inertia(m, d, M, q6: np.ndarray) -> np.ndarray:
     return np.diag(M)[:6].copy()
 
 
-def pick_distal_poses(m, j: int, n: int = 3, n_sample: int = 3000,
+def pick_distal_poses(m, j: int, n: int = 3, n_sample: int = 20000,
                       seed: int = 20260824) -> list[np.ndarray]:
     """为激励关节 `j` 选 n 个**远端**配置，使 `I_link[j]` 的跨度尽量大 ——
     但**只在工作空间可行的位形里选**。
@@ -135,8 +143,17 @@ def pick_distal_poses(m, j: int, n: int = 3, n_sample: int = 3000,
     实测未筛时 j1 的最大惯量位形(j2=170°, j3=−164°)在 HOME 处 z=−0.059、
     j2 的最小惯量位形(j3=−6°, j4=−13°) z=−0.016 —— 都是**静止时就在桌下**，
     先取极值再筛只会得到空集或幅值被压到 0。
-    可行性在**摆动中心(目标关节置 HOME)**上判；整条轨迹的余量由
-    `fit_workspace()` 再缩幅保证。
+    **采样数**: 加上「路径可行 + 摆得动」两道过滤后，高惯量那一端的幸存者很稀疏。
+    3000 次采样时 j1 的最高惯量位形(0.544)被全部滤掉，跨度从 135.6× 塌到 26.3×，
+    而 `Ia1` 恰恰是靠位形跨度才可辨识的。采样是构建里**最便宜的部分**(纯运动学)，
+    故提到 2 万。
+
+    可行性判两件事，缺一不可：
+      · **位形本身**（目标关节置 HOME，即摆动中心）在台面之上；
+      · **从 HOME 到该位形的接近路径**全程在台面之上 —— `full_timeline` 的预移动
+        是两点间的关节直线插值，**两端都可行不代表中间可行**。实测 j1 的最大惯量
+        位形两端都过、路径穿桌，会在激励**开始之前**就撞上去。
+    整条激励轨迹的余量再由 `fit_workspace()` 缩幅保证。
     """
     d, M = mujoco.MjData(m), np.zeros((m.nv, m.nv))
     lo = m.jnt_range[:6, 0] + np.deg2rad(LIMIT_MARGIN_DEG)
@@ -148,20 +165,64 @@ def pick_distal_poses(m, j: int, n: int = 3, n_sample: int = 3000,
     Q = rng.uniform(lo, hi, size=(n_sample, 6))
     Q[:, : j + 1] = home[: j + 1]                 # 近端停 HOME, 只变远端
     need = TABLE_Z + Z_CLEAR
+    home = np.deg2rad(HOME_DEG)
     keep = []
     for q in Q:
         qc = q.copy()
         qc[j] = np.deg2rad(HOME_DEG[j])            # 摆动中心
-        if lowest_geom_z(m, d, qc) >= need:
+        # 位形本身 + 从 HOME 过去的**整条接近路径**
+        path = [home + (qc - home) * a_ for a_ in np.linspace(0.0, 1.0, 13)]
+        if all(lowest_geom_z(m, d, x) >= need for x in path):
             keep.append(q)
     if not keep:
         raise RuntimeError(f"j{j+1}: 没有工作空间可行的远端位形")
     Q = np.array(keep)
     I = np.array([link_inertia(m, d, M, q)[j] for q in Q])
-    order = np.argsort(I)
-    idx = [order[0], order[-1]] if n <= 2 else \
-          [order[0], order[len(order) // 2], order[-1]][:n]
-    return [Q[i] for i in idx]
+    order = list(np.argsort(I))
+
+    def usable(q: np.ndarray) -> bool:
+        """该位形下还能摆 ≥ MIN_USABLE_AMP_DEG 吗。
+
+        运动学判(便宜), 但按 `DYN_GUARD` 倍幅值检查 —— 动力学过冲实测最高 2×,
+        不留这个倍数会选出「运动学摆得动、动力学一摆就触底」的位形。
+        """
+        c = place(m, smooth_step(j, q, MIN_USABLE_AMP_DEG * DYN_GUARD, 5), j)
+        f, _ = full_timeline(c)
+        return all(lowest_geom_z(m, d, f[k, :6]) >= need
+                   for k in range(0, len(f), 5))
+
+    def best_in(seq):
+        """在给定的一档里，取**离台面最高**的那个位形。
+
+        不能直接取惯量极值: 惯量最大的位形往往是手臂伸最远的那个, 静止时勉强
+        过关、动力学过冲一来就触底 —— 实测 j1 惯量 0.550 的位形被选中后, 它的
+        7 条序列**全部**因幅值不足被丢弃, 套件里只剩 0.101, 跨度从 143× 塌到 26×。
+        在同一惯量档内换一个余量大的, 惯量只损失一点, 摆动空间大得多。
+        """
+        cand = [i for i in seq if usable(Q[i])]
+        if not cand:
+            return None
+        return max(cand, key=lambda i: lowest_geom_z(m, d, _center(Q[i])))
+
+    def _center(q):
+        qc = q.copy()
+        qc[j] = np.deg2rad(HOME_DEG[j])
+        return qc
+
+    k = max(1, len(order) // 20)                      # 每档取 5%
+    picks = [best_in(order[:k]), best_in(order[-k:])]           # 低惯量档 / 高惯量档
+    if n >= 3:
+        mid = len(order) // 2
+        picks.insert(1, best_in(order[mid - k // 2: mid + k // 2 + 1]))
+    picks = [i for i in picks if i is not None]
+    if not picks:
+        raise RuntimeError(f"j{j+1}: 没有既可行、又摆得动 {MIN_USABLE_AMP_DEG}° 的远端位形")
+    seen, out = set(), []
+    for i in picks[:n]:
+        if i not in seen:
+            seen.add(i)
+            out.append(Q[i])
+    return out
 
 
 # ── 基元 ────────────────────────────────────────────────────────────────
@@ -321,7 +382,7 @@ def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarr
     速度/加速度/关节限位三项检查都发现不了这个 —— 它是**工作空间**问题。
     """
     d = mujoco.MjData(m)
-    need = TABLE_Z + Z_CLEAR
+    need = TABLE_Z + Z_CLEAR + BISECT_MARGIN      # 目标留余量, 别收敛到边界
 
     def kin_ok(s: float) -> bool:
         c, _ = full_timeline(place(m, cmd, j, s))      # 查**全程**, 含预移动/回停
@@ -346,7 +407,10 @@ def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarr
                                   - m.geom_rbound[m.geom_bodyid != 0]).min()))
         return z
 
-    # 先用**运动学**二分快速定位(便宜), 再用**动力学**逐轮收缩校验(准确)
+    # 先用**运动学**二分快速定位(便宜), 再对**动力学**二分(准确)。
+    # 早先用「固定比例逐轮收缩、上限 5 轮」, 若 5 轮后仍不达标就**静默返回不合规的
+    # 序列** —— 实测 j1 的 p2 位形有 7 条这样漏出去, 在审查端才被报出来。
+    # 二分会收敛; 若连极小幅值都不达标, 明确抛错而不是放行。
     s = 1.0
     if not kin_ok(1.0):
         lo_, hi_ = 0.0, 1.0
@@ -357,10 +421,18 @@ def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarr
             else:
                 hi_ = mid
         s = lo_
-    for _ in range(WS_TRIES):
-        if dyn_z(s) >= need:
-            break
-        s *= WS_SHRINK
+    if dyn_z(s) < need:
+        lo_, hi_ = 0.0, s
+        for _ in range(WS_BISECT):
+            mid = (lo_ + hi_) / 2
+            if dyn_z(mid) >= need:
+                lo_ = mid
+            else:
+                hi_ = mid
+        s = lo_
+    # **不抛错**: 位形筛选用的是运动学判据, 而这里是动力学(过冲最高 2×), 两者必然
+    # 有落差。硬崩会让整套构建失败; 改为返回能找到的最大幅值, 由 `build()` 按
+    # 「幅值是否够用」决定丢弃并**报告**, 而不是静默放行或整体崩溃。
     return place(m, cmd, j, s), s
 
 

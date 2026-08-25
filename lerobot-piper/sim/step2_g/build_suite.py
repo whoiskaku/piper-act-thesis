@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 from sim.step2_g import params as PA                                  # noqa: E402
 from sim.step2_g.sequences import (                                   # noqa: E402
     FPS, Seq, check_limits, chirp, inertia_span, multisine,
-    HOME_DEG, check_limits, fit_limits, fit_workspace, max_amp,
+    HOME_DEG, MIN_USABLE_AMP_DEG, check_limits, fit_limits, fit_workspace, max_amp,
     pick_distal_poses, place, safe_center, slow_sweep, smooth_step,
 )
 
@@ -40,11 +40,26 @@ OUT = ROOT / "outputs/step2_g"
 
 
 def build(m) -> list[Seq]:
+    """生成套件。**调用前 `m` 必须已应用 `PA.baseline`** —— 见下。
+
+    工作空间检查是**动力学**判据, 其结果取决于模型参数。生成端若用 XML 原值
+    (`kp1=500`)、审查端用 `PA.baseline`(`kp1=5000`), 两边过冲不同 ⇒ 余量判定不同,
+    实测有 3 条生成端过、审查端报「余量不足」。故此处强制对齐。
+    """
+    assert m.actuator_gainprm[0, 0] == PA.baseline(m)[0], (
+        "build() 需要已应用 PA.baseline 的模型 —— 否则生成与审查的动力学不一致")
     seqs: list[Seq] = []
+    dropped: list[tuple[str, float]] = []
+
     def add(name, kind, j, cmd, pose, meta):
-        # 居中到限位内, 再按**工作空间**(台面上方)二分缩幅
+        # 居中到限位内, 再按**工作空间**(台面上方, 动力学)二分缩幅
         cmd, ws = fit_workspace(m, cmd, j)
-        seqs.append(Seq(name, kind, (j,), cmd, pose, {**meta, "ws_scale": round(ws, 3)}))
+        amp = float(np.rad2deg(cmd[:, j].max() - cmd[:, j].min()))
+        if amp < MIN_USABLE_AMP_DEG:
+            dropped.append((name, amp))            # 幅值不够用 ⇒ 丢弃并报告
+            return
+        seqs.append(Seq(name, kind, (j,), cmd, pose,
+                        {**meta, "ws_scale": round(ws, 3), "amp_final_deg": round(amp, 3)}))
     poses = {j: pick_distal_poses(m, j, n=3 if j < 4 else 1) for j in range(6)}
     # 幅值按各关节的量程与 pp2 包络取保守值
     amp = {0: 8.0, 1: 8.0, 2: 8.0, 3: 12.0, 4: 10.0, 5: 12.0}
@@ -79,7 +94,24 @@ def build(m) -> list[Seq]:
             cmd, _ = fit_limits(m, cmd, j)
         seqs.append(Seq(f"M_all_s{s}", "multisine", tuple(range(6)), cmd, base,
                         {"seed": s}))
-    return seqs
+
+    # **丢弃必须报出来。** 早先版本只往 `dropped` 里 append 却没有任何打印, 序列被
+    # **静默丢弃** —— 实测 101 条设计只剩 97 条而日志毫无痕迹。
+    if dropped:
+        print(f"⚠ 因工作空间余量不足**丢弃 {len(dropped)} 条**"
+              f"（缩幅后仍 < {MIN_USABLE_AMP_DEG}°）:")
+        for nm, a_ in dropped:
+            print(f"    {nm}  最终幅值 {a_:.3f}°")
+    # 去重: 限位/工作空间缩放可能把不同幅值压成同一条序列
+    seen, uniq = set(), []
+    for s_ in seqs:
+        if s_.sha in seen:
+            continue
+        seen.add(s_.sha)
+        uniq.append(s_)
+    if len(uniq) < len(seqs):
+        print(f"（去重 {len(seqs)} → {len(uniq)} 条）")
+    return uniq
 
 
 _MCACHE: list = []
@@ -124,6 +156,7 @@ def main() -> int:
     a = ap.parse_args()
 
     m = mujoco.MjModel.from_xml_path(str(MODEL))
+    PA.apply(m, PA.baseline(m))                    # 与 visual_check 对齐
     seqs = build(m)
     tot_s = sum(len(s.cmd) for s in seqs) / FPS
     print(f"套件 {len(seqs)} 条序列   合计 {tot_s/60:.1f} 分钟指令时长"
