@@ -267,6 +267,21 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             e2 = int((v[half:].max(1) > np.degrees(PRE_VEL_TOL)).sum())
             print(f"  **前半段 {e1} 次 vs 后半段 {e2} 次** ⇒ "
                   f"{'在衰减(疑似应力释放瞬态)' if e2 < e1 else '未衰减(持续现象)'}")
+        # **分段位置带** —— 事件次数与带宽是两回事: 2026-08-26 的
+        # S_j2_p0_r5_f0.35 在 j4=59° 处带宽 5s 内 0.117→0.427°(涨 4 倍),
+        # 而门禁判的正是带宽。诊断必须直接给出「带宽是收敛到上界还是继续涨」。
+        nseg = 5
+        seg = [s[i * len(s) // nseg:(i + 1) * len(s) // nseg] for i in range(nseg)]
+        bands = np.array([w.max(0) - w.min(0) for w in seg])       # (nseg, 6)
+        cum = np.array([s[:(i + 1) * len(s) // nseg].max(0)
+                        - s[:(i + 1) * len(s) // nseg].min(0)
+                        for i in range(nseg)])                     # 累积带宽
+        jw = int(bands.max(0).argmax())                            # 最活跃关节
+        print(f"  分 {nseg} 段位置带 j{jw+1}(度): {np.round(bands[:, jw], 4)}")
+        print(f"  **累积**位置带 j{jw+1}(度): {np.round(cum[:, jw], 4)}"
+              f"  ⇒ {'趋于上界(有界)' if cum[-1, jw] < 1.15 * cum[nseg//2, jw] else '**仍在增长**'}")
+        print(f"  全程位置带(度): {np.round(s.max(0) - s.min(0), 4)}"
+              f"   门禁阈 {np.degrees(BAND_TOL):.1f}°")
         _d = (outdir or PROBE) / f"settle_probe_{tag}{arm}_{int(time.time())}.json"
         _d.parent.mkdir(parents=True, exist_ok=True)
         _d.write_text(json.dumps({
@@ -274,6 +289,8 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             "settle_s": PRESETTLE_S, "fps": FPS,
             "settle_deg": s.tolist(), "vel_deg_s": v.tolist(),
             "jump_idx": jump.tolist(),
+            "band_full_deg": (s.max(0) - s.min(0)).tolist(),
+            "band_tol_deg": float(np.degrees(BAND_TOL)),
         }, ensure_ascii=False, indent=1))
         print(f"  ⤷ {_d.name}")
         print("  （观测模式：**未跑激励序列**，安全门与协议默认值均未改动）")
@@ -302,11 +319,33 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     vel_all = np.abs(np.diff(np.asarray(settle, float), axis=0) * FPS)
     n_over_all = int((vel_all > PRE_VEL_TOL).sum())
     n_over = int((vel > PRE_VEL_TOL).sum())
-    # (b) 偏差 ≤ 指令超出可达范围的量 + 1°
-    from make_probe_b2 import reach_limits
-    klo, khi = reach_limits()
-    unreach = np.maximum(np.maximum(klo - q_tgt, q_tgt - khi), 0.0)
-    tol = unreach + np.radians(1.0)
+    # (b) 到位容差 —— **两套规则, 按序列来源自动选定, 每次运行都打印**
+    #
+    # 原规则: 容差 = 「指令超出**可达范围**的量」+ 1°。`reach_limits()` 是 20 集
+    # pp2 编码器实测 min/max, 本意很窄且正确 —— 处理**静态饱和**的关节
+    # (j2 指令到 −2.40° 但编码器只到 −0.07°, 静态偏差 +1.17°)。
+    #
+    # 2026-08-26 查出误用: step2_g 激励套件**按设计**走出 pp2 包络(j4 在 pp2 里
+    # 从没动过), 于是「为饱和开的口子」变成了「为**没去过的地方**开的口子」——
+    # 75/90 条被放宽, j3 最多 110.4°、j6 97.6°、j4 81.5°, **到位门禁等于关闭**。
+    # 实测它从未真的起作用: 已收 27 条最大偏差 0.151°, 比 1° 低一个数量级。
+    # ⇒ 用户决定(2026-08-26): **step2_g 一律用固定 1°**, 不做饱和豁免。
+    #   依据: 套件位形全部在模型限位内且余量 ≥5°, 真机实测到位误差 ≤0.151°。
+    #   若后续某条确实命中 j2/j3 饱和点, 会**如实挂掉**并停机排查 —— 这正是
+    #   门禁该做的事, 而不是被一个 110° 的豁免提前抹掉。
+    # 判据按**序列来源**自动选, 不做成可能忘记传的开关。
+    _from_suite = "outputs/step2_g" in str(Path(seqfile).resolve()) \
+        if seqfile else False
+    if _from_suite:
+        unreach = np.zeros(6)
+        tol = np.full(6, np.radians(1.0))
+        _tol_rule = "固定 1° (step2_g 套件; 不做饱和豁免)"
+    else:
+        from make_probe_b2 import reach_limits
+        klo, khi = reach_limits()
+        unreach = np.maximum(np.maximum(klo - q_tgt, q_tgt - khi), 0.0)
+        tol = unreach + np.radians(1.0)
+        _tol_rule = "可达范围豁免 + 1° (pp2 回放)"
     dev = np.abs(q_pre - q_tgt)
     j_bad = int(np.argmax(dev - tol))
     print(f"  预移动后 [判据: 最后 {BAND_WINDOW_S:.0f}s 位置带 R_j ≤ "
@@ -354,8 +393,10 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
                              f"不是毛刺; 不要靠重试绕过**"),
         }, ensure_ascii=False, indent=1))
         print(f"    ⤷ 稳定段轨迹: {_d.name}")
+    print(f"    到位容差规则: {_tol_rule}")
     print(f"    逐关节 |偏差| {np.round(np.degrees(dev), 3)}°  容差 {np.round(np.degrees(tol), 3)}°"
-          f"  (含指令超出可达范围 {np.round(np.degrees(unreach), 3)}°)")
+          + (f"  (含指令超出可达范围 {np.round(np.degrees(unreach), 3)}°)"
+             if unreach.max() > 0 else ""))
     assert not band_bad.any(), (
         f"稳定段位置带超限: j{int(band_bad.argmax())+1} R={np.degrees(band.max()):.3f}° "
         f"> {np.degrees(BAND_TOL):.1f}° —— **立即停机, 不自动重试**")
