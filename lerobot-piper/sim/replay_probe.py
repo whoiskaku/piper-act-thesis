@@ -176,7 +176,19 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     # 改判两条: (a) 已**稳定**(末段速度 <0.5°/s);
     #          (b) 偏差 ≤ 该关节"指令超出可达范围的量" + 1° 的裕度。
     # 六臂之间的一致性由门禁③(state_init 离散 <0.5°)把关, 那才是真正要保证的。
-    PREMOVE_S, PRESETTLE_S = 3.0, 1.5
+    # ── 稳定判据（2026-08-24 修订并冻结；这是**失败之后**的门槛修订）────────
+    # 起因: j4 pilot 的 P03 连续两次被旧判据(末段 0.5s 峰速 ≤ 0.5°/s)拦下。
+    # 20 秒静置诊断证明: j4/j6 存在**有界、不衰减**的腕部极限环 ——
+    #   20s 内 j4 跳 29 次 / j6 跳 11 次, 幅度 0.104–0.152°, 速率约 1.5 次/秒,
+    #   分四段计数 10/8/10/11(**不衰减**), j4 位置始终在 0.284° 带内往复,
+    #   其余四关节全程精确 0.0000。编码器细分辨率 ≤0.005° ⇒ 不是量化噪声。
+    # 旧判据测的是**速度**, 而它的设计意图是「预移动的余振停了没有」。极限环
+    # 不是余振: 有界、不衰减、不发散。用速度阈值去测它, 0.5s 窗口撞上跳变的
+    # 概率约一半 ⇒ **门变成抛硬币**(P01/P02 通过时 settle_vmax_dps 恰为 0.0)。
+    # 修订: 改测**位置带**(运动是否有界在可接受范围内), 不对 j4/j6 做隐藏豁免。
+    PREMOVE_S, PRESETTLE_S = 3.0, 5.0              # 稳定时间 1.5 → 5.0 s
+    BAND_WINDOW_S = 2.0                            # 判据只看**最后 2 s**
+    BAND_TOL = np.radians(0.5)                     # 每个关节 R_j = max−min ≤ 0.5°
     if settle_probe > 0:
         # **观测模式**: 只做预移动 + 长时间静置采样, 然后退出, **不跑激励**。
         # 用来回答「j4 的粘滑会不会自己停」—— 这是实测题, 不是判断题。
@@ -234,7 +246,11 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
 
     obs0 = robot.capture_observation()                    # 起始状态改在**预移动后**取
     q_pre = obs0["observation.state"].numpy()[:6] * np.pi / 180 / 1000
-    # (a) 稳定: 末段 0.5s 的关节速度
+    # (a) 稳定: **位置带**判据 —— 最后 BAND_WINDOW_S 秒内每个关节的 max−min
+    win = np.asarray(settle[-int(BAND_WINDOW_S * FPS):], float)
+    band = win.max(0) - win.min(0)
+    band_bad = band > BAND_TOL
+    # 速度/跳变仍**完整报告**, 但不再决定通过与否
     tail = np.asarray(settle[-int(0.5 * FPS):], float)
     vel = np.abs(np.diff(tail, axis=0) * FPS) if len(tail) > 1 else np.zeros((1, 6))
     vmax = float(vel.max())
@@ -257,14 +273,29 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     tol = unreach + np.radians(1.0)
     dev = np.abs(q_pre - q_tgt)
     j_bad = int(np.argmax(dev - tol))
-    print(f"  预移动后: 末段峰速 {np.degrees(vmax):.3f}°/s (阈 {np.degrees(PRE_VEL_TOL):.1f})"
-          f"  {'✓稳定' if vmax <= PRE_VEL_TOL else '✗未稳定'}")
-    print(f"    峰值出现在 **j{j_v+1}** 末段第 {k_v+1}/{len(vel)} 个采样; "
-          f"中位速度 {np.degrees(v_med):.3f}°/s; 超阈采样 末段 {n_over}/{vel.size}, "
-          f"**全稳定段 {n_over_all}/{vel_all.size}**")
-    print(f"    逐关节峰速 {np.round(np.degrees(vel.max(0)), 3)}°/s")
-    if vmax > PRE_VEL_TOL:
-        _d = (outdir or PROBE) / f"settle_fail_{tag}{arm}_{int(time.time())}.json"
+    print(f"  预移动后 [判据: 最后 {BAND_WINDOW_S:.0f}s 位置带 R_j ≤ "
+          f"{np.degrees(BAND_TOL):.1f}°]")
+    print(f"    R_j = {np.round(np.degrees(band), 4)}°"
+          f"   {'✓ 全部在带内' if not band_bad.any() else '✗ 超限 j' + str(int(band_bad.argmax()) + 1)}")
+    print(f"    —— 以下仅报告, **不决定通过/失败** ——")
+    _sd = np.diff(np.asarray(settle, float), axis=0)      # 带符号, 供方向统计
+    print(f"    末段峰速 {np.degrees(vmax):.3f}°/s @ j{j_v+1}; "
+          f"中位 {np.degrees(v_med):.3f}°/s")
+    print(f"    跳变(>{np.degrees(PRE_VEL_TOL):.1f}°/s) 全稳定段 {n_over_all}/{vel_all.size}"
+          f"; 逐关节 {(vel_all > PRE_VEL_TOL).sum(0).tolist()}")
+    for _j in range(6):
+        _m = np.abs(_sd[:, _j]) * FPS > PRE_VEL_TOL
+        if _m.any():
+            _v = _sd[_m, _j] * FPS
+            print(f"      j{_j+1}: {int(_m.sum())} 次, 幅度 "
+                  f"{np.degrees(np.abs(_v)).min():.3f}–{np.degrees(np.abs(_v)).max():.3f}°/s, "
+                  f"方向 +{int((_v > 0).sum())}/−{int((_v < 0).sum())}, "
+                  f"净位移 {np.degrees(_sd[:, _j].sum()):+.4f}°")
+    # **稳定段轨迹每次都存**（不只失败时）—— P01/P02 只存了标量 settle_vmax_dps,
+    # 门槛修订后无法回算, 这个缺口不该再出现。
+    _tagp = "settle_fail_" if band_bad.any() else "settle_"
+    if True:
+        _d = (outdir or PROBE) / f"{_tagp}{tag}{arm}_{int(time.time())}.json"
         _d.parent.mkdir(parents=True, exist_ok=True)
         _d.write_text(json.dumps({
             "arm": arm, "seqfile": str(seqfile),
@@ -276,15 +307,22 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             "n_over_tail": n_over, "n_samples_tail": int(vel.size),
             "n_over_full_settle": n_over_all, "n_samples_full": int(vel_all.size),
             "peak_joint_1based": int(j_v) + 1,
+            "band_deg": np.degrees(band).tolist(),
+            "band_tol_deg": float(np.degrees(BAND_TOL)),
+            "band_window_s": BAND_WINDOW_S, "settle_s": PRESETTLE_S,
+            "gate": "position-band (2026-08-24 修订冻结)",
+            "passed": bool(not band_bad.any()),
             "verdict": ("疑似单次毛刺 —— 可重试一次"
                         if n_over_all <= 1 and vmax > 3 * max(v_med, 1e-9)
                         else f"**全稳定段有 {n_over_all} 次超阈 ⇒ 可复现现象, "
                              f"不是毛刺; 不要靠重试绕过**"),
         }, ensure_ascii=False, indent=1))
-        print(f"    ⤷ 稳定段轨迹已落盘: {_d.name}（断言在落盘前触发会丢证据，故先存）")
+        print(f"    ⤷ 稳定段轨迹: {_d.name}")
     print(f"    逐关节 |偏差| {np.round(np.degrees(dev), 3)}°  容差 {np.round(np.degrees(tol), 3)}°"
           f"  (含指令超出可达范围 {np.round(np.degrees(unreach), 3)}°)")
-    assert vmax <= PRE_VEL_TOL, f"预移动后仍在动 ({np.degrees(vmax):.3f}°/s) —— 停机排查"
+    assert not band_bad.any(), (
+        f"稳定段位置带超限: j{int(band_bad.argmax())+1} R={np.degrees(band.max()):.3f}° "
+        f"> {np.degrees(BAND_TOL):.1f}° —— **立即停机, 不自动重试**")
     assert (dev <= tol).all(), (
         f"预移动未到位: j{j_bad+1} 偏差 {np.degrees(dev[j_bad]):.3f}° > 容差 "
         f"{np.degrees(tol[j_bad]):.3f}° —— 停机排查, 六臂起始位姿必须一致")
