@@ -49,6 +49,7 @@ plt.rcParams["font.sans-serif"] = ["Noto Sans CJK JP", "Noto Sans CJK SC", "Deja
 plt.rcParams["axes.unicode_minus"] = False
 
 OUT = ROOT / "outputs/step2_g/visual"
+OUT_PILOT = ROOT / "outputs/step2_g/visual_pilot"
 BANNER = "COLLISION DISABLED — VISUAL ONLY"
 VIEWS = (("正面", 0.0, -20.0), ("侧面", 90.0, -20.0), ("俯视", 0.0, -85.0))
 N_SHOT = 6
@@ -144,12 +145,28 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", help="只处理名字含该串的序列")
     ap.add_argument("--max", type=int)
+    ap.add_argument("--pilot", action="store_true",
+                    help="改渲染 j4 分级 pilot 的序列（它们不在主套件里，"
+                         "但同样要在上机前过目视审查）")
     a = ap.parse_args()
     m = mujoco.MjModel.from_xml_path(str(MODEL))
     assert not ((m.geom_contype != 0) & (m.geom_conaffinity != 0)).any(), \
         "模型碰撞已开启 —— 本工具的免责声明与实际不符, 请先确认意图"
     PA.apply(m, PA.baseline(m))
-    seqs = build(m)
+    if a.pilot:
+        # pilot 序列不在主套件里。它去的是 j4 **从未验证过**的包络
+        # (pp2 里 j4 的指令范围是 0.0…0.0), 因此更需要目视审查, 不是更不需要。
+        from sim.step2_g.pilot_j4 import OUT as POUT
+        from sim.step2_g.sequences import Seq as _S
+        seqs = []
+        for f in sorted(POUT.glob("P*.npz")):
+            z = np.load(f, allow_pickle=True)
+            seqs.append(_S(str(z["tag"]), "pilot", (3,),
+                           z["cmd7"].astype(float), np.zeros(6), {}))
+        if not seqs:
+            raise SystemExit("pilot npz 不存在 —— 先跑 pilot_j4.py --save")
+    else:
+        seqs = build(m)
     if a.only:
         seqs = [s for s in seqs if a.only in s.name]
     if a.max:
@@ -161,7 +178,8 @@ def main() -> int:
     print("  本回放可发现: 穿模 / 方向反 / 指令跳变 / 危险包络")
     print("  本回放**不能**证明: 碰撞安全、力矩可行、热可行")
     print("█" * 62)
-    print(f"\n{len(seqs)} 条序列 → {OUT.relative_to(ROOT)}/\n")
+    _o = OUT_PILOT if a.pilot else OUT
+    print(f"\n{len(seqs)} 条序列 → {_o.relative_to(ROOT)}/\n")
     print(f"{'序列':<22}{'指令范围(度)':>16}{'仿真范围(度)':>16}"
           f"{'过冲':>7}{'最低z(m)':>10}{'序列hash':>13}")
     worst = []
@@ -175,7 +193,8 @@ def main() -> int:
         sr = (np.rad2deg(q[k0:k1, j].min()), np.rad2deg(q[k0:k1, j].max()))
         ov = (sr[1] - sr[0]) / max(cr[1] - cr[0], 1e-9)
         lz = lowest_z(m, q)
-        sheet(m, s, q, full, spans, OUT / f"{s.name}.png")
+        sheet(m, s, q, full, spans,
+              (OUT_PILOT if a.pilot else OUT) / f"{s.name}.png")
         flag = "  ⚠余量不足" if lz < TABLE_Z + Z_CLEAR else ""
         if lz < TABLE_Z + Z_CLEAR:
             worst.append(s.name)
@@ -184,7 +203,7 @@ def main() -> int:
     print(f"\n几何邻近（**非碰撞判定**，包围球下界，排除装饰件）: "
           f"要求 z ≥ {TABLE_Z + Z_CLEAR:.3f} m；"
           f"{'余量不足的序列: ' + str(worst) if worst else '全部序列满足'}")
-    print(f"\n人工签字前请逐张核对 {OUT.relative_to(ROOT)}/*.png —— "
+    print(f"\n人工签字前请逐张核对 {_o.relative_to(ROOT)}/*.png —— "
           f"每张都带 {BANNER} 与序列/模型 hash。")
     return 0
 
