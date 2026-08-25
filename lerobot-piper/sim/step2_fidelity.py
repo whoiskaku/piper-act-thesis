@@ -46,6 +46,36 @@ sys.path.insert(0, str(ROOT / "sim"))
 from sim.step1_v2_loss import ALIGN_L, BAND, bandpass41, load_calib, render_ideal  # noqa: E402
 from sim.step2_gap_baseline import aa_down, bare_logs, dyn_replay_cmd  # noqa: E402
 
+sys.path.insert(0, str(ROOT / "sim/step2_g"))
+from accel_limit import accel_limited, pure_delay  # noqa: E402
+
+# ── 固件 MOVE J 的运动学限幅（2026-08-26 加）────────────────────────────────
+# 87→90 条激励套件测出: 指令与关节之间有一个**加速度受限的运动学轨迹生成器**,
+# 它在 0.3–6 Hz 激励带内主导响应, 而当前 G(线性位置伺服)完全没有这一项。
+# 逐关节参数在**大幅值真阶跃**上拟合(见 accel_limit.fit_ad / mechanism.py):
+#   · 只有大幅值档能约束 a(小幅值时限幅几乎不触发, 留出验证 0.53–0.62° vs 0.05–0.19°)
+#   · j4 的 a 弱可辨识(±60% 只让 RMS 变 1.3×, 其余 3.7–18.6×), 数值仅供占位
+A_MAX = np.array([319.0, 319.0, 307.0, 346.0, 391.0, 307.0])      # °/s²
+D_SEC = np.array([0.075, 0.075, 0.070, 0.065, 0.090, 0.075])      # s, 纯传输延迟
+
+
+def apply_limiter(act: np.ndarray, mode: str) -> np.ndarray:
+    """指令 → 固件 MOVE J 限幅 → 再喂 MuJoCo。这是「串联」而非「二选一」。
+
+    mode: "none" 不改 · "a" 只加速度限 · "ad" 加速度限 + 纯延迟。
+    "a" 与 "ad" 分开是因为 MuJoCo 伺服自身也有滞后(j1 的 kp=5000 当初正是为了
+    凑出 2 帧滞后而手调的), 再叠一个 65–90 ms 纯延迟可能**重复计入**。
+    """
+    if mode == "none":
+        return act
+    out = np.array(act, float, copy=True)
+    for j in range(6):
+        y = accel_limited(np.degrees(act[:, j]), A_MAX[j])
+        if mode == "ad":
+            y = pure_delay(y, D_SEC[j])
+        out[:, j] = np.radians(y)
+    return out
+
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK JP", "Noto Sans CJK SC", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
@@ -59,7 +89,8 @@ CALIB = ROOT / "outputs/p2_labels/pp2a-deploy/manifest.json"
 OUT = ROOT / "outputs/step2_g/legacy_fidelity"
 
 
-def episode_traces(log: Path, R: np.ndarray):
+def episode_traces(log: Path, R: np.ndarray, limiter: str = "none",
+                   kpmul: float | None = None):
     """→ dict: 三条带通后的陀螺轨迹(已对齐) + 接缝位置。"""
     d = json.loads(log.read_text())
     fr = d["frames"]
@@ -67,7 +98,12 @@ def episode_traces(log: Path, R: np.ndarray):
     real = np.asarray([f["imu"] for f in fr], float)[:, 3:6]
     kin = render_ideal(d["chunks"], len(fr))
     n = min(len(fr) - ALIGN_L, len(kin))
-    hi, fs = dyn_replay_cmd(act, {0: 5000.0})
+    import mujoco as _mj
+    from sim.step2_gap_baseline import MODEL as _MODEL
+    _m0 = _mj.MjModel.from_xml_path(str(_MODEL))
+    jkp = ({j: float(_m0.actuator_gainprm[j, 0]) * kpmul for j in range(6)}
+           if kpmul is not None else {0: 5000.0})
+    hi, fs = dyn_replay_cmd(apply_limiter(act, limiter), jkp)
     dyn = aa_down(hi, fs, len(fr))[:, 3:6] @ R.T
     n = min(n, len(dyn))
     return {
@@ -108,6 +144,12 @@ def main() -> int:
     ap.add_argument("--ep", help="画波形的集(stem)")
     ap.add_argument("--axis", type=int, default=1, help="陀螺轴 0/1/2")
     ap.add_argument("--n", type=int, help="只算前 N 集")
+    ap.add_argument("--limiter", choices=("none", "a", "ad"), default="none",
+                    help="在 MuJoCo 之前插入固件 MOVE J 的加速度限幅")
+    ap.add_argument("--kpmul", type=float, default=None,
+                    help="把**全部** kp 乘以该倍数(覆盖 j1 的 5000 手调值)。"
+                         "真机静态刚度 ≥1.5e5 N·m/rad(无重力垂落), 而 XML 的 "
+                         "kp=200 预测 1.51° 垂落 ⇒ 限幅器在前之后, 后级伺服应更硬。")
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     R, _ = load_calib(CALIB)
@@ -116,11 +158,14 @@ def main() -> int:
     # ── 分区保真度(全部裸 ACT 集汇总) ───────────────────────────────
     print("⚠ legacy_development：当前手调 XML 基线，不是自动标定 G0 或最终验收")
     print(f"分区保真度开发诊断 —— {len(logs)} 集已查看的裸 ACT")
-    print(f"口径 {BAND[0]}–{BAND[1]} Hz 陀螺三轴;  黄=理想 蓝=现实 绿=手调 XML\n")
+    print(f"口径 {BAND[0]}–{BAND[1]} Hz 陀螺三轴;  黄=理想 蓝=现实 绿=手调 XML")
+    print(f"限幅器: {{'none':'无(当前 G)','a':'加速度限','ad':'加速度限+纯延迟'}}[a.limiter]"
+          .replace('{a.limiter}', a.limiter) if False else
+          f"限幅器: {'无(当前 G)' if a.limiter=='none' else ('加速度限' if a.limiter=='a' else '加速度限+纯延迟')}\n")
     acc: dict[str, list] = {}
     traces = []
     for p in logs:
-        tr = episode_traces(p, R)
+        tr = episode_traces(p, R, a.limiter, a.kpmul)
         traces.append(tr)
         for nm, m in regions(tr).items():
             acc.setdefault(nm, []).append(fidelity(tr, m))

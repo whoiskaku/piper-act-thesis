@@ -448,14 +448,19 @@ def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarr
         return timeline_z_ok(m, d, c, sp, need, stride)
 
     def dyn_z(s: float) -> float:
-        """跑动力学, 返回**完整上机时间线**仿真位形的最低 geom z。
+        """跑动力学, 返回**设计段**(稳定/激励)仿真位形的最低 geom z。
 
-        与 `kin_ok` 同样分两段: 转运段(预移动/归位/停放)只要求不低于**停放位姿
-        自身**的余量, 故这里把它们的裕度折算回来 —— 返回值仍与 `need` 比较,
-        转运段的读数先加上 (need − park_z) 再参与取最小。见 `timeline_z_ok`。
+        **只查设计段, 不查转运段** —— 两条理由:
+          ① 动力学过冲要管的是**激励**(实测最高 2×), 转运段是 2–3 s 的余弦插值,
+             动力学贡献可忽略;
+          ② 更要紧: `dyn_z` 用的是 MuJoCo 伺服模型, 而实测表明它的**静态柔度
+             比真机软约 900 倍**(该模型预测 j2 在 5.28 N·m 下垂落 1.51°,
+             真机实测 ≤0.002°)。拿一个已知错误的柔性模型去卡**停放位姿**,
+             加的是噪声不是安全 —— 实测后果: 停放处的虚假下垂使全部幅值被
+             二分到 0, 90 条里 87 条被判「最终幅值 0.000°」。
+        转运段的把关交给 `kin_ok` 的两段式运动学判据(见 `timeline_z_ok`)。
         """
         c, sp = full_timeline(place(m, cmd, j, s))
-        off = need - park_z(m, d)                  # 转运段允许比 need 低这么多
         span_of = np.empty(len(c), dtype=object)
         for a, b, nm in sp:
             span_of[a:b] = nm
@@ -469,12 +474,9 @@ def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarr
             dd.ctrl[:6] = c[k, :6]
             for _ in range(sub):
                 mujoco.mj_step(m, dd)
-            if k % stride == 0:
-                zk = float((dd.geom_xpos[m.geom_bodyid != 0, 2]
-                            - m.geom_rbound[m.geom_bodyid != 0]).min())
-                if span_of[k] not in DESIGN_SPANS:
-                    zk += off                      # 转运段: 折算回 need 口径
-                z = min(z, zk)
+            if k % stride == 0 and span_of[k] in DESIGN_SPANS:
+                z = min(z, float((dd.geom_xpos[m.geom_bodyid != 0, 2]
+                                  - m.geom_rbound[m.geom_bodyid != 0]).min()))
         return z
 
     # 先用**运动学**二分快速定位(便宜), 再对**动力学**二分(准确)。
