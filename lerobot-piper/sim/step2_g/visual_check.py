@@ -42,7 +42,7 @@ sys.path.insert(0, str(ROOT))
 from sim.step2_g import params as PA                                   # noqa: E402
 from sim.step2_g.build_suite import MODEL, build                       # noqa: E402
 from sim.step2_g.sequences import (                                    # noqa: E402
-    FPS, HOME_DEG, TABLE_Z, Z_CLEAR, lowest_geom_z,
+    FPS, TABLE_Z, Z_CLEAR, full_timeline, lowest_geom_z,
 )
 
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK JP", "Noto Sans CJK SC", "DejaVu Sans"]
@@ -50,30 +50,8 @@ plt.rcParams["axes.unicode_minus"] = False
 
 OUT = ROOT / "outputs/step2_g/visual"
 BANNER = "COLLISION DISABLED — VISUAL ONLY"
-PREMOVE_S, SETTLE_S, RETURN_S = 2.0, 1.0, 2.0
 VIEWS = (("正面", 0.0, -20.0), ("侧面", 90.0, -20.0), ("俯视", 0.0, -85.0))
 N_SHOT = 6
-
-
-def timeline(cmd: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int, str]]]:
-    """完整上机时间线：HOME →(预移动)→ 起点 →(稳定)→ 激励 →(回停)→ HOME。"""
-    home = np.zeros(7)
-    home[:6] = np.deg2rad(HOME_DEG)
-    npre, nset, nret = (int(x * FPS) for x in (PREMOVE_S, SETTLE_S, RETURN_S))
-    ramp = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, npre)))[:, None]
-    pre = home[None, :] + (cmd[0] - home)[None, :] * ramp
-    setl = np.repeat(cmd[0][None, :], nset, axis=0)
-    ramp2 = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, nret)))[:, None]
-    ret = cmd[-1][None, :] + (home - cmd[-1])[None, :] * ramp2
-    tail = np.repeat(home[None, :], int(0.5 * FPS), axis=0)
-    full = np.concatenate([pre, setl, cmd, ret, tail])
-    k = 0
-    spans = []
-    for nm, n in (("预移动", npre), ("稳定", nset), ("激励", len(cmd)),
-                  ("回停", nret), ("停放", len(tail))):
-        spans.append((k, k + n, nm))
-        k += n
-    return full, spans
 
 
 def roll(m, full: np.ndarray) -> np.ndarray:
@@ -188,7 +166,7 @@ def main() -> int:
           f"{'过冲':>7}{'最低z(m)':>10}{'序列hash':>13}")
     worst = []
     for s in seqs:
-        full, spans = timeline(s.cmd)
+        full, spans = full_timeline(s.cmd)
         q = roll(m, full)
         j = s.target[0]
         # 过冲只在**激励段**上算 —— 含预移动的全程范围会把它稀释掉(实测全成 1.00×)

@@ -58,6 +58,39 @@ class Seq:
 
 TABLE_Z = -0.001                     # deco_table 台面高度(m)
 Z_CLEAR = 0.02                       # 台面之上要留的余量(m)
+# 过冲不能靠猜系数: 实测本套件 j2 快阶跃的仿真过冲达 **1.57–2.01×**, 远超
+# 曾假设的 1.2×(那是慢扫的值)。故 `fit_workspace` **直接跑动力学**并判仿真轨迹,
+# 与审查端(visual_check 渲染仿真位形)量的是同一个东西, 不留口径差。
+# 局限: 用的是**未标定**模型的动力学, 过冲估计本身有不确定性 —— 又一条
+# 「人工目视签字仍然必需」的理由。
+WS_SHRINK = 0.8                      # 动力学校验不过时每轮收缩比
+WS_TRIES = 5
+PREMOVE_S, SETTLE_S, RETURN_S = 2.0, 1.0, 2.0     # 上机时间线的三段
+
+
+def full_timeline(cmd: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int, str]]]:
+    """完整上机时间线：HOME →(预移动)→ 起点 →(稳定)→ 激励 →(回停)→ HOME。
+
+    **工作空间检查必须查全程, 不能只查激励段** —— 预移动同样会扫过空间。
+    实测只查激励段时, 生成端判过、审查端(查全程)仍报「余量不足」, 两端打架。
+    生成与审查共用本函数, 消除口径差。
+    """
+    home = np.zeros(7)
+    home[:6] = np.deg2rad(HOME_DEG)
+    npre, nset, nret = (int(x * FPS) for x in (PREMOVE_S, SETTLE_S, RETURN_S))
+    r1 = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, npre)))[:, None]
+    r2 = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, nret)))[:, None]
+    pre = home[None, :] + (cmd[0] - home)[None, :] * r1
+    setl = np.repeat(cmd[0][None, :], nset, axis=0)
+    ret = cmd[-1][None, :] + (home - cmd[-1])[None, :] * r2
+    tail = np.repeat(home[None, :], int(0.5 * FPS), axis=0)
+    full = np.concatenate([pre, setl, cmd, ret, tail])
+    k, spans = 0, []
+    for nm, n in (("预移动", npre), ("稳定", nset), ("激励", len(cmd)),
+                  ("回停", nret), ("停放", len(tail))):
+        spans.append((k, k + n, nm))
+        k += n
+    return full, spans
 
 
 def lowest_geom_z(m, d, q6: np.ndarray) -> float:
@@ -290,21 +323,45 @@ def fit_workspace(m, cmd: np.ndarray, j: int, stride: int = 5) -> tuple[np.ndarr
     d = mujoco.MjData(m)
     need = TABLE_Z + Z_CLEAR
 
-    def ok(s: float) -> bool:
-        c = place(m, cmd, j, s)
+    def kin_ok(s: float) -> bool:
+        c, _ = full_timeline(place(m, cmd, j, s))      # 查**全程**, 含预移动/回停
         return all(lowest_geom_z(m, d, c[k, :6]) >= need
                    for k in range(0, len(c), stride))
 
-    if ok(1.0):
-        return place(m, cmd, j), 1.0
-    lo_, hi_ = 0.0, 1.0
-    for _ in range(12):
-        mid = (lo_ + hi_) / 2
-        if ok(mid):
-            lo_ = mid
-        else:
-            hi_ = mid
-    return place(m, cmd, j, lo_), lo_
+    def dyn_z(s: float) -> float:
+        """跑动力学, 返回**完整上机时间线**仿真位形的最低 geom z。"""
+        c, _ = full_timeline(place(m, cmd, j, s))
+        dd = mujoco.MjData(m)
+        dd.qpos[:6] = c[0, :6]
+        mujoco.mj_forward(m, dd)
+        dd.ctrl[:6] = c[0, :6]
+        sub = int(round(1 / FPS / m.opt.timestep))
+        z = np.inf
+        for k in range(len(c)):
+            dd.ctrl[:6] = c[k, :6]
+            for _ in range(sub):
+                mujoco.mj_step(m, dd)
+            if k % stride == 0:
+                z = min(z, float((dd.geom_xpos[m.geom_bodyid != 0, 2]
+                                  - m.geom_rbound[m.geom_bodyid != 0]).min()))
+        return z
+
+    # 先用**运动学**二分快速定位(便宜), 再用**动力学**逐轮收缩校验(准确)
+    s = 1.0
+    if not kin_ok(1.0):
+        lo_, hi_ = 0.0, 1.0
+        for _ in range(10):
+            mid = (lo_ + hi_) / 2
+            if kin_ok(mid):
+                lo_ = mid
+            else:
+                hi_ = mid
+        s = lo_
+    for _ in range(WS_TRIES):
+        if dyn_z(s) >= need:
+            break
+        s *= WS_SHRINK
+    return place(m, cmd, j, s), s
 
 
 def max_amp(m, j: int, gen, probe_deg: float = 1.0) -> float:
