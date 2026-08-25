@@ -138,6 +138,66 @@ def safety_checks(cmd7, da, model_path=None):
     return msgs, degraded
 
 
+
+# ── 断开前的分段插值归位（2026-08-26 新增；修复未被任何检查覆盖的真机回停）──────
+# 起因: `PiperMotorsBus.safe_disconnect()` 是**一次性写、无插值**:
+#     safe_disable_position = [0, 0, 0, 0, 0.52, 0, 0]
+#     def safe_disconnect(self): self.write(target_joint=self.safe_disable_position)
+# 从 S_j4_p2_rise10_a8.2 的末帧出发, 等于让腕部在低头 62° 的姿态下横滚 114°、
+# 同时 j2 下扫 51°, 全部并发、速度由固件决定 —— 实测发生碰撞, 臂停在瘫态。
+#
+# **为什么模型检查看不见**: j6 单独转 30° 时 link6 原点移动 **0.0 mm**
+# (它是绕工具轴的末端滚转)。模型里腕体完全不动 ⇒ 任何基于模型几何的碰撞检查
+# 对 j6 的滚转天然是瞎的。而 IMU 与支架挂在末端、有径向伸出, 滚 114° 就是让它
+# 扫一个圆。IMU/支架未建模 ⇒ 该运动在仿真里不存在。
+#
+# 故本函数**不假装能算出安全路径**, 它做的是三件可验证的事:
+#   ① **一次只动一组**, 慢速余弦插值 —— 若发生接触, 速度与动量都小;
+#   ② **j6 最先单独走** —— 它是模型看不见的那个, 且此刻臂正处在刚刚安全待过
+#      整条激励的位形上, 是已知最可信的起点;
+#   ③ **每段都有到位门禁** —— 不到位就**停在原地并如实报告**, 不盲目进下一段。
+#      (这正是上次缺的: 一次性写之后没有任何检查, 撞停了也无人知晓。)
+SAFE_DISABLE = np.array([0.0, 0.0, 0.0, 0.0, 0.52, 0.0])      # 与 SDK 一致(弧度)
+RETURN_STAGES = (("j6 腕滚转(模型不可见)", [5]),
+                 ("j4/j5 腕", [3, 4]),
+                 ("j1–j3 近端", [0, 1, 2]))
+RET_S, RET_SETTLE_S, RET_TOL = 3.0, 0.5, np.radians(1.5)
+
+
+def staged_return(robot, torch, grip: float) -> bool:
+    """分段插值归位到 safe_disable_position。返回是否全部到位。"""
+    def read():
+        return robot.capture_observation()["observation.state"].numpy()[:6] \
+            * np.pi / 180 / 1000
+    q = read()
+    print("\n  分段归位（取代固件的一次性无插值写）")
+    for name, idx in RETURN_STAGES:
+        tgt = q.copy()
+        tgt[idx] = SAFE_DISABLE[idx]
+        if np.abs(tgt - q).max() < np.radians(0.2):
+            print(f"    {name}: 已在位, 跳过")
+            continue
+        n = int(RET_S * FPS)
+        r = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, n)))
+        for i in list(range(n)) + [n - 1] * int(RET_SETTLE_S * FPS):
+            act = q + (tgt - q) * r[min(i, n - 1)]
+            robot.send_action(torch.from_numpy(
+                np.concatenate([act, [grip]]).astype(np.float32)))
+            time.sleep(1.0 / FPS)
+        q_now = read()
+        dev = np.abs(q_now - tgt)[idx]
+        mv = np.degrees(np.abs(tgt - q)[idx]).max()
+        if dev.max() > RET_TOL:
+            j = int(np.array(idx)[int(dev.argmax())])
+            print(f"    ✗ {name}: 行程 {mv:.1f}°, **j{j+1} 未到位 "
+                  f"{np.degrees(dev.max()):.2f}° > {np.degrees(RET_TOL):.1f}°**")
+            print("      ⇒ 停在此处, **不进入下一段**。疑似受阻, 请人工检查后再动。")
+            return False
+        print(f"    ✓ {name}: 行程 {mv:.1f}°, 最大偏差 {np.degrees(dev.max()):.2f}°")
+        q = q_now
+    return True
+
+
 def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         outdir=None, robot_type="piper", settle_probe=0.0):
     cmd7, da, z = load_seq(seqfile, b2)
@@ -313,6 +373,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         }, ensure_ascii=False, indent=1))
         print(f"  ⤷ {_d.name}")
         print("  （观测模式：**未跑激励序列**，安全门与协议默认值均未改动）")
+        staged_return(robot, torch, float(np.clip(cmd7[0, 6], 0, 0.035)))
         robot.disconnect()
         return 0
 
@@ -492,6 +553,20 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         rec["seqfile"] = seqfile
         p.write_text(json.dumps(rec))
         print(f"\n采集 {len(rec['imu'])} 帧(20Hz) + {len(rec['imu100'])} 样本(100Hz) → {p}" + (f"  ⚠ 提前终止: {stopped}" if stopped else "  ✓"))
+        # **先落盘, 再动机器** —— 归位若受阻, 数据已经安全。
+        # 归位放在这里而不是靠 __del__: 固件的一次性无插值写会从**激励末帧**
+        # 直扫 safe_disable, 那正是 2026-08-26 碰撞的成因(见 staged_return 注释)。
+        try:
+            ok = staged_return(robot, torch, float(np.clip(cmd7[0, 6], 0, 0.035)))
+            if not ok:
+                rec["return_blocked"] = True
+                p.write_text(json.dumps(rec))
+                print("  ⚠ **归位受阻已记入结果文件**(return_blocked)。"
+                      "机器停在中途, 请人工检查后再运行下一条。")
+        except NameError:
+            pass                                   # 未走到真机路径
+        except Exception as e:                     # noqa: BLE001
+            print(f"  ⚠ 归位过程异常: {type(e).__name__}: {e}")
     return 0 if stopped is None else 1
 
 

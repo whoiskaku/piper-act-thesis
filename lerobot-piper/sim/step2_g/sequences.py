@@ -76,26 +76,53 @@ DYN_GUARD = 2.5                      # 位形筛选时给动力学过冲留的�
 PREMOVE_S, SETTLE_S, RETURN_S = 2.0, 1.0, 2.0     # 上机时间线的三段
 
 
+# 机械臂的**实际停放位姿** = SDK 的 safe_disable_position, 不是 HOME_DEG。
+# 上机时 replay_probe 的预移动从这里出发, 归位也回到这里。
+SAFE_DISABLE_DEG = np.array([0.0, 0.0, 0.0, 0.0, 29.794, 0.0])
+# 分段归位: 与 replay_probe.RETURN_STAGES 必须一致
+RETURN_STAGES = ((5,), (3, 4), (0, 1, 2))
+RETURN_STAGE_S = 3.0
+
+
 def full_timeline(cmd: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int, str]]]:
-    """完整上机时间线：HOME →(预移动)→ 起点 →(稳定)→ 激励 →(回停)→ HOME。
+    """完整上机时间线：停放 →(预移动)→ 起点 →(稳定)→ 激励 →(分段归位)→ 停放。
 
     **工作空间检查必须查全程, 不能只查激励段** —— 预移动同样会扫过空间。
     实测只查激励段时, 生成端判过、审查端(查全程)仍报「余量不足」, 两端打架。
     生成与审查共用本函数, 消除口径差。
+
+    ── 2026-08-26 修正两端: 此前本函数建模的是「HOME →预移动→ … →2s 插值回 HOME」,
+    而真机执行的是「**safe_disable** →预移动→ … →固件一次性无插值写 safe_disable」。
+    **起点、终点、路径、有无插值四者全不同** ⇒ 检查过的时间线与执行的时间线
+    从来不是同一条。第 54 条 S_j4_p2_rise10_a8.2 就是在这个未覆盖的归位段撞的。
+    现在两端都按真机改: 起点/终点均为 SAFE_DISABLE_DEG, 归位改为**分段插值**
+    (j6 单独先走 → j4/j5 → j1–j3), 与 replay_probe.staged_return 一一对应。
     """
-    home = np.zeros(7)
-    home[:6] = np.deg2rad(HOME_DEG)
-    npre, nset, nret = (int(x * FPS) for x in (PREMOVE_S, SETTLE_S, RETURN_S))
+    park = np.zeros(7)
+    park[:6] = np.deg2rad(SAFE_DISABLE_DEG)
+    npre, nset = (int(x * FPS) for x in (PREMOVE_S, SETTLE_S))
     r1 = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, npre)))[:, None]
-    r2 = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, nret)))[:, None]
-    pre = home[None, :] + (cmd[0] - home)[None, :] * r1
+    pre = park[None, :] + (cmd[0] - park)[None, :] * r1
     setl = np.repeat(cmd[0][None, :], nset, axis=0)
-    ret = cmd[-1][None, :] + (home - cmd[-1])[None, :] * r2
-    tail = np.repeat(home[None, :], int(0.5 * FPS), axis=0)
-    full = np.concatenate([pre, setl, cmd, ret, tail])
+    # 分段归位: 一次只动一组, 每段 RETURN_STAGE_S 秒余弦插值
+    nst = int(RETURN_STAGE_S * FPS)
+    r2 = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, nst)))[:, None]
+    q = cmd[-1].copy()
+    segs, names = [], []
+    for idx in RETURN_STAGES:
+        tgt = q.copy()
+        for j in idx:
+            tgt[j] = park[j]
+        segs.append(q[None, :] + (tgt - q)[None, :] * r2)
+        names.append("归位 j" + "/j".join(str(j + 1) for j in idx))
+        q = tgt
+    tail = np.repeat(park[None, :], int(0.5 * FPS), axis=0)
+    full = np.concatenate([pre, setl, cmd] + segs + [tail])
     k, spans = 0, []
-    for nm, n in (("预移动", npre), ("稳定", nset), ("激励", len(cmd)),
-                  ("回停", nret), ("停放", len(tail))):
+    parts = [("预移动", npre), ("稳定", nset), ("激励", len(cmd))]
+    parts += [(n, nst) for n in names]
+    parts += [("停放", len(tail))]
+    for nm, n in parts:
         spans.append((k, k + n, nm))
         k += n
     return full, spans
