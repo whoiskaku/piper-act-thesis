@@ -31,8 +31,8 @@ sys.path.insert(0, str(ROOT))
 from sim.step2_g import params as PA                                  # noqa: E402
 from sim.step2_g.sequences import (                                   # noqa: E402
     FPS, Seq, check_limits, chirp, inertia_span, multisine,
-    HOME_DEG, fit_limits, max_amp, pick_distal_poses, safe_center,
-    slow_sweep, smooth_step,
+    HOME_DEG, check_limits, fit_limits, max_amp, pick_distal_poses, place,
+    safe_center, slow_sweep, smooth_step,
 )
 
 MODEL = ROOT / "sim/piper_model.xml"
@@ -42,8 +42,7 @@ OUT = ROOT / "outputs/step2_g"
 def build(m) -> list[Seq]:
     seqs: list[Seq] = []
     def add(name, kind, j, cmd, pose, meta):
-        cmd, s = fit_limits(m, cmd, j)
-        meta = {**meta, "amp_scale": round(s, 3)}
+        cmd = place(m, cmd, j)                     # 按实际偏移范围居中到限位内
         seqs.append(Seq(name, kind, (j,), cmd, pose, meta))
     poses = {j: pick_distal_poses(m, j, n=3 if j < 4 else 1) for j in range(6)}
     # 幅值按各关节的量程与 pp2 包络取保守值
@@ -52,25 +51,22 @@ def build(m) -> list[Seq]:
         for pi, pose in enumerate(poses[j]):
             # ── 平滑阶跃: 两个上升时间(快/慢) × 两个幅值 ──
             for rise in (2, 5):
-                amax = min(amp[j], max_amp(
-                    m, j, lambda a, r=rise: smooth_step(
-                        j, pose, a, r, q0_deg=safe_center(m, j, a))))
+                amax = max_amp(m, j, lambda a, r=rise: smooth_step(j, pose, a, r))
                 for frac in (0.35, 1.0):          # 阶梯取**可达最大值的比例**
                     a_ = amax * frac
-                    q0 = safe_center(m, j, a_)
                     add(f"S_j{j+1}_p{pi}_r{rise}_f{frac:.2f}", "step", j,
-                        smooth_step(j, pose, a_, rise, q0_deg=q0), pose,
-                        {"amp_deg": round(a_, 3), "rise_frames": rise, "q0_deg": q0})
+                        smooth_step(j, pose, a_, rise), pose,
+                        {"amp_deg": round(a_, 3), "rise_frames": rise})
             # ── 慢速双向扫描: 两档低速（为 fc） ──
             for sp in (2.0, 8.0):
-                q0 = safe_center(m, j, amp[j])
+                aw = max_amp(m, j, lambda a, v=sp: slow_sweep(j, pose, a, v))
                 add(f"W_j{j+1}_p{pi}_v{sp:.0f}", "sweep", j,
-                    slow_sweep(j, pose, amp[j], sp, q0_deg=q0), pose,
-                    {"speed_dps": sp, "q0_deg": q0})
+                    slow_sweep(j, pose, aw, sp), pose,
+                    {"speed_dps": sp, "amp_deg": round(aw, 3)})
             # ── 扫频 ──
-            q0 = safe_center(m, j, amp[j] * 0.5)
-            add(f"C_j{j+1}_p{pi}", "chirp", j,
-                chirp(j, pose, amp[j] * 0.5, q0_deg=q0), pose, {"q0_deg": q0})
+            ac = max_amp(m, j, lambda a: chirp(j, pose, a))
+            add(f"C_j{j+1}_p{pi}", "chirp", j, chirp(j, pose, ac), pose,
+                {"amp_deg": round(ac, 3)})
     # ── 多关节多正弦（惯量耦合） ──
     ma = {j: amp[j] * 0.4 for j in range(6)}
     base = np.deg2rad([float(np.clip(HOME_DEG[j], *sorted((

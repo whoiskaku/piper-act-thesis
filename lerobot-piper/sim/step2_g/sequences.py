@@ -91,6 +91,9 @@ def pick_distal_poses(m, j: int, n: int = 3, n_sample: int = 3000,
 def safe_center(m, j: int, amp_deg: float) -> float:
     """关节 j 的起始角(度)，保证 ±amp 全程留在限位内。
 
+    **仅供多正弦的基准姿态使用。** 单关节序列改用 `place()` —— 它按波形的实际
+    偏移范围居中，而本函数假设的是关于起点对称的 ±amp（阶跃并不对称）。
+
     必需，因为若干关节的限位**一端就是 0**（j2 下限 0、j3 上限 0），
     从 0 出发做双向摆动必然越界。
     """
@@ -181,33 +184,55 @@ def multisine(joints: tuple[int, ...], pose: np.ndarray, amps_deg: dict[int, flo
 
 
 # ── 安全与度量 ──────────────────────────────────────────────────────────
-def fit_limits(m, cmd: np.ndarray, j: int) -> tuple[np.ndarray, float]:
-    """把关节 j 的幅值等比缩到速度/加速度上限内。→ (缩放后的指令, 缩放比)。
+def _dev(cmd: np.ndarray, j: int) -> np.ndarray:
+    """关节 j 相对**本序列起点**的偏移。"""
+    return cmd[:, j] - cmd[0, j]
 
-    对固定形状的轨迹 `v ∝ amp`、`a ∝ amp`，故一个标量缩放即可同时满足两者。
-    慢速扫描的 `v` 由速度参数决定、与幅值无关，缩放只会缩短行程 —— 无副作用。
+
+def max_scale(m, cmd: np.ndarray, j: int) -> float:
+    """满足 速度 / 加速度 / **行程** 三项限制的最大等比缩放。**不截到 1。**
+
+    2026-08-24 修: 旧实现 `fit_limits` 把比例截在 `min(1.0, …)`, 而 `max_amp`
+    用 1° 探针去问「最大幅值」—— 探针本就在限内 ⇒ 比例恒为 1 ⇒ **每个关节的
+    「可达最大幅值」都返回 1.0°**。实测真正可达 2.9°–14.7°, 即整个套件被压到
+    1° 附近, **欠激励 3–15 倍**。此函数返回未截断的比例, 供 `max_amp` 使用;
+    `fit_limits`（只缩不放）保留给多正弦等已显式定幅的波形。
     """
-    q0 = cmd[0, j]
-    dev = cmd[:, j] - q0
-    v = np.abs(np.diff(dev)) * FPS
-    a = np.abs(np.diff(dev, n=2)) * FPS ** 2
+    d = _dev(cmd, j)
+    v = np.abs(np.diff(d)) * FPS
+    a = np.abs(np.diff(d, n=2)) * FPS ** 2
     sv = np.deg2rad(VMAX_DEG[j]) / max(v.max(), 1e-12)
     sa = np.deg2rad(AMAX_DEG[j]) / max(a.max(), 1e-12)
-    s = float(min(1.0, sv, sa))
+    room = (m.jnt_range[j, 1] - m.jnt_range[j, 0]) - 2 * np.deg2rad(LIMIT_MARGIN_DEG)
+    sq = room / max(d.max() - d.min(), 1e-12)
+    return float(min(sv, sa, sq))
+
+
+def fit_limits(m, cmd: np.ndarray, j: int) -> tuple[np.ndarray, float]:
+    """把关节 j 的幅值**只缩不放**到限内。→ (指令, 缩放比 ≤ 1)。"""
+    s = min(1.0, max_scale(m, cmd, j))
     if s < 1.0:
-        cmd = cmd.copy()
-        cmd[:, j] = q0 + dev * s
+        cmd = place(m, cmd, j, s)
     return cmd, s
 
 
-def max_amp(m, j: int, gen, probe_deg: float = 1.0) -> float:
-    """给定波形生成器，关节 j 在速度/加速度限内的**可达最大幅值**(度)。
+def place(m, cmd: np.ndarray, j: int, s: float = 1.0) -> np.ndarray:
+    """把关节 j 的轨迹按 s 缩放, 并**整段平移**到限位区间内居中。
 
-    必需，否则绝对度数的幅值阶梯会在限位处**塌成同一条序列**
-    （实测 j4 的 a4 与 a12 缩放后 hash 相同 ⇒ 重复采集、灵敏度重复计数）。
+    比原来的 `safe_center` 正确: 后者假设摆动是关于起点对称的 ±amp, 而阶跃的
+    偏移范围是 [0, amp]、扫频是 [−amp, +amp] —— 形状不同, 居中点也不同。
     """
-    _, s = fit_limits(m, gen(probe_deg), j)
-    return probe_deg * s
+    out = cmd.copy()
+    d = _dev(cmd, j) * s
+    lo = m.jnt_range[j, 0] + np.deg2rad(LIMIT_MARGIN_DEG)
+    hi = m.jnt_range[j, 1] - np.deg2rad(LIMIT_MARGIN_DEG)
+    out[:, j] = (lo + hi) / 2 - (d.max() + d.min()) / 2 + d
+    return out
+
+
+def max_amp(m, j: int, gen, probe_deg: float = 1.0) -> float:
+    """关节 j 在 速度/加速度/行程 限内的**真正可达最大幅值**(度)。"""
+    return probe_deg * max_scale(m, gen(probe_deg), j)
 
 
 def check_limits(m, cmd: np.ndarray) -> dict:

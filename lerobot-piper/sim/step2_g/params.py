@@ -18,6 +18,14 @@
    `I_link@j6` 恒定(实测极差 0.0%), j5 仅 1.8%。
    ⇒ 这两个关节拟合**有效惯量** `I_eff = I_link + Ia`, 并**明确声明未分离**。
    要真分离, 只能外加**已知末端负载**改变 `I_link`。
+
+③ **j6 的 `kp` 与 `c` 只有一个自由度**（`map_separability.py`: (kp,c) 平面全网格
+   |cos| 最低仅 0.677）。j6 惯量仅 4.2e-4，要 ζ≈1 需 `c₆≈0.03`，已在任何合理网格外；
+   且**加大幅度或降低频率只能提高信噪比，造不出第二个独立的动力学特征**。
+   ⇒ 固定 `kp₆` 为**预先声明的 gauge**，只拟合**有效闭环时间常数**
+       `τ₆ = c₆ / kp₆`,  `c₆ = kp₆ · τ₆`
+   XML 里仍是两个数，但**只有一个自由度**。报告时称「j6 有效闭环时间常数」，
+   **不得**解释为两个独立的物理参数。⇒ 自由参数 24 → **23**。
 """
 from __future__ import annotations
 
@@ -32,6 +40,11 @@ N_P = len(NAMES)
 IA_SEPARABLE = {0: "可检验", 1: "可检验", 2: "弱", 3: "可检验",
                 4: "I_eff(未分离)", 5: "I_eff(未分离)"}
 
+# j6 的 kp 固定为 gauge；自由量是 τ₆ = c₆/kp₆（见 docstring ③）
+KP6_GAUGE = 50.0
+FIXED = ("kp6",)                       # 不是自由参数
+N_FREE = N_P - len(FIXED)              # 23
+
 
 def unpack(theta: np.ndarray) -> dict[str, np.ndarray]:
     t = np.asarray(theta, float).reshape(len(BLOCKS), N_J)
@@ -39,7 +52,13 @@ def unpack(theta: np.ndarray) -> dict[str, np.ndarray]:
 
 
 def apply(m, theta: np.ndarray) -> None:
-    """把参数写进 MuJoCo 模型。**`kv` 恒置 0** —— 见模块 docstring ①。"""
+    """把参数写进 MuJoCo 模型。
+
+    · **`kv` 恒置 0** —— 见 docstring ①（`b`/`kv` 精确简并）。
+    · **`kp₆` 强制为 gauge** —— 见 docstring ③；j6 的自由量是 `τ₆ = c₆/kp₆`。
+    """
+    theta = np.asarray(theta, float).copy()
+    theta[0 * N_J + 5] = KP6_GAUGE                # kp6 是 gauge, 不可自由变动
     p = unpack(theta)
     for j in range(N_J):
         m.actuator_gainprm[j, 0] = p["kp"][j]
@@ -48,6 +67,12 @@ def apply(m, theta: np.ndarray) -> None:
         m.dof_damping[j] = p["c"][j]
         m.dof_frictionloss[j] = p["fc"][j]
         m.dof_armature[j] = p["Ia"][j]
+
+
+def tau6(theta: np.ndarray) -> float:
+    """j6 的有效闭环时间常数 `τ₆ = c₆ / kp₆`（唯一自由量）。"""
+    p = unpack(theta)
+    return float(p["c"][5] / KP6_GAUGE)
 
 
 def baseline(m) -> np.ndarray:
