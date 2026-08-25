@@ -38,7 +38,8 @@ CALIB = ROOT / "outputs/p2_labels/pp2a-deploy/manifest.json"
 FPS = 20.0
 
 
-def sim_gyro(cmd7: np.ndarray, kpmul: float, dmul: float, nframes: int) -> np.ndarray:
+def sim_gyro(cmd7: np.ndarray, kpmul: float, dmul: float, nframes: int,
+             limiter: str = "a") -> np.ndarray:
     """限幅器 → MuJoCo(kp×kpmul, damping×dmul) → 降采样到 20 Hz 的陀螺三轴。"""
     import mujoco
     m = mujoco.MjModel.from_xml_path(str(MODEL))
@@ -47,7 +48,7 @@ def sim_gyro(cmd7: np.ndarray, kpmul: float, dmul: float, nframes: int) -> np.nd
         m.actuator_gainprm[j, 0] = kp
         m.actuator_biasprm[j, 1] = -kp
         m.dof_damping[j] = float(m.dof_damping[j]) * dmul
-    act = apply_limiter(cmd7, "a")
+    act = apply_limiter(cmd7, limiter)
     dt = m.opt.timestep
     nsub = int(round(1 / FPS / dt))
     d = mujoco.MjData(m)
@@ -86,13 +87,13 @@ def load_suite(quick: bool):
     return out
 
 
-def loss(data, R, kpmul, dmul) -> tuple[float, float]:
+def loss(data, R, kpmul, dmul, limiter="a") -> tuple[float, float]:
     """→ (带通残差能量 / 带通实测能量, 逐条中位相对残差)。"""
     num = den = 0.0
     per = []
     for nm, cmd, real in data:
         try:
-            sim = sim_gyro(cmd, kpmul, dmul, len(real))
+            sim = sim_gyro(cmd, kpmul, dmul, len(real), limiter)
         except Exception:                                    # noqa: BLE001
             return np.inf, np.inf
         n = min(len(sim), len(real))
@@ -112,6 +113,7 @@ def main() -> int:
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--kp", default="1,5,10,25,50")
     ap.add_argument("--damp", default="0.2,1,5")
+    ap.add_argument("--limiter", choices=("none", "a", "ad"), default="a")
     a = ap.parse_args()
     R, _ = load_calib(CALIB)
     data = load_suite(a.quick)
@@ -124,7 +126,7 @@ def main() -> int:
     for kp in kps:
         for dm in dms:
             t0 = time.time()
-            r, med = loss(data, R, kp, dm)
+            r, med = loss(data, R, kp, dm, a.limiter)
             print(f"{kp:>7g}{dm:>8g}{r:>11.4f}{med:>10.4f}{time.time()-t0:>7.0f}",
                   flush=True)
             if r < best[0]:
