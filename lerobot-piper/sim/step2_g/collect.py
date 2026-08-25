@@ -46,6 +46,28 @@ MAX_VOIDS = 3
 # artifact=编排器自身的记账错误产生的假记录(非真实事件)。
 NOT_COUNTED = ("env", "artifact")
 
+# ── 暂缓执行的序列（2026-08-26，用户决定）────────────────────────────────
+# 第 54 条 S_j4_p2_rise10_a8.2 录完后, 机械臂在**断开归位**时发生碰撞:
+# `PiperMotorsBus.safe_disconnect()` 是**一次性写** safe_disable_position
+# [0,0,0,0,29.8°,0]、无插值; 从该条末帧 [−4.8, 51.5, −25.2, −4.2, 61.9, −113.9]
+# 出发, 等于让腕部在低头 62° 的姿态下横滚 114°、同时 j2 下扫 51°。
+# 事后臂停在 j4/j5 双双卡在 19.9° 的瘫态。
+#
+# **注意: 这条路径从未被任何检查覆盖过。** 套件的限位/工作空间/碰撞检查用的是
+# `full_timeline`, 它建模的回停是「2s 余弦插值回 HOME_DEG」—— 终点、路径、
+# 有无插值三者都与真机不同。事后补做的碰撞检查(真实 mesh, 全 90 条真实回停
+# 路径)报告**零接触**, 即模型看不见这次碰撞 ⇒ 撞到的东西不在模型内
+# (IMU 与支架未建模)。故没有任何模型侧依据可以放行重试。
+#
+# 下列 3 条的**末帧位姿与出事那条完全相同**(j5=61.9°, j6=−113.8°), 断开时会
+# 执行一模一样的动作; 该位姿组首次上机即碰撞(1/1)。⇒ 暂缓, 不作废、不删除,
+# 待「断开前分段插值归位」实现并验证后再单独补收。
+DEFERRED = {
+    "S_j4_p2_rise5_a4.1": "j4_p2 末帧位姿组: 断开归位碰撞风险(同组 1/1 已发生)",
+    "W_j4_p2_v2":         "j4_p2 末帧位姿组: 断开归位碰撞风险(同组 1/1 已发生)",
+    "W_j4_p2_v8":         "j4_p2 末帧位姿组: 断开归位碰撞风险(同组 1/1 已发生)",
+}
+
 
 def load_plan() -> list[dict]:
     """读 manifest 并**逐条核对签字**。没签过字的序列不得上机。"""
@@ -83,7 +105,11 @@ class State:
 
 def sweep_orphans(st: State, plan: list[dict]) -> None:
     """把上次中断留在盘上、属于**下一条未完成序列**的结果正式作废并移开。"""
-    nxt = next((p for p in plan if not st.is_done(p["name"])), None)
+    # **暂缓的序列不参与孤儿清理** —— 它们不会再跑, 而盘上留下的结果往往正是
+    # 事故证据(如 S_j4_p2_rise5_a4.1 的稳定段轨迹记录了断开碰撞后的瘫态位姿)。
+    # 当成「下一条的孤儿」扫走 = 把证据改名归档并记一条假作废。
+    nxt = next((p for p in plan
+                if not st.is_done(p["name"]) and p["name"] not in DEFERRED), None)
     if nxt is None:
         return
     nm = nxt["name"]
@@ -175,13 +201,24 @@ def run_one(st: State, p: dict, dry: bool) -> None:
 
 def status(st: State, plan: list[dict]) -> None:
     d = st.d
+    n_def = sum(1 for p in plan if p["name"] in DEFERRED and not st.is_done(p["name"]))
     print(f"\n{'═'*56}\n进度 {len(d['done'])}/{len(plan)} 条"
-          f"   在册 {d['used']} + 作废 {d['wasted']}")
-    todo = [p["name"] for p in plan if not st.is_done(p["name"])]
+          f"   在册 {d['used']} + 作废 {d['wasted']}"
+          + (f" + **暂缓 {n_def}**" if n_def else ""))
+    todo = [p["name"] for p in plan
+            if not st.is_done(p["name"]) and p["name"] not in DEFERRED]
     if todo:
-        rem = sum(p["frames"] for p in plan if not st.is_done(p["name"]))
+        rem = sum(p["frames"] for p in plan
+                  if not st.is_done(p["name"]) and p["name"] not in DEFERRED)
         print(f"  待跑 {len(todo)} 条 ≈ {rem/20/60:.1f} 分钟指令时长")
         print(f"  下一条: {todo[0]}")
+    elif n_def:
+        # **不得报「全部完成」** —— 暂缓的 3 条没跑, 最终数据集是 87/90。
+        print(f"  ⏸ 可跑的已跑完; 仍有 **{n_def} 条暂缓未收** ⇒ 数据集为 "
+              f"{len(d['done'])}/{len(plan)}, 不是全套")
+        for nm, why in DEFERRED.items():
+            if not st.is_done(nm):
+                print(f"      {nm:24s} —— {why}")
     else:
         print("  ✅ 全部完成")
 
@@ -207,6 +244,12 @@ def main() -> int:
     if not a.dry_run:
         sweep_orphans(st, plan)
     todo = [p for p in plan if not st.is_done(p["name"])]
+    skipped = [p for p in todo if p["name"] in DEFERRED]
+    todo = [p for p in todo if p["name"] not in DEFERRED]
+    if skipped:
+        print(f"⏸ 暂缓 {len(skipped)} 条（**不作废、不删除**，待归位流程修好后补收）:")
+        for p in skipped:
+            print(f"    {p['name']:24s} —— {DEFERRED[p['name']]}")
     if a.n:
         todo = todo[: a.n]
     if not todo:
