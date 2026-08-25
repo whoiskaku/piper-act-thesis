@@ -85,6 +85,16 @@ def ladder(m) -> list[Seq]:
 
     def add(tag, phase, level, cmd, meta):
         amp = float(meta.get("amp_deg", 0.0))
+        if "revision" in meta:
+            # 修订项不参与「已验证幅值」断言（它降的是**动态强度**，幅值不变），
+            # 但仍要带上 proven_amp_deg 以便与其余条目同表打印。
+            cmd = place(m, cmd, J)
+            # 修订项的两次重复按用户规格命名为 P05b / P06b（不是 _r1/_r2）
+            for r, nm in enumerate(("P05b_step_rise10", "P06b_step_rise10")):
+                out.append(Seq(nm, phase, (J,), cmd, pose,
+                               {"level": level, "phase": phase, "rep": r + 1,
+                                "proven_amp_deg": round(proven["amp"], 3), **meta}))
+            return
         if phase.startswith("A"):
             proven["amp"] = max(proven["amp"], amp)
         else:
@@ -120,6 +130,26 @@ def ladder(m) -> list[Seq]:
     # ── 阶段 C: chirp ──
     a_c = min(max_amp(m, J, lambda a: chirp(J, pose, a)), a_slow)
     add("C_chirp", "C_扫频", 1.00, chirp(J, pose, a_c), {"amp_deg": round(a_c, 3)})
+
+    # ── 设计修订 P05b/P06b（2026-08-24）: 顶档改为**降低动态强度**而非降幅值 ──
+    # 起因: P05(8.245°, rise=5, 峰速 58.3°/s, 峰加速 683°/s²) 被门禁判否。
+    # 诊断(零机时, 现有数据):
+    #   · 亚帧滞后扫描: 最优滞后随速度变 98 ms(≤29°/s) → 133 ms(52°/s),
+    #     但补偿后残差仍 0.891° > 0.5° ⇒ **延迟解释不完**
+    #   · 速度峰值无平台(前5峰离散度 4.60 vs P03 的 0.56) ⇒ **不是速率饱和**
+    #     ⇒ j4 上限**不该**取 29°/s
+    #   · 残差 **97% 的能量集中在高加速度段**(a>p80), 高速段 82%, 低速平稳段 0.625°
+    # ⇒ 异常**主要集中于加减速瞬态**。
+    # **措辞界限**: 尚不能严格证明「只有加速度起作用」—— P05b 同时降低了速度与
+    # 加速度, 两者未解耦。但这不妨碍工程决策: 目标不是精确定位极限, 而是找到
+    # **正式辨识可用的干净激励**。40°/s 边界试探留待「发现激励强度不足」时再做。
+    #
+    # 修订: **保留 8.245° 大幅值**(可重复性 94.2% 靠它), 上升时间 5 → 10 帧
+    # ⇒ 峰速与峰加速度退回已验证范围。原 P05/P06 及其失败记录**保留不覆盖**。
+    add("P05b", "A_幅值阶梯(修订)", 1.00,
+        smooth_step(J, pose, a_slow, 10),
+        {"amp_deg": round(a_slow, 3), "rise_frames": 10,
+         "revision": "replaces P05/P06; rise 5→10 to cut dynamic intensity"})
 
     # ── 阶段 D: 多关节多正弦（最后） ──
     amps = {j: 2.0 for j in range(6)}
