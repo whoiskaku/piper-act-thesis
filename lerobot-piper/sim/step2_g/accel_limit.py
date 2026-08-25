@@ -118,6 +118,64 @@ def fit_two_stage(man, done, joints=None):
     return out
 
 
+def pure_delay(y, d_s):
+    """**纯传输延迟**(亚帧线性插值)。
+
+    区别于一阶滞后: 100 Hz 陀螺显示速度曲线是**纯三角形**
+    (10–90% 上升段线性拟合 R² = 0.988–0.994, 残差仅峰值的 1.7–2.4%),
+    没有一阶环节该有的平滑 ⇒ 正确形式是纯延迟, 不是一阶滞后。
+    """
+    k = d_s * FPS
+    i0 = int(np.floor(k)); f = k - i0
+    o = np.empty(len(y), float)
+    for t in range(len(y)):
+        o[t] = (1 - f) * y[max(0, t - i0)] + f * y[max(0, t - i0 - 1)]
+    return o
+
+
+def fit_ad(man, done, only_big=False):
+    """**二参数 (a, 纯延迟 d)** 在阶跃上格搜 —— 取代此前的单参数 fit_a。
+
+    单参数拟合把缺失的传输延迟折算成了**更小的加速度**: a 被系统性低估
+    1.7–2.8 倍(180 → ~310), 加上延迟项后阶跃 RMS 降 60–84%。
+
+    `only_big=True` 只用大幅值档 —— **小幅值阶跃里限幅器几乎不触发**,
+    a 在那儿没有约束力(留出验证: 小幅拟合外推到大幅 RMS 0.53–0.62°,
+    反向则为 0.049–0.192°)。
+    """
+    per = defaultdict(list)
+    for nm in sorted(n for n in done if man[n]["kind"] == "step"):
+        t, k, A, c, s = step_info(nm, man)
+        if abs(A) < 0.5:
+            continue
+        big = ("f1.00" in nm) or ("a8.2" in nm)
+        if only_big and not big:
+            continue
+        per[t].append((nm, k, c, s))
+    ga = np.exp(np.linspace(np.log(120), np.log(2000), 70))
+    gd = np.linspace(0.0, 0.16, 33)
+    W = lambda k: slice(max(0, k - 3), k + 24)
+    out = {}
+    for t, items in per.items():
+        best = (1e9, None, None)
+        for a in ga:
+            base = {nm: accel_limited(c[W(k)], a) for nm, k, c, s in items}
+            for d in gd:
+                e = float(np.mean([np.mean((pure_delay(base[nm], d)
+                                            - s[W(k)]) ** 2)
+                                   for nm, k, c, s in items]))
+                if e < best[0]:
+                    best = (e, a, d)
+        # a 的可辨识性: 固定 d, a 变 ±60% 时 RMS 放大多少倍
+        r0 = np.sqrt(best[0])
+        ident = min(
+            np.sqrt(float(np.mean([np.mean((pure_delay(accel_limited(c[W(k)], best[1]*f), best[2])
+                                            - s[W(k)]) ** 2) for nm, k, c, s in items]))) / r0
+            for f in (0.6, 1.6))
+        out[t] = (best[1], best[2], r0, ident)
+    return out
+
+
 def sim_current_G(cmd_deg7, j):
     """当前 G(MuJoCo 线性位置伺服)的关节角响应。"""
     import mujoco
