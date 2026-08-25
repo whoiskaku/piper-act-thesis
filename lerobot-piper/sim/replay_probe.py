@@ -37,14 +37,40 @@ PB2 = ROOT / "outputs/probe_b2"
 
 
 def load_seq(seqfile="probe_seq.npz", b2=False):
-    root = PB2 if b2 else PROBE
-    z = np.load(root / seqfile, allow_pickle=True)
+    """读序列。`seqfile` 可以是**显式路径**，也可以是 PROBE/PB2 下的文件名。
+
+    2026-08-24: 早先只接受「PROBE/PB2 下的文件名」，外部生成的序列
+    （如 `outputs/step2_g/pilot_j4/*.npz`）无法喂进来。现在若 `seqfile` 存在
+    （绝对或相对当前目录）就直接用，否则回落到旧的根目录拼接。
+    """
+    p = Path(seqfile)
+    path = p if p.exists() else (PB2 if b2 else PROBE) / seqfile
+    if not path.exists():
+        raise SystemExit(f"序列文件不存在: {seqfile}（也不在 "
+                         f"{(PB2 if b2 else PROBE).name}/ 下）")
+    z = np.load(path, allow_pickle=True)
+    missing = {"cmd7", "da"} - set(z.files)
+    if missing:
+        raise SystemExit(f"{path.name} 缺字段 {sorted(missing)}；实有 {list(z.files)}")
     return z["cmd7"].astype(np.float32), z["da"].astype(np.float32), z
 
 
+EPS_B_FALLBACK = 0.010          # 与 lerobot/common/policies/act/b_runtime.py 一致
+
+
 def safety_checks(cmd7, da, model_path=None):
-    """出发前的全部断言 —— 任何一条不过就不上机。"""
-    from lerobot.common.policies.act.b_runtime import EPS_B
+    """出发前的全部断言 —— 任何一条不过就不上机。
+
+    → (msgs, degraded)。`degraded=True` 表示有依赖缺失、部分检查被跳过或用了
+    回落常量 —— 此时的 dry-run **只能用于诊断接口, 不足以放行上机**。
+    """
+    degraded = []
+    try:
+        from lerobot.common.policies.act.b_runtime import EPS_B
+    except Exception as e:                                        # noqa: BLE001
+        EPS_B = EPS_B_FALLBACK
+        degraded.append(f"EPS_B 取回落常量 {EPS_B_FALLBACK}（导入失败: "
+                        f"{type(e).__name__}）—— 上机前须与 b_runtime.py 核对")
     msgs = []
     assert np.isfinite(cmd7).all() and np.isfinite(da).all(), "指令/探针含 NaN"
     assert np.abs(da).max() <= EPS_B + 1e-12, \
@@ -80,18 +106,20 @@ def safety_checks(cmd7, da, model_path=None):
         msgs.append(f"✓ 探针不加深越界 (最坏 {np.degrees(worse):.4f}°)")
         mar = float(np.minimum(tot - lo, hi - tot).min())
         msgs.append(f"✓ 加探针后离限位最小余量 {np.degrees(mar):.2f}°")
-    except ImportError:
-        msgs.append("⚠ 未装 mujoco, 跳过限位检查")
+    except ImportError as e:                                      # noqa: BLE001
+        msgs.append(f"⚠ 跳过限位检查（{type(e).__name__}: {e}）")
+        degraded.append("关节限位检查被跳过")
 
     # 指令连续性（探针不得制造跳变）
     step = np.abs(np.diff(cmd7[:, :6] + da, axis=0)).max()
     base = np.abs(np.diff(cmd7[:, :6], axis=0)).max()
     assert step < base * 1.5 + 0.006, f"叠加探针后单帧跳变 {step*1e3:.1f}mrad 过大"
     msgs.append(f"✓ 单帧最大跳变 {step*1e3:.1f} mrad (裸 {base*1e3:.1f})")
-    return msgs
+    return msgs, degraded
 
 
-def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=None):
+def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
+        outdir=None, robot_type="piper"):
     cmd7, da, z = load_seq(seqfile, b2)
     import re
     is_bare = bool(re.fullmatch(r"A\d+", arm))      # A1/A2/A3/A4… 全是裸复放
@@ -99,8 +127,11 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=No
     total = cmd7[:, :6] + (da if use_probe else 0.0)
     print(f"=== 复放 {arm} ({'加探针' if use_probe else '裸'}) · {len(cmd7)} 帧 "
           f"= {len(cmd7)/FPS:.0f}s ===")
-    for m in safety_checks(cmd7, da if use_probe else np.zeros_like(da)):
+    msgs, degraded = safety_checks(cmd7, da if use_probe else np.zeros_like(da))
+    for m in msgs:
         print("  " + m)
+    for d in degraded:
+        print(f"  ⚠ 降级: {d}")
 
     if dry_run:
         print("\n[dry-run] 不连机器人。时序模拟:")
@@ -110,6 +141,12 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=No
         oh = (time.perf_counter() - t0) / 100 * 1e3
         print(f"  循环开销 {oh:.3f} ms/帧 (预算 {DT*1e3:.0f} ms)  ✓")
         print(f"  预计时长 {len(cmd7)/FPS:.0f}s")
+        if degraded:
+            print(f"\n  ⚠⚠ **降级 dry-run** —— {len(degraded)} 项依赖缺失/跳过。")
+            print("      仅可用于诊断接口, **不足以放行上机**。")
+            print("      请在 lerobot 环境下重跑: "
+                  "~/miniconda3/envs/lerobot/bin/python sim/replay_probe.py …")
+            return 2
         print("  ✓ 全部安全检查通过 —— 可上机")
         return 0
 
@@ -118,7 +155,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False, outdir=No
     from lerobot.common.robot_devices.robots.utils import make_robot
     # 探针只需 IMU+关节: inference_time=True(推理模式,无手柄teleop) · enable_imu=True(默认关!)
     # · cameras={}(不读图, 省循环开销且避开已知的 ffmpeg SIGABRT)
-    robot = make_robot("piper", inference_time=True, enable_imu=True, cameras={})
+    robot = make_robot(robot_type, inference_time=True, enable_imu=True, cameras={})
     if not robot.is_connected:
         robot.connect()
     # IMU 连接自检: 动之前先确认 IMU 活着, 否则白跑 59s
@@ -254,7 +291,15 @@ if __name__ == "__main__":
                     help="2=反向平衡块(4mrad) / 3=幅值对比(2mrad, 顺序同第2轮); "
                          "输出文件加 _rN_ 前缀, 不覆盖前轮")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--robot", default="piper",
+                    help="机器人类型, 传给 make_robot（此前 docstring 写了它但 CLI 没定义）")
+    ap.add_argument("--seqfile", help="**显式**序列 npz 路径; 给了就不再从 --ep/--b2 推导")
+    ap.add_argument("--outdir", help="落盘目录; 默认 outputs/probe（--b2 时 outputs/probe_b2）")
     a = ap.parse_args()
+    if a.seqfile:                                  # 显式路径优先, 直接跑
+        raise SystemExit(run(a.arm, a.dry_run, seqfile=a.seqfile, tag="",
+                             b2=a.b2, outdir=Path(a.outdir) if a.outdir else None,
+                             robot_type=a.robot))
     if a.b2:
         import re as _re
         cfg = ("j2_" + a.amp + "_p" if _re.fullmatch(r"A\d+", a.arm)
