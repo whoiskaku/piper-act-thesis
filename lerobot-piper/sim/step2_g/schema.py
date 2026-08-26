@@ -42,11 +42,18 @@ M0 的 gauge 理由与我们独立推出的完全一致：
 | 角色 | 数据 | 说明 |
 |---|---|---|
 | `calibration` | 90 条激励套件（`build_suite`） | 专为辨识设计 |
-| `holdout` | 17 集 pp2 裸 ACT | **真实任务**上的表现 |
+| `dev_benchmark` | 17 集 pp2 裸 ACT | **真实任务**上的表现（**已用于选择，不是留出集**） |
+| `holdout` | **尚未采集** | 结构冻结后另采 |
 
-沿用 M0 的措辞：holdout 是 **role separation only; not sealed, secret,
-access-controlled, or confirmatory** —— 它回答「标定出的模型在实际用途上准不准」，
-不是一次确证检验。
+> **2026-08-26 订正**：那 17 集 pp2 裸 ACT 此前声明为 `holdout`，现改为
+> **`dev_benchmark`（pp2 开发基准集）**。理由：它们已被用于
+> ① 选择是否加入加速度限幅、② 扫 kp（选出 ×25）、③ 决定下一步的模型结构 ——
+> **三次都是「选择」**。用于选择过的数据不再是留出集，
+> 在其上得到的数字不能作为留出性能引用。
+> **真正的 holdout 必须在 G 的结构冻结之后另行采集。**
+
+沿用 M0 的措辞：角色分离是 **role separation only; not sealed, secret,
+access-controlled, or confirmatory**。
 
 用法: python sim/step2_g/schema.py        # 打印契约并自检
 """
@@ -125,7 +132,7 @@ GAUGES = (
 class DataRole:
     """带强制角色标签的一批真机数据。"""
 
-    role: Literal["calibration", "holdout"]
+    role: Literal["calibration", "dev_benchmark", "holdout"]
     source: str
     sequence_shas: tuple[str, ...]
     n_episodes: int
