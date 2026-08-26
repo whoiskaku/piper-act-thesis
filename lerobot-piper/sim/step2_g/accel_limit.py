@@ -527,3 +527,44 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def accel_limited_stream(cmd_deg, a_max, sub=20):
+    """**流式**加速度限幅 —— 跟踪**移动目标** `(q_ref, v_ref)`，不要求在每个设定点停下。
+
+    与 `accel_limited` 的唯一区别: 目标从 `(q_ref, 0)` 换成 `(q_ref, v_ref)`。
+    **不引入任何新参数。**
+
+    ── 为什么需要它（2026-08-26 A/B 分解的结论）─────────────────────────────
+    `accel_limited` 是**时间最优 bang-bang, 每个目标都要求停下**。
+      · 激励套件: 目标保持 1.6–2.0 s, 确实要停稳 ⇒ 正确。A 段 9/12 改善。
+      · pp2: **每 50 ms 换一次目标** ⇒ 跟踪器反复刹车, 输出里**近零速的帧占
+        31–52%**, 而实测编码器是连续运动的。A 段 **0/17**, 关节 RMS 从 0.92°
+        恶化到 2.71°。平均|速度|三者接近(j1 4.36/4.32/4.38 °/s) ⇒
+        **不是幅值被削掉, 是时序被打碎。**
+
+    律: `s = e + ev·|ev|/(2a)`（若此刻起以 a 消除速度差, 最终的位置误差），
+        `acc = a·sign(s)`。`e = q_ref − q`, `ev = v_ref − v`。
+        `v_ref` 由 20 Hz 指令的一阶差分给出, 帧内对 `q_ref` 线性插值。
+    """
+    c = np.asarray(cmd_deg, float)
+    n = len(c)
+    dt = 1.0 / (FPS * sub)
+    q, v = float(c[0]), 0.0
+    out = np.empty(n, float)
+    for t in range(n):
+        q0 = float(c[t - 1]) if t > 0 else float(c[0])
+        q1 = float(c[t])
+        vref = (q1 - q0) * FPS
+        for k in range(sub):
+            qref = q0 + (q1 - q0) * (k + 1) / sub
+            e = qref - q
+            ev = vref - v
+            s = e + ev * abs(ev) / (2.0 * a_max)
+            if abs(s) < a_max * dt * dt and abs(ev) < a_max * dt:
+                q, v = qref, vref                    # 落位, 避免子步颤振
+            else:
+                v += a_max * (1.0 if s > 0 else -1.0) * dt
+                q += v * dt
+        out[t] = q
+    return out

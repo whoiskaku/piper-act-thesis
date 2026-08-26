@@ -47,7 +47,7 @@ from sim.step1_v2_loss import ALIGN_L, BAND, bandpass41, load_calib, render_idea
 from sim.step2_gap_baseline import aa_down, bare_logs, dyn_replay_cmd  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "sim/step2_g"))
-from accel_limit import accel_limited, pure_delay  # noqa: E402
+from accel_limit import accel_limited, accel_limited_stream, pure_delay  # noqa: E402
 
 # ── 固件 MOVE J 的运动学限幅（2026-08-26 加）────────────────────────────────
 # 87→90 条激励套件测出: 指令与关节之间有一个**加速度受限的运动学轨迹生成器**,
@@ -62,7 +62,8 @@ D_SEC = np.array([0.075, 0.075, 0.070, 0.065, 0.090, 0.075])      # s, 纯传输
 def apply_limiter(act: np.ndarray, mode: str) -> np.ndarray:
     """指令 → 固件 MOVE J 限幅 → 再喂 MuJoCo。这是「串联」而非「二选一」。
 
-    mode: "none" 不改 · "a" 只加速度限 · "ad" 加速度限 + 纯延迟。
+    mode: "none" 不改 · "a" 只加速度限(每目标停下) · "ad" 加速度限 + 纯延迟
+          · **"s" 流式加速度限**(跟踪移动目标, 不要求停下 —— 见 accel_limited_stream)。
     "a" 与 "ad" 分开是因为 MuJoCo 伺服自身也有滞后(j1 的 kp=5000 当初正是为了
     凑出 2 帧滞后而手调的), 再叠一个 65–90 ms 纯延迟可能**重复计入**。
     """
@@ -70,9 +71,12 @@ def apply_limiter(act: np.ndarray, mode: str) -> np.ndarray:
         return act
     out = np.array(act, float, copy=True)
     for j in range(6):
-        y = accel_limited(np.degrees(act[:, j]), A_MAX[j])
-        if mode == "ad":
-            y = pure_delay(y, D_SEC[j])
+        if mode == "s":
+            y = accel_limited_stream(np.degrees(act[:, j]), A_MAX[j])
+        else:
+            y = accel_limited(np.degrees(act[:, j]), A_MAX[j])
+            if mode == "ad":
+                y = pure_delay(y, D_SEC[j])
         out[:, j] = np.radians(y)
     return out
 
@@ -154,7 +158,7 @@ def main() -> int:
     ap.add_argument("--ep", help="画波形的集(stem)")
     ap.add_argument("--axis", type=int, default=1, help="陀螺轴 0/1/2")
     ap.add_argument("--n", type=int, help="只算前 N 集")
-    ap.add_argument("--limiter", choices=("none", "a", "ad"), default="none",
+    ap.add_argument("--limiter", choices=("none", "a", "ad", "s"), default="none",
                     help="在 MuJoCo 之前插入固件 MOVE J 的加速度限幅")
     ap.add_argument("--vs", type=float, default=None,
                     help="同时算第二个变体(限幅器 ⊕ kp×VS)并叠进波形图")
