@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Step 1 v3 确认阶段 —— 候选 (-++) 的 30 组 matched A/B。
 
+**行政状态（2026-08-24）**：研究者决定在 9/30 个有效 block 后永久停止本阶段，
+见 `reports/STEP1_CLOSEOUT.md`。本脚本仅保留 `--plan` / `--status` / `--analyze`
+用于审计既有记录；所有真实采集与 `--dry-run` 均被关闭，防止状态被继续写入。
+
 预注册 `reports/PREREG_STEP1_V3.md` §5：判据、口径、matched 定义、安全门
 **全部沿用 v2 §5/§6 原样不改**。日程 `reports/step1_v3_confirm_schedule.json`。
 
@@ -22,7 +26,7 @@
     python sim/confirm_step1_v3.py --session 1        # block 1-15 (30 集)
     python sim/confirm_step1_v3.py --blocks 3         # 只跑接下来 3 个 block
     python sim/confirm_step1_v3.py --status
-    python sim/confirm_step1_v3.py --analyze          # H1 五项判据
+    python sim/confirm_step1_v3.py --analyze          # 未完成时只报描述统计；n=30 才评 H1
 """
 from __future__ import annotations
 
@@ -47,6 +51,8 @@ from sim.spsa_step1_v2 import (                      # noqa: E402
 OUT = ROOT / "outputs/step1_v3_confirm"
 SCHEDULE = ROOT / "reports/step1_v3_confirm_schedule.json"
 STATE = OUT / "state.json"
+STOP_RECORD = ROOT / "reports/STEP1_CLOSEOUT.md"
+COLLECTION_CLOSED = True                  # 行政终止硬门；不依赖报告文件是否被移动
 MAX_BLOCK_VOIDS = 3
 MATCH_TOL_DEG = 0.5                  # 附录 B: 两臂各关节初始编码器差 ≤ 0.5°
 H1_BAR = 0.15                        # §5 判据 1
@@ -296,6 +302,11 @@ def sweep_orphans(st: State, sc: dict) -> None:
 
 
 def collect(st: State, dry: bool, session: int | None, nb: int | None) -> None:
+    if COLLECTION_CLOSED:
+        raise RuntimeError(
+            "Step 1 v3 确认采集已在 9/30 block 永久关闭；"
+            f"权威记录：{STOP_RECORD}. 只允许 --plan/--status/--analyze。"
+        )
     sc = sched()
     if not dry:
         sweep_orphans(st, sc)
@@ -341,8 +352,8 @@ def analyze(st: State) -> int:
     n = len(r)
     final = n == 30
     print(f"{'═'*66}")
-    print(f"H1 五项判据 —— 候选 (-++)   n = {n}/30 block"
-          f"{'' if final else '  ⚠ **未采集完, 以下为描述性中期数, 不构成判定**'}")
+    print((f"H1 五项判据 —— 候选 (-++)   n = {n}/30 block" if final else
+           f"停止时描述统计 —— 候选 (-++)   n = {n}/30 block（H1 未评估）"))
     print(f"{'═'*66}\n")
     print(f"{'block':>6}{'会话':>5}{'顺序':>5}{'L_A':>10}{'L_B':>10}{'r':>9}{'初始差':>8}")
     for x in B:
@@ -350,8 +361,15 @@ def analyze(st: State) -> int:
               f"{x['L_B']:>10.5f}{x['r']*100:>+8.1f}%{x['init_diff_deg']:>7.3f}°"
               + ("  ⚠B类" if x["b_class"] else ""))
     med = float(np.median(r))
-    tt = stats.ttest_1samp(r, 0.0)
     npos = int((r > 0).sum())
+    if not final:
+        sd = float(r.std(ddof=1)) if n > 1 else float("nan")
+        print(f"\n停止时：均值 {r.mean()*100:+.2f}%   中位 {med*100:+.2f}%   "
+              f"SD {sd*100:.1f}%   正向 {npos}/{n}")
+        print("⇒ 计划样本未完成且停止不是预注册规则：不计算 H1 勾叉、确认性 p 值或置信界。")
+        return 0
+
+    tt = stats.ttest_1samp(r, 0.0)
     m1 = [x["r"] for x in B if x["session"] == 1]
     m2 = [x["r"] for x in B if x["session"] == 2]
     gates_bad = [x["block"] for x in B if x["b_class"]]
@@ -372,12 +390,10 @@ def analyze(st: State) -> int:
           f"{'✓' if c5 else '✗'}")
     ok = all((c1, c2, c3, c4, c5))
     se = r.std(ddof=1) / np.sqrt(n)
-    lo, hi = r.mean() - 1.96 * se, r.mean() + 1.96 * se
+    crit2 = stats.t.ppf(0.975, n - 1)
+    lo, hi = r.mean() - crit2 * se, r.mean() + crit2 * se
     print(f"\n效应量: 均值 {r.mean()*100:+.2f}%  95%CI [{lo*100:+.2f}%, {hi*100:+.2f}%]"
           f"   SD(r)={r.std(ddof=1)*100:.1f}%")
-    if not final:
-        print("\n⇒ **未采集完, 不作判定。**")
-        return 0
     print(f"\n{'═'*66}")
     if ok:
         print("⇒ **满足完整 H1** ⇒ Step 1 完成, 可开始研究通用 G（指導教員第 4、5 条）")
@@ -387,10 +403,9 @@ def analyze(st: State) -> int:
     else:
         print("⇒ **不显著或反向** ⇒ 这个**三参数接缝补正族**不够；")
         print("   **不得**推出「SPSA / model-free 整体无效」")
-    lo1 = r.mean() - stats.t.ppf(0.95, n - 1) * se
-    print(f"\n单侧 95% 界: 真实改善 ≥ {lo1*100:+.1f}%"
-          f"   ⇒ {'可以' if hi < H1_BAR else '不能'}排除「达到 15%」"
-          f"（上界 {hi*100:+.1f}%）")
+    hi1 = r.mean() + stats.t.ppf(0.95, n - 1) * se
+    print(f"\n单侧 95% 上界: 真实改善 ≤ {hi1*100:+.1f}%"
+          f"   ⇒ {'可以' if hi1 < H1_BAR else '不能'}排除「达到 15%」")
     return 0
 
 
@@ -415,6 +430,11 @@ def main() -> int:
             if b["block"] % 5 == 0:
                 print()
         return 0
+    if COLLECTION_CLOSED and not (a.status or a.analyze):
+        print("拒绝采集：Step 1 v3 确认已在 9/30 block 永久关闭。", file=sys.stderr)
+        print(f"权威记录：{STOP_RECORD}", file=sys.stderr)
+        print("仍可使用 --plan、--status 或 --analyze 审计既有数据。", file=sys.stderr)
+        return 2
     st = State()
     if a.status:
         status(st)

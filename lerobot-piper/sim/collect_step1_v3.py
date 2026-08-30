@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Step 1 v3 采集与分析 —— 箱体 8 顶点全因子候选筛选。
 
+**行政状态（2026-08-24）**：本阶段已完成，整个 Step 1 随后在确认 9/30 block
+处永久停止，见 `reports/STEP1_CLOSEOUT.md`。本脚本仅保留计划、状态及离线分析
+用于审计；继续采集、dry-run 写状态和 reset 均被关闭。
+
 预注册: `reports/PREREG_STEP1_V3.md`（2026-08-24 冻结）
 日程:   `reports/step1_v3_schedule.json`（40 集, seed 20260824）
 
@@ -41,6 +45,8 @@ from sim.spsa_step1_v2 import (                      # noqa: E402  复用 v2 的
 OUT = ROOT / "outputs/step1_v3"
 SCHEDULE = ROOT / "reports/step1_v3_schedule.json"
 STATE = OUT / "state.json"
+STOP_RECORD = ROOT / "reports/STEP1_CLOSEOUT.md"
+COLLECTION_CLOSED = True                  # 行政终止硬门；不依赖报告文件是否被移动
 MAX_SLOT_VOIDS = 3          # 同一 slot 的 A 类作废上限, 超过则停下查环境
 CORNERS = ["".join(s) for s in itertools.product("-+", repeat=3)]   # 枚举顺序 = 平局规则
 
@@ -196,6 +202,11 @@ def one_slot(st: State, e: dict, dry: bool) -> None:
 
 def collect(st: State, sched: list[dict], dry: bool,
             session: int | None, n_slots: int | None) -> None:
+    if COLLECTION_CLOSED:
+        raise RuntimeError(
+            "Step 1 已永久关闭；"
+            f"权威记录：{STOP_RECORD}. 只允许 --plan/--status/--analyze/--sensitivity。"
+        )
     todo = [e for e in sched
             if not st.is_done(e["session"], e["slot"])
             and (session is None or e["session"] == session)]
@@ -277,13 +288,20 @@ def analyze(st: State) -> int:
               f"{b/se:>+7.2f}  {'✗ B类失格' if c in dq else '✓'}")
 
     # ── Dunnett 单侧临界值（MC, 用实际拟合协方差）──
+    # 共同残差方差由本批数据估计，因此零假设下是**多元 t(df=dof)**，不是
+    # 多元正态。旧实现漏掉共享的 χ²/dof 分母，给出 2.441；那会把
+    # 小样本临界值和校正 p 值都算得过于乐观。
     idx = [off + i for i in range(len(keep))]
     Cs = C[np.ix_(idx, idx)]
     se_v = np.sqrt(np.diag(Cs))
+    corr = Cs / np.outer(se_v, se_v)
     rng = np.random.default_rng(20260824)
-    Z = rng.multivariate_normal(np.zeros(len(idx)), Cs, 200000) / se_v
-    crit = float(np.quantile(Z.max(1), 0.95))
-    print(f"\nDunnett 单侧临界值（k={len(idx)}, α=0.05, MC 于实际协方差）= {crit:.3f}")
+    Z = rng.multivariate_normal(np.zeros(len(idx)), corr, 400000)
+    scale = np.sqrt(rng.chisquare(dof, len(Z)) / dof)
+    max_t = (Z / scale[:, None]).max(1)
+    crit = float(np.quantile(max_t, 0.95))
+    print(f"\nDunnett 单侧临界值（k={len(idx)}, α=0.05, df={dof} 多元 t，"
+          f"MC 于实际协方差）= {crit:.3f}")
 
     elig = [c for c in eff if c not in dq]
     if not elig:
@@ -291,8 +309,10 @@ def analyze(st: State) -> int:
         return 1
     best = min(elig, key=lambda c: (eff[c][0], CORNERS.index(c)))   # 严格最小 + 枚举平局
     b, se = eff[best]
+    adj_p = float(np.mean(max_t >= -b / se))
     print(f"\n§4.2 候选 = **({best})**   ΔlogL {b:+.4f} ± {se:.4f}"
           f"   ⇒ L {(np.exp(b)-1)*100:+.1f}%   单侧 p={_p1(b/se, dof):.4f}")
+    print(f"     Dunnett 校正后单侧 p≈{adj_p:.4f}")
     print("     （严格取最小；无平局带、无入围门槛 —— 预注册 §4.2）")
 
     # ── §4.3 负结论: 同时单侧下界 ──
@@ -413,6 +433,13 @@ def main() -> int:
             if e["session"] == 1 and e["slot"] == 20:
                 print("  ─── 会话边界 ───")
         return 0
+
+    audit_only = a.status or a.sensitivity or a.analyze
+    if COLLECTION_CLOSED and (a.reset or not audit_only):
+        print("拒绝采集或重置：Step 1 已永久关闭。", file=sys.stderr)
+        print(f"权威记录：{STOP_RECORD}", file=sys.stderr)
+        print("仍可使用 --plan、--status、--analyze 或 --sensitivity。", file=sys.stderr)
+        return 2
 
     st = State()
     if a.reset:

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Step 1 v2 —— episode 级 SPSA 编排器。**无 G、无 H、无求逆。**
 
+**行政状态（2026-08-24）**：整个 Step 1 已永久停止，见
+`reports/STEP1_CLOSEOUT.md`。本模块仍供冻结分析代码导入；直接执行时只允许
+`--plan` 审计，不再允许续跑、reset、final-check 或改写最终参数。
+
 预注册 `reports/PREREG_STEP1_V2.md` §3–§4 的唯一实现。一轮 = 两集真机：
 
     采样 Δ  →  跑 θ⁺=θ+c_kΔ 一集  →  跑 θ⁻=θ−c_kΔ 一集
@@ -47,6 +51,8 @@ MAX_PAIR_VOIDS = 3           # 同一轮因中途崩被作废重跑的上限(⑥
 
 OUT = ROOT / "outputs/spsa_v2"
 STATE = OUT / "state.json"
+STOP_RECORD = ROOT / "reports/STEP1_CLOSEOUT.md"
+COLLECTION_CLOSED = True                  # 行政终止硬门；不依赖报告文件是否被移动
 POLICY = "outputs/train/2026-07-01/ACT_pickplace2_noimu_seed42/checkpoints/100000/pretrained_model"
 CALIB = "outputs/p2_labels/pp2a-deploy/manifest.json"
 
@@ -425,6 +431,24 @@ def main() -> int:
                     help="用 theta_final 跑 5 集冻结检查(§4), 只验安全与量级")
     ap.add_argument("--reset", action="store_true", help="清空状态重新开始（会先备份）")
     a = ap.parse_args()
+
+    plan_only = (a.plan and not a.dry_run and not a.finalize
+                 and not a.final_check and not a.reset)
+    if COLLECTION_CLOSED:
+        if not plan_only:
+            print("拒绝执行：Step 1 已永久关闭；v2 只保留 --plan 审计。", file=sys.stderr)
+            print(f"权威记录：{STOP_RECORD}", file=sys.stderr)
+            return 2
+        # 原流程在 round=40 时会自动重写 theta_final；关闭后 `--plan` 必须严格只读。
+        sp = _sp()
+        st = State.load()
+        print(f"Step 1 v2 已关闭 —— {st.round}/{N_ROUNDS} 轮，"
+              f"在册 {st.episodes_used} + 作废 {st.episodes_wasted} 集")
+        if st.round < N_ROUNDS:
+            one_round(st, sp, dry=False, plan_only=True)
+        else:
+            print("无待执行轮次；冻结结果保持不变。")
+        return 0
     sp = _sp()
 
     if a.reset and STATE.exists():
