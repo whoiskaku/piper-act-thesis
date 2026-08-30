@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Step 2 起点测量 —— 当前 MuJoCo 模型对真机 IMU 的保真度 (Gap1 / Gap2)。
+"""Step 2 开发基线 —— 当前手调 MuJoCo 模型对历史真机 IMU 的拟合度。
+
+**仅限 `legacy_development`**：输入含 Step 1 已查看的数据，而且每集单独搜索最佳
+滞后；输出既不是 held-out 验证，也不是 Step 2 的确认性指标。它只回答“现有 XML
+值得从哪里开始改”，不能证明或否定自动标定后的 G。
 
 指導教員第⑤条: G 必须是**能自动标定真实动力学参数的通用模拟器**, 不是 Δa 响应模型。
 故 Step 2 的对象是 `sim/piper_model.xml` 的物理参数, 而不是任何学出来的响应核。
@@ -9,11 +13,11 @@
     kin_ideal : 手臂被"规定"贴住指令 (零标定, 是"理想"的定义)
     dyn_ideal : 带 kp/阻尼的伺服模型追指令 (依赖标定)
     Gap1 = kin → dyn   控制器能解释的部分 (滞后 + 低通)
-    Gap2 = dyn → real  **未建模的墙本体** ← Step 2 要压的就是这个
+    Gap2 = dyn → real  在这个开发口径下的未拟合残差
 
 口径与 Step 1 的 `L` 完全一致 (0.5–9 Hz, 陀螺三轴, mean‖·‖²), 以便可比。
-**对齐**: kin 用 Step 1 冻结的 +3 帧; dyn 的滞后由伺服模型自己产生, 故用
-互相关**实测**最优滞后并一并报告 —— 若标定正确, 该值应趋于 0。
+**对齐**: kin 用 Step 1 冻结的 +3 帧；dyn 则在每集的开发损失上枚举 lag 并报告
+最小值。这个逐集最优 lag 会使结果偏乐观，不能作为最终测试的对齐规则。
 
 用法:
     python sim/step2_gap_baseline.py                 # 全部裸 ACT 集
@@ -112,7 +116,7 @@ def main() -> int:
     logs = bare_logs()[: a.n]
     print(f"裸 ACT 集 {len(logs)} 个   kp 覆盖 {jkp or '（无，用 XML 原值）'}")
     print(f"口径 {BAND[0]}–{BAND[1]} Hz 陀螺三轴 mean‖·‖²；kin 对齐 +{ALIGN_L} 帧（冻结）\n")
-    print(f"{'集':<26}{'L_kin':>9}{'L_dyn':>9}{'dyn滞后':>8}{'Gap1':>9}{'解释率':>8}")
+    print(f"{'集':<26}{'L_kin':>9}{'L_dyn':>9}{'dyn滞后':>8}{'Gap1':>9}{'相对变化':>9}")
     rows = []
     for p in logs:
         d = json.loads(p.read_text())
@@ -136,10 +140,11 @@ def main() -> int:
           f"{np.median(A[:,2]):>8.1f}{np.median(A[:,3]):>9.5f}{np.median(A[:,4])*100:>+7.1f}%")
     print(f"\n解读:")
     print(f"  L_kin  = Step 1 一直在用的 gap（真机 vs 运动学理想）")
-    print(f"  L_dyn  = **Gap2**, 未建模部分 ⇒ Step 2 要压的量")
-    print(f"  解释率 = 1 − L_dyn/L_kin ⇒ 当前伺服模型解释掉了多少 gap")
-    print(f"  dyn 滞后中位 {np.median(A[:,2]):.1f} 帧 —— 标定正确时应趋于 0"
-          f"（当前 kp 是**手调**的，第⑤条要求换成自动标定）")
+    print(f"  L_dyn  = 开发口径下的 **Gap2**（每集调过 lag，不是 held-out 指标）")
+    print(f"  相对变化 = 1 − L_dyn/L_kin（开发集内逐集选 lag，正值才表示误差下降）")
+    print(f"  dyn 最优滞后中位 {np.median(A[:,2]):.1f} 帧 —— 仅作开发诊断，"
+          f"不能据此冻结延迟（当前 kp 是**手调**的）")
+    print("  ⚠ 本结果使用 legacy_development 数据并逐集选 lag，只能作为开发起点。")
     return 0
 
 
