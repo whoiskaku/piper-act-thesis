@@ -204,10 +204,22 @@ def roll_flex(xml: Path, item, theta, mj_dt_scale: float = 1.0):
         jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, f"joint{k+1}")
         qa.append(int(m.jnt_qposadr[jid]))
     d = mujoco.MjData(m)
+    # 与冻结的 G-q-v1 使用完全相同的可用输入初始化：只读首帧命令，不能把
+    # 实测 enc0 偷渡给候选 F（否则候选比基线多看了一项真机状态）。
     for k in range(6):
-        d.qpos[qa[k]] = np.radians(item["enc0"][k])
+        d.qpos[qa[k]] = float(item["act"][0, k])
+    g0 = (float(np.clip(item["act"][0, 6], 0, 0.035))
+          if item["act"].shape[1] > 6 else 0.0)
+    for jn, val in (("joint7", g0), ("joint8", -g0)):
+        jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, jn)
+        if jid >= 0:
+            d.qpos[int(m.jnt_qposadr[jid])] = val
     mujoco.mj_forward(m, d)
     d.ctrl[:6] = item["ref"][0]
+    for an, val in (("joint7", g0), ("joint8", -g0)):
+        aid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, an)
+        if aid >= 0:
+            d.ctrl[aid] = val
     for _ in range(int(round(0.3 / dt))):
         mujoco.mj_step(m, d)
 
@@ -389,10 +401,13 @@ def main() -> int:
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--gate", action="store_true")
+    ap.add_argument("--extend", action="store_true")
     ap.add_argument("--workers", type=int, default=14)
     a = ap.parse_args()
     gc.disable()
     OUT.mkdir(parents=True, exist_ok=True)
+    if a.extend:
+        return cmd_extend(a)
     if a.gate:
         return cmd_gate(a)
     if not (a.smoke or a.run):
@@ -469,6 +484,59 @@ def main() -> int:
 
 
 
+# ══ 一次性网格外延（研究者 2026-08-30 放行；**固定预算，此后不再追加**）══
+#
+# 依据（`outputs/step2_g/structure/grid.json` 实测，非事后解释）:
+#   F 沿 ω 固定 ζ=0.40: 6.00:0.4824 → **8.49:0.4726** → 12.00:0.4770  ⇒ **ω 是内点**
+#   F 沿 ζ 固定 ω=8.49: 0.05:0.6434 → 0.10:0.5234 → 0.20:0.4772 → **0.40:0.4726**
+#                                                        ⇒ **ζ 在边缘, 单调要更大**
+#   B 沿 ζ 固定 ω=8.49: 0.4778 / 0.4775 / 0.4782 / 0.4799  ⇒ **两维都是内点**
+# ⇒ **只外延 F, 只沿 ζ 向上**（ζ 与 ω 交互 ⇒ 带一个 ω 局部细化）。**B 不外延**,
+#   理由是它的最优在两维都是内点 —— 证据判断, 非偏好。
+#
+# **预注册的解释约束**: 若胜出格的 ζ ≥ 0.7, **不得称「柔性共振模态」** ——
+# 大 ζ 下柔性铰趋于纯阻尼器, 加进去的是**电机–连杆之间的有效滞后 / 低通**,
+# 那是**不同的物理主张**。
+#
+# **终止规则**: 这是唯一一次外延。若 F 仍不过条件 4 ⇒ **收口, 不再扩大柔性结构**。
+Z_EXT = (0.6, 0.8, 1.0, 1.4, 2.0)
+W_EXT = (6.00, 7.13, 8.49, 10.10, 12.00)
+W_REFINE = (7.13, 10.10)
+
+
+def ext_cells():
+    c = [(j, float(w), z) for j in FLEX_J for w in W_EXT for z in Z_EXT]      # 75
+    c += [(4, float(w), z) for w in W_REFINE for z in Z_GRID]                 # 8 (仅 j5)
+    return c
+
+
+def cmd_extend(a) -> int:
+    cells = ext_cells()
+    print(f"**一次性网格外延（仅候选 F）** {len(cells)} 格，固定预算，此后不追加")
+    print(f"  ζ 向上 {Z_EXT} · ω {W_EXT} · 关节 {[f'j{j+1}' for j in FLEX_J]}")
+    print(f"  + j5 的 ω 细化 {W_REFINE} × 原 ζ {Z_GRID}")
+    print(f"  **B 不外延** —— 其最优在 ω 与 ζ 两维都是内点\n", flush=True)
+    rows = _grid_flex("train", cells, a.workers)
+    G = json.loads((OUT / "grid.json").read_text())
+    G["flex_ext"] = rows
+    (OUT / "grid.json").write_text(json.dumps(G, ensure_ascii=False, indent=2))
+    b0j, b0i = G["base_train"]
+    good = [r for r in rows if r[3] <= b0j * 1.05]
+    print(f"  {len(good)}/{len(rows)} 格满足训练关节不劣化 5%")
+    print(f"  {'关节':>6s}{'ω Hz':>8s}{'ζ':>7s}{'训练关节':>10s}{'训练IMU':>10s}{'vs 基线':>10s}")
+    for r in sorted(good, key=lambda r: r[4])[:8]:
+        print(f"  {'j'+str(r[0]+1):>6s}{r[1]:>8.2f}{r[2]:>7.2f}{r[3]:>10.4f}{r[4]:>10.4f}"
+              f"{(r[4]/b0i-1)*100:>9.1f}%")
+    allf = G["flex"] + rows
+    bf = min([r for r in allf if r[3] <= b0j * 1.05], key=lambda r: r[4])
+    print(f"\n  **F 合并后最优**: j{bf[0]+1} ω={bf[1]:.2f} ζ={bf[2]:g}"
+          f"  训练 IMU {bf[4]:.4f} ({(bf[4]/b0i-1)*100:+.1f}%)")
+    if bf[2] >= 0.7:
+        print(f"  ⚠ **ζ = {bf[2]:g} ≥ 0.7 ⇒ 按预注册不得称「柔性共振模态」**，"
+              f"只能称「电机–连杆间的有效滞后 / 低通」")
+    return 0
+
+
 def cmd_gate(a) -> int:
     """读 grid.json 的最优格，跑九条门禁 + 步长稳定检查。"""
     import g_q_v1 as GQ
@@ -480,7 +548,8 @@ def cmd_gate(a) -> int:
     b0j, b0i = G["base_train"]
     best = {}
     for kind, key in (("F", "flex"), ("B", "bracket")):
-        good = [r for r in G[key] if r[3] <= b0j * 1.05]
+        rows_all = G[key] + (G.get("flex_ext", []) if key == "flex" else [])
+        good = [r for r in rows_all if r[3] <= b0j * 1.05]
         best[kind] = min(good, key=lambda r: r[4])
     print("**九条门禁**（预注册；A/B 选结构，现有 pp2 作开发门禁）\n")
     for kind in ("F", "B"):
@@ -557,11 +626,25 @@ def cmd_gate(a) -> int:
     print(f"    F: dt 减半 ⇒ IMU 变化 **{dF:.2f}%** {'✓' if dF < 2 else '**✗**'}")
     print(f"    B: 滤波率 ×4 ⇒ IMU 变化 **{dB:.2f}%** {'✓' if dB < 2 else '**✗**'}")
 
+    # 条件 8 只在两候选各自均过 1–7、9 时用于判优；若只有一个候选通过，
+    # 不要求它再战胜一个本身不合格的候选。
+    baseF = all(res["F"]["_ok"].values()) and dF < 2
+    baseB = all(res["B"]["_ok"].values()) and dB < 2
+    fA = res["F"]["留出A"]["ci"].mean()
+    bA = res["B"]["留出A"]["ci"].mean()
+    winF = fA <= 0.95 * bA
+    winB = bA <= 0.95 * fA
+    if baseF and baseB:
+        passF, passB = bool(winF), bool(winB)
+    else:
+        passF, passB = bool(baseF), bool(baseB)
+    print(f"    条件 8 留出A 判优: F {fA:.4f} / B {bA:.4f} ⇒ "
+          f"{'F胜' if winF else ('B胜' if winB else '差异不足5%')}"
+          f"{'（仅两者基础门均过时生效）' if not (baseF and baseB) else ''}")
+
     pp2_none = all(res[k]["pp2"]["ci"].mean() >= res[k]["pp2"]["bi"].mean()
                    for k in ("F", "B"))
     print(f"\n{'='*80}")
-    passF = all(res["F"]["_ok"].values()) and dF < 2
-    passB = all(res["B"]["_ok"].values()) and dB < 2
     if passF or passB:
         print(f"⇒ 通过: {'F' if passF else ''}{'B' if passB else ''}")
     else:
@@ -572,6 +655,9 @@ def cmd_gate(a) -> int:
     (OUT / "gate.json").write_text(json.dumps({
         "best": {k: list(v) for k, v in best.items()},
         "stability_pct": {"F": dF, "B": dB},
+        "condition8": {"F_vs_B_holdoutA": float(fA / bA - 1),
+                       "winF": bool(winF), "winB": bool(winB),
+                       "applied": bool(baseF and baseB)},
         "sets": {k: {sn: {kk: (vv.tolist() if hasattr(vv, "tolist") else vv)
                           for kk, vv in u.items() if kk != "groups"}
                      for sn, u in res[k].items() if sn != "_ok"} for k in res},
