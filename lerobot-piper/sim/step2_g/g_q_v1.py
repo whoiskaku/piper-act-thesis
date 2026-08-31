@@ -155,12 +155,14 @@ def _schedule(dts: np.ndarray, mj_dt: float):
     return send, send + READ_OFFSET_STEPS
 
 
-def _sim(cmd7, dts=None, t_send=None, t_read=None, theta=None):
+def _sim(cmd7, dts=None, t_send=None, t_read=None, theta=None, return_hi=False):
     """→ (关节轨迹 度, 20 Hz 陀螺三轴)。
 
     `dts`      每帧指令保持时长(秒)。**缺省为名义 1/20 s** —— 部署口径，
                因为 pp2 等日志**没有逐帧时间戳**。
     `t_send/t_read` 若给出实际时间戳则优先，还原**辨识时的口径**。
+    `return_hi` 额外返回 (高速率陀螺, 读数步号, 高速率 fs) —— 供**传感器侧**
+               二阶模态等后置模型使用。冻结输出不受影响。
     `theta`    **仅供候选评估**。缺省 `None` ⇒ 用冻结的 `THETA_STAR`。
                传入别的 θ 时，走的是**逐字相同的代码路径**（同一限幅器、
                同一事件网格、同一读数惯例），但**结果不是 G-q-v1**。
@@ -227,7 +229,11 @@ def _sim(cmd7, dts=None, t_send=None, t_read=None, theta=None):
     while ri < n:
         q[ri] = np.degrees(d.qpos[:6]); ri += 1
     ba = butter(4, 0.45 * FPS / ((1.0 / mj_dt) / 2.0))
-    return q, filtfilt(*ba, hi, axis=0)[np.clip(read, 0, ntot - 1)]
+    g20 = filtfilt(*ba, hi, axis=0)[np.clip(read, 0, ntot - 1)]
+    if return_hi:
+        # 高速率(1/mj_dt Hz)未抗混叠的陀螺 + 读数步号 —— 供传感器侧后置模型使用
+        return q, g20, hi, np.clip(read, 0, ntot - 1), 1.0 / mj_dt
+    return q, g20
 
 
 def predict_qpos(cmd7, dts=None, t_send=None, t_read=None) -> np.ndarray:
