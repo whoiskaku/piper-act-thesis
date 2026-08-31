@@ -49,7 +49,7 @@ ACT の関節指令列 → [固件 MOVE J 加速度限幅(冻结)] → [MuJoCo �
   G-q-v1 **不是**「高保真 IMU 的 G」。
 - **无根本权衡**：在编码器拟合出的参数族内部（留出A，28 个横跨全 range 的 trial），
   编码器 L 与 IMU 的相关 **ρ = +0.580** ⇒ **二者同向变好**。
-  IMU 只是地板高得多，不是与关节精度冲突。
+  IMU 的可达水平低得多，但不与关节精度冲突。
 
 ## 选参规则（防留出污染）
 
@@ -155,12 +155,15 @@ def _schedule(dts: np.ndarray, mj_dt: float):
     return send, send + READ_OFFSET_STEPS
 
 
-def _sim(cmd7, dts=None, t_send=None, t_read=None):
+def _sim(cmd7, dts=None, t_send=None, t_read=None, theta=None):
     """→ (关节轨迹 度, 20 Hz 陀螺三轴)。
 
     `dts`      每帧指令保持时长(秒)。**缺省为名义 1/20 s** —— 部署口径，
                因为 pp2 等日志**没有逐帧时间戳**。
     `t_send/t_read` 若给出实际时间戳则优先，还原**辨识时的口径**。
+    `theta`    **仅供候选评估**。缺省 `None` ⇒ 用冻结的 `THETA_STAR`。
+               传入别的 θ 时，走的是**逐字相同的代码路径**（同一限幅器、
+               同一事件网格、同一读数惯例），但**结果不是 G-q-v1**。
     """
     import mujoco
     from scipy.signal import butter, filtfilt
@@ -186,7 +189,10 @@ def _sim(cmd7, dts=None, t_send=None, t_read=None):
     ref = np.radians(ref)
 
     m = mujoco.MjModel.from_xml_path(str(MODEL))
-    P.apply(m, THETA_STAR)                       # **kp6 由 params 压回 gauge**
+    th = THETA_STAR if theta is None else np.asarray(theta, float)
+    if th.shape != (P.N_P,):
+        raise TypeError(f"theta 形状应为 ({P.N_P},)，收到 {th.shape}")
+    P.apply(m, th)                               # **kp6 由 params 压回 gauge**
     mj_dt = m.opt.timestep
     if ts is not None:
         t0 = ts[0]
@@ -227,6 +233,19 @@ def _sim(cmd7, dts=None, t_send=None, t_read=None):
 def predict_qpos(cmd7, dts=None, t_send=None, t_read=None) -> np.ndarray:
     """ACT 指令 → 关节角轨迹（度）。**这是 G-q-v1 的主输出。**"""
     return _sim(cmd7, dts, t_send, t_read)[0]
+
+
+def predict_with_theta(cmd7, theta, dts=None, t_send=None, t_read=None):
+    """**候选评估专用** —— 用任意 θ 走 G-q-v1 的逐字相同代码路径。
+
+    → (关节轨迹 度, 20 Hz 陀螺三轴)。
+
+    ⚠ **返回值不是 G-q-v1 的输出。** 存在的唯一理由是：比较候选 θ 时，
+    必须排除「用某个模型的评估壳去量另一个模型」这类混淆
+    （已实际踩过一次，见 `G_Q_V1_FREEZE.md` §9）。
+    冻结的 `predict_qpos` / `predict_gyro` 行为不受本函数影响。
+    """
+    return _sim(cmd7, dts, t_send, t_read, theta=theta)
 
 
 def predict_gyro(cmd7, dts=None, t_send=None, t_read=None) -> np.ndarray:
