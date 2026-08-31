@@ -178,68 +178,76 @@ ABLATION = {"kp": None, "c": None, "fc": -0.2, "Ia": +2.1}
 LABEL = {"kp": "kp", "c": "damping", "fc": "frictionloss", "Ia": "armature"}
 
 
+# 冻结件对冻结件的性能（各调官方 predict_*、名义 20 Hz、扫全局位移各取最优）
+# 来源: reports/RESULT_OPTUNA_IDENT_ENC.md §14 / reports/G_Q_V1_FREEZE.md §4
+PERF = {
+    "joint_hA": (0.1490, 0.0353), "imu_hA": (0.7696, 0.5898),
+    "joint_pp2": (0.7644, 0.4304), "imu_pp2": (0.9797, 0.5643),
+}
+
+
 def fig3() -> Path:
     blk, bv, ntri = _enc_round()
     fig, ax = plt.subplots(figsize=(13.33, 7.5))
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
-    ax.text(0.5, 0.965, "同定結果と、その信頼度", ha="center", fontsize=27,
+    ax.text(0.5, 0.968, "同定結果と、その信頼度", ha="center", fontsize=26,
             fontweight="bold", color=INK)
-    ax.text(0.5, 0.915, "関節エンコーダを目標にした探索：3 seed × 約 1000 trial"
-            f"（計 {ntri} trial）", ha="center", fontsize=15, color=INK2)
+    ax.text(0.5, 0.922, f"関節エンコーダを目標にした探索：3 seed × 約 1000 trial"
+            f"（計 {ntri} trial）", ha="center", fontsize=14, color=INK2)
 
-    # ── 二つの結果を並べる：良くなった側と悪くなった側 ──
-    for x0, w, tt, l1, l2, col, fc_ in (
-        (0.045, 0.44, "関節軌道（未知姿勢）", "0.1241  →  0.0356",
-         "−71%  改善", BLUE, "#eaf2f8"),
-        (0.515, 0.44, "手首 IMU（未知姿勢）", "0.5930  →  0.6832",
-         "+15%  悪化", RED, "#fdf0ec")):
-        ax.add_patch(FancyBboxPatch((x0, 0.775), w, 0.115,
+    # ── 未知姿勢での改善（関節と IMU、両方）──
+    for x0, w, tt, pair in ((0.045, 0.44, "関節軌道（未知姿勢）", PERF["joint_hA"]),
+                            (0.515, 0.44, "手首 IMU（未知姿勢）", PERF["imu_hA"])):
+        ax.add_patch(FancyBboxPatch((x0, 0.788), w, 0.108,
                                     boxstyle="round,pad=0.008,rounding_size=0.015",
-                                    fc=fc_, ec=col, lw=2.0))
-        ax.text(x0 + w / 2, 0.862, tt, ha="center", va="center", fontsize=14, color=INK2)
-        ax.text(x0 + w * 0.36, 0.812, l1, ha="center", va="center", fontsize=16, color=INK)
-        ax.text(x0 + w * 0.82, 0.812, l2, ha="center", va="center", fontsize=17,
-                color=col, fontweight="bold")
+                                    fc="#eaf2f8", ec=BLUE, lw=2.0))
+        ax.text(x0 + w / 2, 0.869, tt, ha="center", va="center", fontsize=13.5, color=INK2)
+        ax.text(x0 + w * 0.36, 0.822, f"{pair[0]:.4f}  →  {pair[1]:.4f}",
+                ha="center", va="center", fontsize=15.5, color=INK)
+        ax.text(x0 + w * 0.83, 0.822, f"−{(1-pair[1]/pair[0])*100:.0f}%",
+                ha="center", va="center", fontsize=18, color=BLUE, fontweight="bold")
+    ax.text(0.70, 0.762,
+            "※ ただし 1.0 = 出力ゼロ相当 ⇒ 帯域エネルギーの約 44% しか説明できていない",
+            ha="center", fontsize=11.5, color=RED)
 
     cx = [0.035, 0.185, 0.475, 0.655, 0.815]
     cw = [0.145, 0.28, 0.17, 0.15, 0.15]
     hdr = ["分類", "最適値（j1-j3）", "3 seed 間の\nばらつき",
            "0 にした時の\n悪化", "同定できたか"]
-    y = 0.665
+    y = 0.640
     for x, w, h in zip(cx, cw, hdr):
-        ax.add_patch(FancyBboxPatch((x, y), w, 0.085, boxstyle="square,pad=0",
+        ax.add_patch(FancyBboxPatch((x, y), w, 0.082, boxstyle="square,pad=0",
                                     fc="#eef1f5", ec=GREY, lw=1.3))
-        ax.text(x + w / 2, y + 0.0425, h, ha="center", va="center", fontsize=14,
+        ax.text(x + w / 2, y + 0.041, h, ha="center", va="center", fontsize=13.5,
                 fontweight="bold", color=INK, linespacing=1.35)
     for i, k in enumerate(("kp", "c", "Ia", "fc")):
         v, rng = blk[k]
-        yy = y - (i + 1) * 0.098
+        yy = y - (i + 1) * 0.094
         ok = rng <= 3.0
         ab = ABLATION[k]
         cells = [LABEL[k], " / ".join(_num(x) for x in v), f"{rng:.1f} 倍",
                  "主要因" if ab is None else f"{ab:+.1f}%",
                  "○ 同定可" if ok else "× 決まらない"]
         for x, w, t in zip(cx, cw, cells):
-            ax.add_patch(FancyBboxPatch((x, yy), w, 0.098, boxstyle="square,pad=0",
+            ax.add_patch(FancyBboxPatch((x, yy), w, 0.094, boxstyle="square,pad=0",
                                         fc="white" if ok else "#fdf0ec", ec=GREY, lw=1.1))
-            ax.text(x + w / 2, yy + 0.049, t, ha="center", va="center", fontsize=14.5,
+            ax.text(x + w / 2, yy + 0.047, t, ha="center", va="center", fontsize=14,
                     color=INK if ok else RED,
                     fontweight="bold" if t.startswith(("○", "×", "主")) else "normal")
 
-    ax.add_patch(FancyBboxPatch((0.035, 0.028), 0.93, 0.215,
+    ax.add_patch(FancyBboxPatch((0.035, 0.022), 0.93, 0.208,
                                 boxstyle="round,pad=0.01,rounding_size=0.015",
                                 fc="#fdf0ec", ec=RED, lw=2.0))
-    ax.text(0.5, 0.200, "「決まらない」のは データ不足ではなく、効かないから",
-            ha="center", fontsize=18, fontweight="bold", color=RED)
-    ax.text(0.5, 0.148,
+    ax.text(0.5, 0.190, "「決まらない」のは データ不足ではなく、効かないから",
+            ha="center", fontsize=17.5, fontweight="bold", color=RED)
+    ax.text(0.5, 0.142,
             "armature と frictionloss を 0 にしても、損失は 2% しか変わらない。",
-            ha="center", fontsize=15.5, color=INK)
-    ax.text(0.5, 0.100,
-            "3 倍の改善はすべて kp と damping による。",
-            ha="center", fontsize=15.5, color=INK)
-    ax.text(0.5, 0.050,
-            "⇒ これは「関節軌道」の予測モデル。IMU の G の置き換えではない。",
-            ha="center", fontsize=16.5, color=INK, fontweight="bold")
+            ha="center", fontsize=15, color=INK)
+    ax.text(0.5, 0.096, "改善はすべて kp と damping による。",
+            ha="center", fontsize=15, color=INK)
+    ax.text(0.5, 0.046,
+            "⇒ この 24 個は「有効値」であって、実機の機械パラメータではない。",
+            ha="center", fontsize=16, color=INK, fontweight="bold")
     OUT.mkdir(parents=True, exist_ok=True)
     p = OUT / "fig3_result_credibility.png"
     fig.savefig(p, dpi=170, facecolor="white"); plt.close(fig)

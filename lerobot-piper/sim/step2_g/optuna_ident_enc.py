@@ -270,9 +270,20 @@ def roll(m, it) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def evaluate(m, items, theta, R, want_diag: bool = False) -> dict:
-    """→ {loss, per, imu, (diag)}。发散 ⇒ 全 PENALTY。"""
+    """→ {loss, per, imu, (diag)}。发散 ⇒ 全 PENALTY。
+
+    ⚠ 参数顺序是 `(m, items, **theta**, **R**)` —— 与 `optuna_ident.evaluate`
+    的 `(m, items, R, p)` **相反**。下面的断言就是为了让顺序写错时立刻炸掉，
+    而不是把 3×3 的旋转矩阵当 θ 静默算出垃圾（已实际踩过一次）。
+    """
     import params as P
     from sim.step1_v2_loss import bandpass41
+    theta = np.asarray(theta, float)
+    if theta.shape != (P.N_P,):
+        raise TypeError(f"theta 形状应为 ({P.N_P},)，收到 {theta.shape} —— "
+                        f"很可能把 theta 和 R 的位置写反了")
+    if np.shape(R) != (3, 3):
+        raise TypeError(f"R 形状应为 (3,3)，收到 {np.shape(R)} —— 同上")
     P.apply(m, theta)                                    # **kp6 由 params 压回 gauge**
     per, imu_per, dg = [], [], []
     for it in items:
