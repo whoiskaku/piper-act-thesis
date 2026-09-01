@@ -495,7 +495,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     import hashlib
     cmd_hash = hashlib.sha256(np.ascontiguousarray(cmd7, np.float32).tobytes()).hexdigest()[:16]
     rec = {"arm": arm, "t": [], "t_send": [], "t_send_span": [], "cmd": [],
-           "imu": [], "state": [], "imu100": [], "can_hs": [],
+           "imu": [], "state": [], "imu100": [], "can_hs": [], "can_q200": [],
            "clock": "time.monotonic",
            "cmd_hash": cmd_hash, "seqfile": seqfile, "use_probe": bool(use_probe),
            "premove": {"s": PREMOVE_S, "settle_s": PRESETTLE_S,
@@ -548,6 +548,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
                                           *map(float, ac), *map(float, gy)])
             if can_rec is not None:
                 rec["can_hs"].extend(can_rec.drain_recording())
+                rec["can_q200"].extend(can_rec.drain_q200())
             dt = time.perf_counter() - t_start
             if dt < DT:
                 time.sleep(DT - dt)
@@ -560,6 +561,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             rdr.stop_recording()
         if can_rec is not None:
             rec["can_hs"].extend(can_rec.drain_recording())
+            rec["can_q200"].extend(can_rec.drain_q200())
             can_rec.stop_recording()
             # 固件/SDK 版本要与数据同文件落盘: effort 标度规则依赖固件版本
             rec["can_hs_meta"] = can_rec.meta(getattr(robot.arm, "piper", None))
@@ -574,7 +576,8 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         rec["seqfile"] = seqfile
         p.write_text(json.dumps(rec))
         print(f"\n采集 {len(rec['imu'])} 帧(20Hz) + {len(rec['imu100'])} 样本(100Hz)"
-              f" + {len(rec['can_hs'])} 帧(高速CAN) → {p}"
+              f" + {len(rec['can_hs'])} 帧(电机200Hz)"
+              f" + {len(rec['can_q200'])} 帧(关节200Hz) → {p}"
               + (f"  ⚠ 提前终止: {stopped}" if stopped else "  ✓"))
         # **先落盘, 再动机器** —— 归位若受阻, 数据已经安全。
         # 归位放在这里而不是靠 __del__: 固件的一次性无插值写会从**激励末帧**
