@@ -86,6 +86,11 @@ GRIP_FULL = 0.035
 CONTACT_THRESHOLD_RATIO = 0.02
 CONTACT_HALF_WINDOW = 10
 GATE_THRESHOLD = 0.08
+# Frozen offline metric band.  The fit itself never touches it: only the P2/P3
+# beta tests and the P0 8% gate do (see the module docstring).  ``--metric-band``
+# overrides it so the *same* analyser, split and gates can be re-scored in a
+# narrower band; the default stays bit-identical to step1-linear-v1.
+METRIC_BAND: tuple[float, float] = (0.5, 9.0)
 MU = 0.005
 HP_ALPHA = 1.0 - math.exp(-2.0 * math.pi * 0.5 / FS)
 
@@ -146,11 +151,14 @@ def causal_conv(H: np.ndarray, action: np.ndarray) -> np.ndarray:
 
 
 def bandpass41(x: np.ndarray) -> np.ndarray:
-    """Frozen offline metric filter: centred 41-tap FIR, 0.5--9 Hz at 20 Hz."""
+    """Offline metric filter: centred 41-tap FIR at 20 Hz, band ``METRIC_BAND``.
+
+    Default (0.5, 9.0) reproduces step1-linear-v1 bit for bit.
+    """
     x = _as_f64(x)
     if x.ndim != 2 or x.shape[1] != 3:
         raise ValueError(f"bandpass input must have shape (T,3), got {x.shape}")
-    kernel = firwin(41, [0.5, 9.0], fs=FS, pass_zero=False)
+    kernel = firwin(41, list(METRIC_BAND), fs=FS, pass_zero=False)
     return np.stack([np.convolve(x[:, j], kernel, mode="same") for j in range(3)], axis=1)
 
 
@@ -608,7 +616,8 @@ def artifact_manifest(R: np.ndarray, b: np.ndarray, epsilon: float,
         "theta_shape": [6, FEATURE_DIM],
         "epsilon_lms": epsilon,
         "fit_space": "raw_aligned_gyro_gap",
-        "offline_metric": "41-tap FIR 0.5-9 Hz, centred",
+        "offline_metric": f"41-tap FIR {METRIC_BAND[0]}-{METRIC_BAND[1]} Hz, centred",
+        "metric_band": list(METRIC_BAND),
         "H_fit_nuisance": "per-episode constant removed",
         "calibration": {"path": str(calib_path), "sha256": _file_sha256(calib_path),
                         "R": np.asarray(R).tolist(), "b": np.asarray(b).tolist()},
@@ -698,6 +707,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="p2: require only P0/P1/P2 and stop at the P2 beta gate; "
                              "full: require P3 and run all frozen gates")
     parser.add_argument("--min-frames", type=int, default=550)
+    parser.add_argument("--metric-band", nargs=2, type=float, metavar=("LO", "HI"),
+                        default=None,
+                        help="offline metric band in Hz; default 0.5 9.0 = frozen "
+                             "step1-linear-v1.  Only the P2/P3 beta tests and the "
+                             "P0 8%% gate use it -- the fit is unchanged.")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args(argv)
 
@@ -706,6 +720,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.self_test:
         return self_test()
+    if args.metric_band is not None:
+        global METRIC_BAND
+        METRIC_BAND = (float(args.metric_band[0]), float(args.metric_band[1]))
+        print(f"**offline metric band overridden: {METRIC_BAND[0]}-{METRIC_BAND[1]} Hz** "
+              f"(fit unchanged; only P2/P3 beta and the P0 8% gate are re-scored)")
     data_root = args.data_root if args.data_root.is_absolute() else ROOT / args.data_root
     calib_path = args.calib if args.calib.is_absolute() else ROOT / args.calib
     output = args.output if args.output.is_absolute() else ROOT / args.output
