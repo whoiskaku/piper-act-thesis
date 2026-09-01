@@ -22,6 +22,7 @@
 from __future__ import annotations
 import argparse
 import json
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -199,7 +200,7 @@ def staged_return(robot, torch, grip: float) -> bool:
 
 
 def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
-        outdir=None, robot_type="piper", settle_probe=0.0):
+        outdir=None, robot_type="piper", settle_probe=0.0, canhs=True):
     cmd7, da, z = load_seq(seqfile, b2)
     import re
     is_bare = bool(re.fullmatch(r"A\d+", arm))      # A1/A2/A3/A4… 全是裸复放
@@ -494,7 +495,8 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     import hashlib
     cmd_hash = hashlib.sha256(np.ascontiguousarray(cmd7, np.float32).tobytes()).hexdigest()[:16]
     rec = {"arm": arm, "t": [], "t_send": [], "t_send_span": [], "cmd": [],
-           "imu": [], "state": [], "imu100": [], "clock": "time.monotonic",
+           "imu": [], "state": [], "imu100": [], "can_hs": [],
+           "clock": "time.monotonic",
            "cmd_hash": cmd_hash, "seqfile": seqfile, "use_probe": bool(use_probe),
            "premove": {"s": PREMOVE_S, "settle_s": PRESETTLE_S,
                        "q_parked": q_now.tolist(), "q_start": q_pre.tolist(),
@@ -508,6 +510,18 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     if rdr is not None and hasattr(rdr, "start_recording"):
         rdr.start_recording()                      # 100Hz 独立队列(不碰控制侧 buffer)
         print("  100Hz 记录已开启")
+    # 六关节高速 CAN 反馈(0x251–0x256)。**被动只读**, 独立 socket, 不碰控制回路。
+    # 轮询 GetArmHighSpdInfoMsgs() 会对六路异步流做无抗混叠抽取 —— 与 TSND 同一个坑。
+    can_rec = None
+    if canhs:
+        sys.path.insert(0, str(ROOT / "sim/step3_canobs"))
+        from can_hs_recorder import CanHighSpdRecorder
+        can_rec = CanHighSpdRecorder()
+        # wait_first 不能省: 接口 DOWN 时 bind 照样成功, 会静默录到零帧。
+        if can_rec.start_recording() and can_rec.wait_first():
+            print("  高速 CAN 反馈记录已开启 (0x251–0x256, 被动只读)")
+        else:
+            print(f"  ⚠ 高速 CAN 反馈未开启: {can_rec.err} —— **本条不能用于 CAN 可观测性分析**")
     stopped = None
     try:
         for i in range(len(cmd7)):
@@ -532,6 +546,8 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
                 for ht, ms, ac, gy in rdr.drain_recording():   # 逐帧排空, 防环形覆盖
                     rec["imu100"].append([float(ht), int(ms),
                                           *map(float, ac), *map(float, gy)])
+            if can_rec is not None:
+                rec["can_hs"].extend(can_rec.drain_recording())
             dt = time.perf_counter() - t_start
             if dt < DT:
                 time.sleep(DT - dt)
@@ -542,6 +558,11 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             for ht, ms, ac, gy in rdr.drain_recording():
                 rec["imu100"].append([float(ht), int(ms), *map(float, ac), *map(float, gy)])
             rdr.stop_recording()
+        if can_rec is not None:
+            rec["can_hs"].extend(can_rec.drain_recording())
+            can_rec.stop_recording()
+            # 固件/SDK 版本要与数据同文件落盘: effort 标度规则依赖固件版本
+            rec["can_hs_meta"] = can_rec.meta(getattr(robot.arm, "piper", None))
         p = (outdir or PROBE) / f"replay_{tag}{arm}.json"   # tag 含 ep 与轮次
         if p.exists():
             # **移开, 不覆盖**。判据修订后重跑同一条序列会同名 —— 原始数据仍然
@@ -552,7 +573,9 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         rec["stopped"] = stopped
         rec["seqfile"] = seqfile
         p.write_text(json.dumps(rec))
-        print(f"\n采集 {len(rec['imu'])} 帧(20Hz) + {len(rec['imu100'])} 样本(100Hz) → {p}" + (f"  ⚠ 提前终止: {stopped}" if stopped else "  ✓"))
+        print(f"\n采集 {len(rec['imu'])} 帧(20Hz) + {len(rec['imu100'])} 样本(100Hz)"
+              f" + {len(rec['can_hs'])} 帧(高速CAN) → {p}"
+              + (f"  ⚠ 提前终止: {stopped}" if stopped else "  ✓"))
         # **先落盘, 再动机器** —— 归位若受阻, 数据已经安全。
         # 归位放在这里而不是靠 __del__: 固件的一次性无插值写会从**激励末帧**
         # 直扫 safe_disable, 那正是 2026-08-26 碰撞的成因(见 staged_return 注释)。
@@ -589,11 +612,14 @@ if __name__ == "__main__":
     ap.add_argument("--settle-probe", type=float, default=0.0, metavar="SEC",
                     help="**观测模式**: 预移动后静置 SEC 秒并记录, 然后退出, "
                          "不跑激励序列。用于测「粘滑会不会自己停」。")
+    ap.add_argument("--no-canhs", action="store_true",
+                    help="关闭六关节高速 CAN 反馈记录(默认开; 被动只读, 不影响控制)")
     a = ap.parse_args()
     if a.seqfile:                                  # 显式路径优先, 直接跑
         raise SystemExit(run(a.arm, a.dry_run, seqfile=a.seqfile, tag="",
                              b2=a.b2, outdir=Path(a.outdir) if a.outdir else None,
-                             robot_type=a.robot, settle_probe=a.settle_probe))
+                             robot_type=a.robot, settle_probe=a.settle_probe,
+                             canhs=not a.no_canhs))
     if a.b2:
         import re as _re
         cfg = ("j2_" + a.amp + "_p" if _re.fullmatch(r"A\d+", a.arm)
@@ -602,7 +628,8 @@ if __name__ == "__main__":
         # 轮次后缀: 第2轮的 B 臂配置名与第1轮相同, 不加后缀会**覆盖首轮数据**
         tag = f"ep{a.ep}_" if a.round == 1 else f"ep{a.ep}_r{a.round}_"
         raise SystemExit(run(a.arm, a.dry_run, seqfile=seqfile,
-                             tag=tag, b2=True, outdir=PB2))
+                             tag=tag, b2=True, outdir=PB2, canhs=not a.no_canhs))
     seqfile = f"probe_seq_pp2_ep{a.ep}.npz" if a.ep is not None else "probe_seq.npz"
     tag = f"ep{a.ep}_" if a.ep is not None else ""
-    raise SystemExit(run(a.arm, a.dry_run, seqfile=seqfile, tag=tag))
+    raise SystemExit(run(a.arm, a.dry_run, seqfile=seqfile, tag=tag,
+                         canhs=not a.no_canhs))
