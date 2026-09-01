@@ -29,7 +29,7 @@
     python -u sim/step3_canobs/ceiling_200hz.py
 """
 from __future__ import annotations
-import gc, json, sys
+import argparse, gc, json, sys
 from pathlib import Path
 import numpy as np
 
@@ -97,6 +97,10 @@ def load_streams(nm: str, arm: str = "A1"):
 
 def main() -> int:
     gc.disable()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arms", nargs="+", default=["A1"],
+                    help="每个 arm = 一个会话（A1=会话1, A3=会话2）")
+    ARMS = ap.parse_args().arms
     from scipy.signal import butter, filtfilt, firwin
     from scipy.linalg import orthogonal_procrustes
 
@@ -130,8 +134,9 @@ def main() -> int:
     print("200 Hz 关节角 → 腕部陀螺：抗混叠口径统一前后")
     print("（时基全部用设备/内核时间戳；不使用那两条集里坏掉的 20 Hz 落盘字段）\n")
     acc = {k: {b: np.zeros(3) for b in BANDS} for k in ("naive20", "aa20", "aa100")}
-    for nm in EPS:
-        g100, q200, tg_i, tg_q = load_streams(nm)
+    runs = [(arm, nm) for arm in ARMS for nm in EPS]
+    for arm, nm in runs:
+        g100, q200, tg_i, tg_q = load_streams(nm, arm)
         kin200 = kin_gyro_fs(q200, FS_Q)
         # ---- 100 Hz 上限（两侧都不抽取，只把 200→100 抗混叠）----
         kin100 = lp(kin200, 45.0, FS_Q)[::2][:len(g100)]
@@ -146,7 +151,7 @@ def main() -> int:
             L, r = evaluate(A_, S_, fs, msh)
             for b in BANDS:
                 acc[key][b] += np.array(r[b])
-            print(f"  {nm} {key:>8}  L={L:>2}  "
+            print(f"  {arm}/{nm} {key:>8}  L={L:>2}  "
                   f"ρ² = {' / '.join(f'{r[b][1]:.3f}' for b in BANDS)}")
 
     print(f"\n  {'口径':<34}{'0.5–3 Hz':>22}{'3–9 Hz':>22}{'0.5–9 Hz':>22}")
@@ -156,12 +161,12 @@ def main() -> int:
                      ("aa100", "100 Hz 原生(不抽到 20 Hz)")):
         s = ""
         for b in BANDS:
-            r, r2, g = acc[key][b] / len(EPS)
+            r, r2, g = acc[key][b] / len(runs)
             s += f"{r2:>10.3f}{r:>7.3f}{g:>5.2f}"
         print(f"  {lbl:<34}{s}")
-    d = (acc["aa20"][(3.0, 9.0)][1] - acc["naive20"][(3.0, 9.0)][1]) / len(EPS)
+    d = (acc["aa20"][(3.0, 9.0)][1] - acc["naive20"][(3.0, 9.0)][1]) / len(runs)
     print(f"\n  3–9 Hz 抗混叠单独带来的 ρ² 变化: {d:+.3f}")
-    print("  口径: pp2 诊断集 2 条(同一会话 2026-09-01)。**不可与 17 集开发基准集**"
+    print(f"  口径: pp2 诊断集 {len(runs)} 条 / {len(ARMS)} 个会话(2026-09-01)。**不可与 17 集开发基准集**"
           "的 §28 数字并列 —— 集合不同、会话不同、R 的来源也不同。")
     return 0
 

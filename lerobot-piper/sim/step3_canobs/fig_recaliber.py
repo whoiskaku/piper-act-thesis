@@ -55,8 +55,23 @@ def main() -> int:
 
     from scipy.linalg import orthogonal_procrustes
     z = np.load(OUT / "recaliber_traces.npz")
+    eps = sorted({k.rsplit("_", 2)[0] for k in z.files if k.endswith("_A_aa")})
+
+    def _r2(nm):                       # G-q-v1 の 3–9 Hz ρ²(自分の最適シフト)
+        A0, S0 = z[f"{nm}_A_aa"], z[f"{nm}_gq20"]
+        best = 0.0
+        for L in range(4):
+            k = min(len(A0) - L, len(S0)); A_, S_ = A0[L:L + k], S0[:k]
+            Sr = S_ @ orthogonal_procrustes(S_, A_)[0]
+            a_, s_ = bp(A_, *BANDS[1]), bp(Sr, *BANDS[1])
+            best = max(best, float((a_ * s_).sum() ** 2
+                                   / max((a_ * a_).sum() * (s_ * s_).sum(), 1e-30)))
+        return best
+    order = sorted(eps, key=_r2, reverse=True)         # 良い順
+    # 慣例どおり **中央値集と最難集**（G-q-v1 の 3–9 Hz が中央 / 最悪）
+    show = [(order[len(order) // 2], "中央値"), (order[-1], "最難")]
     fig, axes = plt.subplots(2, 2, figsize=(16, 8.2))
-    for col, nm in enumerate(("ep0", "ep1")):
+    for col, (nm, kind) in enumerate(show):
         A0 = z[f"{nm}_A_aa"]
         # ── **シフトは系列ごとに最適化する** ────────────────────────────
         # 20 Hz 出力では 1 サンプル = 50 ms、3–9 Hz(周期 111–333 ms)では 54–162°
@@ -99,7 +114,7 @@ def main() -> int:
                     label=f"真の関節 200 Hz から描画 = 天井 (L={Lk})")
             ax.plot(t, g_[:, j] * sg, color=C_GQ, lw=1.4, zorder=2,
                     label=f"G-q-v1 (L={Lg})")
-            ax.set_title(f"{nm}  {lo}–{hi} Hz  (軸 {'xyz'[j]})"+ ("  ※最も強い 4 s を拡大" if row else "") + "    "
+            ax.set_title(f"{kind} {nm}  {lo}–{hi} Hz  (軸 {'xyz'[j]})"+ ("  ※最も強い 4 s を拡大" if row else "") + "    "
                          f"ρ: G-q-v1 = {rg:+.2f} / 天井 = {rk:+.2f}", fontsize=10.5)
             ax.set_ylabel("角速度 [rad/s]", fontsize=9)
             ax.grid(alpha=.25); ax.tick_params(labelsize=8)
@@ -111,12 +126,12 @@ def main() -> int:
                  "下段 3–9 Hz：**橙(真の関節)は追える・紫(G-q-v1)は追えない**（各系列は自分の最適シフト）",
                  fontsize=13.5, y=0.985)
     fig.text(0.5, 0.005,
-             "集計 ρ²(3–9 Hz): G-q-v1 = 0.230 / 天井 = 0.673  ⇒ 不足の 0.443 は"
-             "**関節軌跡予測**、0.327 がセンサ・可観測層。"
+             "集計 ρ²(3–9 Hz, 4 集/2 セッション): G-q-v1 = 0.235 / 天井 = 0.692  ⇒ 不足の 0.457 は"
+             "**関節軌跡予測**、0.308 がセンサ・可観測層。"
              "口径: 実機側 100 Hz→9 Hz 低通→20 Hz（従来は無フィルタ間引き）。"
-             "時基はデバイス ms とカーネル時刻（この 2 集は 20 Hz ループ自体が劣化, "
+             "時基はデバイス ms とカーネル時刻（20 Hz ループは記録器で劣化, "
              "落盤 20 Hz フィールドは不使用）。装着回転は集ごとに Procrustes 推定。"
-             "pp2 診断集 2 条・同一セッション、17 集の開発基準集とは並置不可。",
+             "pp2 診断集 4 条・2 セッション、17 集の開発基準集とは並置不可。",
              ha="center", fontsize=8.4, color="#333")
     fig.tight_layout(rect=(0, 0.028, 1, 0.965))
     for p in (OUT, ADV):

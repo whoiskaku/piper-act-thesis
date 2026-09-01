@@ -23,7 +23,7 @@
     python -u sim/step3_canobs/gq_recaliber.py
 """
 from __future__ import annotations
-import gc, json, sys
+import argparse, gc, json, sys
 from pathlib import Path
 import numpy as np
 
@@ -39,6 +39,9 @@ OUT = ROOT / "outputs/step3_canobs"
 
 def main() -> int:
     gc.disable()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arms", nargs="+", default=["A1"])
+    ARMS = ap.parse_args().arms
     from scipy.signal import butter, filtfilt, firwin
     from scipy.linalg import orthogonal_procrustes
     import g_q_v1 as GQ
@@ -74,9 +77,10 @@ def main() -> int:
     keys = ("gq_naive20", "gq_aa20", "kin_naive20", "kin_aa20")
     acc = {k: {b: np.zeros(3) for b in BANDS} for k in keys}
     saved = {}
-    for nm in EPS:
-        d = json.loads((ROOT / f"outputs/probe/replay_{nm}_A1.json").read_text())
-        g100, q200, tg_i, tg_q = load_streams(nm)
+    runs = [(arm, nm) for arm in ARMS for nm in EPS]
+    for arm, nm in runs:
+        d = json.loads((ROOT / f"outputs/probe/replay_{nm}_{arm}.json").read_text())
+        g100, q200, tg_i, tg_q = load_streams(nm, arm)
         cmd = np.asarray(d["cmd"], float)
         ts, tr = np.asarray(d["t_send"], float), np.asarray(d["t"], float)
         # G 侧：1 kHz 原始陀螺 → 抗混叠 → 重采到真机的均匀 100 Hz 网格
@@ -94,9 +98,9 @@ def main() -> int:
                 for b in BANDS:
                     acc[f"{tag}_{cal}"][b] += np.array(r[b])
                 if tag == "gq":
-                    print(f"  {nm} G-q-v1 {cal:>8}  L={L}  "
+                    print(f"  {arm}/{nm} G-q-v1 {cal:>8}  L={L}  "
                           f"ρ² = {' / '.join(f'{r[b][1]:.3f}' for b in BANDS)}")
-        saved[nm] = {"A_naive": A_naive, "A_aa": A_aa,
+        saved[f"{arm}_{nm}"] = {"A_naive": A_naive, "A_aa": A_aa,
                      "gq20": lp(gq100, 9.0, FS_I)[::5],
                      "kin20": lp(kin100, 9.0, FS_I)[::5]}
 
@@ -108,18 +112,18 @@ def main() -> int:
                    ("kin_aa20", "天花板  新口径")):
         s = ""
         for b in BANDS:
-            r, r2, g = acc[k][b] / len(EPS)
+            r, r2, g = acc[k][b] / len(runs)
             s += f"{r2:>10.3f}{r:>7.3f}{g:>5.2f}"
         print(f"  {lbl:<32}{s}")
     for b, nb in ((0.5, 3.0), (3.0, 9.0), (0.5, 9.0)) and (
             ((0.5, 3.0), "0.5–3"), ((3.0, 9.0), "3–9"), ((0.5, 9.0), "0.5–9")):
-        d1 = (acc["gq_aa20"][b][1] - acc["gq_naive20"][b][1]) / len(EPS)
+        d1 = (acc["gq_aa20"][b][1] - acc["gq_naive20"][b][1]) / len(runs)
         print(f"  {nb} Hz: G-q-v1 的 ρ² 因**口径修正**变化 {d1:+.3f}")
     OUT.mkdir(parents=True, exist_ok=True)
     np.savez(OUT / "recaliber_traces.npz",
              **{f"{nm}_{k}": v for nm, dd in saved.items() for k, v in dd.items()})
     print(f"\n  波形已存 → {OUT/'recaliber_traces.npz'}")
-    print("  口径: pp2 诊断集 2 条(同一会话 2026-09-01)，**不可与 17 集开发基准集**"
+    print(f"  口径: pp2 诊断集 {len(runs)} 条 / {len(ARMS)} 个会话(2026-09-01)，**不可与 17 集开发基准集**"
           "的 §28 数字并列。")
     return 0
 
