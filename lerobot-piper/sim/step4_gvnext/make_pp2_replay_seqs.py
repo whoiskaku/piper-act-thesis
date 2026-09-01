@@ -24,7 +24,7 @@ pp2 家族有跨族多样性（`pp2f60` 与训练族的轨迹相关仅约 0.70�
     python -u sim/step4_gvnext/make_pp2_replay_seqs.py --check    # 只做安全体检
 """
 from __future__ import annotations
-import argparse, json, sys
+import argparse, hashlib, json, subprocess, sys, time
 from pathlib import Path
 import numpy as np
 
@@ -34,7 +34,10 @@ for _p in (ROOT, ROOT / "sim"):
         sys.path.insert(0, str(_p))
 
 SRC = ROOT / "outputs/p2_labels"
-OUT = ROOT / "outputs/step4_gvnext/seqs"
+OUT = ROOT / "outputs/step4_gvnext"                 # = collect.py 的 SUITE
+SIGNOFF = ROOT / "reports/step4_gvnext_signoff.json"
+# 训练族只在会话1采, 留出族只在会话2采 —— 「未见轨迹 + 跨会话」两者同时成立。
+SESSION = {"pp2": 1, "pp2a": 1, "pp2f": 2, "pp2f60": 2}
 FAMILIES = ("pp2", "pp2a", "pp2f", "pp2f60")
 GRIP_MAX = 0.035                      # 与 replay_probe 的夹爪钳位一致
 
@@ -59,6 +62,7 @@ def main() -> int:
 
     OUT.mkdir(parents=True, exist_ok=True)
     tot = ok = 0
+    meta: dict[str, dict] = {}
     kept: dict[str, list[str]] = {f: [] for f in FAMILIES}
     excluded: list[dict] = []
     print(f"{'序列':<18}{'帧':>6}{'时长s':>7}   安全检查")
@@ -79,19 +83,42 @@ def main() -> int:
             if degraded:
                 note += f"  ⚠降级:{degraded[0][:30]}"
             print(f"{nm:<18}{len(cmd7):>6}{len(cmd7)/20:>7.1f}   ✓ {note}")
+            sha = hashlib.sha256(np.round(cmd7, 9).tobytes()).hexdigest()[:12]
+            meta[nm] = {"kind": "pp2_replay", "target": [0, 1, 2, 4, 5],
+                        "sha": sha, "frames": int(len(cmd7)), "family": fam,
+                        "session": SESSION[fam],
+                        "role": "train" if SESSION[fam] == 1 else "holdout"}
             if not a.check:
-                np.savez(OUT / f"{nm}.npz", cmd7=cmd7, da=da,
+                np.savez(OUT / f"{nm}.npz", cmd7=cmd7, da=da, sha=sha,
                          src=str(SRC / f"{fam}-deploy"), family=fam)
     print(f"\n  {ok}/{tot} 条通过安全检查，**只落盘通过的那些**"
           + ("（--check：未落盘）" if a.check else f"  → {OUT}"))
     for e in excluded:
         print(f"    剔除 {e['name']}: {e['reason']}")
     if not a.check:
-        (OUT / "manifest.json").write_text(json.dumps(
-            {"kept": kept, "n_kept": ok, "n_total": tot, "excluded": excluded,
-             "note": ("裸复放 da=0; j4 在所有族里恒为 0; "
-                      "剔除项越 MuJoCo 模型限位(j2 下界保守), **未放宽限位**"),
-             "grip_clip": GRIP_MAX}, indent=1, ensure_ascii=False))
+        (OUT / "manifest.json").write_text(json.dumps(meta, indent=1, ensure_ascii=False))
+        try:
+            gitc = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                                  capture_output=True, text=True).stdout.strip()
+        except Exception:                                     # noqa: BLE001
+            gitc = "?"
+        # **签字由安全审计产出, 只签通过的那些** —— collect.py 会逐条核对 sha,
+        # 没签过字的序列不得上机。
+        SIGNOFF.write_text(json.dumps({
+            "signed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "scope": "G-vNext 复放采集(PREREG_G_VNEXT.md)",
+            "n_sequences": ok, "git_commit": gitc,
+            "excluded": excluded,
+            "what_this_does_NOT_cover":
+                "未覆盖: 真机接触/负载变化; 剔除项越 MuJoCo 模型限位(j2 下界保守), 未放宽限位",
+            "note": "裸复放 da=0; j4 在所有族里恒为 0 ⇒ 逐关节判据只在 5 个可动关节上成立",
+            "sequences": [{"name": k, **v} for k, v in sorted(meta.items())],
+        }, indent=1, ensure_ascii=False))
+        print(f"  签字 → {SIGNOFF}")
+        for sess in (1, 2):
+            ns = [k for k, v in meta.items() if v["session"] == sess]
+            fr = sum(meta[k]["frames"] for k in ns)
+            print(f"    会话{sess}: {len(ns):>2} 条  指令时长 {fr/20/60:.1f} min")
     return 0
 
 

@@ -234,8 +234,38 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--n", type=int, help="只跑接下来 N 条")
+    # ── 路径参数化(2026-09-02) ────────────────────────────────────────
+    # G-vNext 的复放采集要用**同一套机制**(崩溃重启/原子记账/孤儿清理/签字核对),
+    # 只是换套件与落盘目录。故把常量改成可覆盖, **机制一行不动**。
+    ap.add_argument("--suite", type=Path, default=None,
+                    help="套件目录(含 manifest.json 与 {name}.npz); 默认 outputs/step2_g")
+    ap.add_argument("--out", type=Path, default=None, help="落盘目录; 默认 SUITE/collect")
+    ap.add_argument("--signoff", type=Path, default=None, help="签字文件")
+    ap.add_argument("--session", type=int, default=None,
+                    help="只跑 manifest 里 session 等于该值的序列")
+    ap.add_argument("--only", nargs="+", default=None,
+                    help="只跑指定名字的序列(用于跨会话重复采样)")
     a = ap.parse_args()
+    global SUITE, OUT, STATE, SIGNOFF
+    if a.suite:
+        SUITE = a.suite if a.suite.is_absolute() else ROOT / a.suite
+        OUT = SUITE / "collect"
+        SIGNOFF = ROOT / "reports/step2_g_signoff.json"
+    if a.out:
+        OUT = a.out if a.out.is_absolute() else ROOT / a.out
+    if a.signoff:
+        SIGNOFF = a.signoff if a.signoff.is_absolute() else ROOT / a.signoff
+    STATE = OUT / "state.json"
     plan = load_plan()
+    if a.session is not None:
+        plan = [p for p in plan if p.get("session") == a.session]
+        print(f"**只跑会话 {a.session}** ⇒ {len(plan)} 条")
+    if a.only:
+        miss = sorted(set(a.only) - {p["name"] for p in plan})
+        if miss:
+            raise SystemExit(f"--only 里这些名字不在计划中: {miss}")
+        plan = [p for p in plan if p["name"] in set(a.only)]
+        print(f"**只跑指定 {len(plan)} 条**: {[p['name'] for p in plan]}")
     print(f"套件 {len(plan)} 条 · 签字核对 ✅ 全部一致")
     if a.plan:
         for i, p in enumerate(plan, 1):

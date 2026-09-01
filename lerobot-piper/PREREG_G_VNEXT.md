@@ -87,7 +87,11 @@ $$\hat\omega = kin(\hat q) + r_s(u,\ \hat q,\ \dot{\hat q},\ history)$$
 | | 内容 | 集数 | 估时 |
 |---|---|---|---|
 | **会话 1** | 训练族全量（pp2 + pp2a） | 18 | ~19 min |
-| **会话 2** | **留出族全量**（pp2f + pp2f60）+ 训练族里**重复 6 条** 🔧 | 8 + 6 | ~15 min |
+| **会话 2** | **留出族全量**（pp2f + pp2f60）+ 训练族里**重复 6 条** | 8 + 6 | ~15 min |
+
+**重复的 6 条事前定死**（不得采完再挑）：
+`pp2_ep000` `pp2_ep004` `pp2_ep009` `pp2a_ep000` `pp2a_ep004` `pp2a_ep009`
+（每族按序号均匀取 3 条）。
 
 - **最终判定只能来自「未见轨迹 + 跨会话」** ⇒ 留出族**只在会话 2 采**，
   同时满足"轨迹未参与训练"与"会话未参与训练"。
@@ -160,6 +164,27 @@ $$\hat\omega = kin(\hat q) + r_s(u,\ \hat q,\ \dot{\hat q},\ history)$$
 - 时基用 TSND 设备 ms 与 CAN 内核时刻；**不用落盘的 20 Hz 字段**。
 - 装着旋转逐集正交 Procrustes（跨会话绑带重装 ⇒ 每会话朝向不同）。
 - 本轮数字**不可与** 17 集 pp2 开发基准集、也不可与 §28 的旧口径数字并列。
+
+## 7.5 采集命令（签字已核对，26 条 sha 全部一致）
+
+```
+# 会话 1（训练族 18 条，~19 min）
+python -u sim/step2_g/collect.py --suite outputs/step4_gvnext \
+  --out outputs/step4_gvnext/s1 --signoff reports/step4_gvnext_signoff.json --session 1
+
+# 会话 2（先留出族 8 条）—— **开始前重装 IMU 绑带**
+python -u sim/step2_g/collect.py --suite outputs/step4_gvnext \
+  --out outputs/step4_gvnext/s2 --signoff reports/step4_gvnext_signoff.json --session 2
+
+# 会话 2（再跑 6 条重复，同一目录）
+python -u sim/step2_g/collect.py --suite outputs/step4_gvnext \
+  --out outputs/step4_gvnext/s2 --signoff reports/step4_gvnext_signoff.json \
+  --only pp2_ep000 pp2_ep004 pp2_ep009 pp2a_ep000 pp2a_ep004 pp2a_ep009
+```
+
+编排器沿用 `sim/step2_g/collect.py`（崩溃重启、原子记账、孤儿清理、逐条签字核对
+—— 每一条都对应一次真实踩坑），**机制一行未改**，只把套件/落盘/签字路径参数化。
+每会话开始前先跑 `sim/step3_canobs/check_session.py`，环路时序不过就停。
 
 ## 8. 本轮不做
 
