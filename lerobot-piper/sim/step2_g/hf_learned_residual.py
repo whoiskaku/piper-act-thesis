@@ -334,25 +334,25 @@ def main() -> int:
         row = {}
         for k in ("dev", "ood", "v3"):
             for lo, hi in ((0.5, 9.0), (3.0, 9.0), (0.5, 3.0)):
-                row[(k, lo)] = agg(S[k], pr[k], lo, hi)
-        base_v3 = agg(S["v3"], P["① 底座 r≡0"]["v3"], 0.5, 9.0)[1]
-        w = int((base_v3 > row[("v3", 0.5)][1]).sum())
-        T[nm] = (row, w, float(np.median((base_v3 - row[("v3", 0.5)][1]) / base_v3)))
-        print(f"  {nm:20s}{row[('dev',0.5)][0]:>12.4f}{row[('dev',3.0)][0]:>11.4f}"
-              f"{row[('dev',0.5)][0] if False else agg(S['dev'],pr['dev'],0.5,3.0)[0]:>12.4f}"
-              f"{row[('ood',0.5)][0]:>12.4f}{row[('v3',0.5)][0]:>11.4f}"
+                row[(k, lo, hi)] = agg(S[k], pr[k], lo, hi)
+        bv3 = agg(S["v3"], P["① 底座 r≡0"]["v3"], 0.5, 9.0)[1]
+        mv3 = row[("v3", 0.5, 9.0)][1]
+        w = int((bv3 > mv3).sum())
+        T[nm] = (row, w, float(np.median((bv3 - mv3) / bv3)))
+        print(f"  {nm:20s}{row[('dev',0.5,9.0)][0]:>12.4f}{row[('dev',3.0,9.0)][0]:>11.4f}"
+              f"{row[('dev',0.5,3.0)][0]:>12.4f}"
+              f"{row[('ood',0.5,9.0)][0]:>12.4f}{row[('v3',0.5,9.0)][0]:>11.4f}"
               f"{w:>7d}/{len(vv):<3d}", flush=True)
 
     b = T["① 底座 r≡0"][0]; t = T["⑥ causal TCN"][0]
     ph = T["③ 相位模板(对照)"][0]; evm = T["④ 事件对齐模板"][0]
-    d1 = 1 - t[("dev", 0.5)][0] / b[("dev", 0.5)][0]
-    d2 = 1 - t[("dev", 3.0)][0] / b[("dev", 3.0)][0]
-    lo3 = agg(S["dev"], P["⑥ causal TCN"]["dev"], 0.5, 3.0)[0]
-    lo3b = agg(S["dev"], P["① 底座 r≡0"]["dev"], 0.5, 3.0)[0]
-    d3 = lo3 / lo3b - 1
-    d4 = 1 - t[("dev", 0.5)][0] / ph[("dev", 0.5)][0]
-    d5 = 1 - t[("dev", 0.5)][0] / evm[("dev", 0.5)][0]
-    d7 = t[("ood", 0.5)][0] / b[("ood", 0.5)][0] - 1
+    K9, K39, K3 = ("dev", 0.5, 9.0), ("dev", 3.0, 9.0), ("dev", 0.5, 3.0)
+    d1 = 1 - t[K9][0] / b[K9][0]
+    d2 = 1 - t[K39][0] / b[K39][0]
+    d3 = t[K3][0] / b[K3][0] - 1
+    d4 = 1 - t[K9][0] / ph[K9][0]
+    d5 = 1 - t[K9][0] / evm[K9][0]
+    d7 = t[("ood", 0.5, 9.0)][0] / b[("ood", 0.5, 9.0)][0] - 1
     w6, m6 = T["⑥ causal TCN"][1], T["⑥ causal TCN"][2]
     ok = [d1 >= 0.10, d2 >= 0.10, d3 <= 0.05, d4 >= 0.05, d5 >= 0.05,
           w6 >= 9 and m6 > 0, d7 <= 0.05]
@@ -371,8 +371,10 @@ def main() -> int:
           "\n   缺的是**可观测输入或传感器信息**，不是模型容量。"))
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "gate.json").write_text(json.dumps(
-        {"models": {k: {f"{s}_{lo}": v[0][(s, lo)][0] for s in ("dev", "ood", "v3")
-                        for lo in (0.5, 3.0)} for k, v in T.items()},
+        {"models": {k: {f"{s}_{lo}-{hi}": v[0][(s, lo, hi)][0]
+                        for s in ("dev", "ood", "v3")
+                        for lo, hi in ((0.5, 9.0), (3.0, 9.0), (0.5, 3.0))}
+                    for k, v in T.items()},
          "deltas": {"dev_0.5-9": d1, "dev_3-9": d2, "dev_0.5-3": d3,
                     "vs_phase": d4, "vs_event": d5, "ood": d7,
                     "v3_wins": w6, "v3_median": m6},
