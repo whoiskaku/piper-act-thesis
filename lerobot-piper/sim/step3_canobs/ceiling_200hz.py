@@ -63,9 +63,12 @@ def kin_gyro_fs(q_rad: np.ndarray, fs: float) -> np.ndarray:
     return out
 
 
-def load_streams(nm: str):
-    """→ (gyro100 均匀, q200 均匀[rad], 两者共同的均匀时间网格 dt)。"""
-    d = json.loads((ROOT / f"outputs/probe/replay_{nm}_A1.json").read_text())
+def load_streams(nm: str, arm: str = "A1"):
+    """→ (gyro100 均匀, q200 均匀[rad], 均匀 100 Hz 网格, 均匀 200 Hz 网格)。
+
+    `arm` 选会话：A1 = 会话1(2026-09-01 22:25)，A3 = 会话2。
+    """
+    d = json.loads((ROOT / f"outputs/probe/replay_{nm}_{arm}.json").read_text())
     off = d["can_hs_meta"]["clock"]["offset_realtime_minus_monotonic_s"]
     I = np.asarray(d["imu100"], float)
     ms, ht, gy = I[:, 1], I[:, 0], I[:, 5:8]
