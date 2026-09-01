@@ -512,7 +512,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         print("  100Hz 记录已开启")
     # 六关节高速 CAN 反馈(0x251–0x256)。**被动只读**, 独立 socket, 不碰控制回路。
     # 轮询 GetArmHighSpdInfoMsgs() 会对六路异步流做无抗混叠抽取 —— 与 TSND 同一个坑。
-    can_rec = None
+    can_rec, can_raw = None, []
     if canhs:
         sys.path.insert(0, str(ROOT / "sim/step3_canobs"))
         from can_hs_recorder import CanHighSpdRecorder
@@ -547,8 +547,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
                     rec["imu100"].append([float(ht), int(ms),
                                           *map(float, ac), *map(float, gy)])
             if can_rec is not None:
-                rec["can_hs"].extend(can_rec.drain_recording())
-                rec["can_q200"].extend(can_rec.drain_q200())
+                can_raw.extend(can_rec.drain_recording())   # 只搬原始字节, 不解码
             dt = time.perf_counter() - t_start
             if dt < DT:
                 time.sleep(DT - dt)
@@ -560,9 +559,11 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
                 rec["imu100"].append([float(ht), int(ms), *map(float, ac), *map(float, gy)])
             rdr.stop_recording()
         if can_rec is not None:
-            rec["can_hs"].extend(can_rec.drain_recording())
-            rec["can_q200"].extend(can_rec.drain_q200())
+            can_raw.extend(can_rec.drain_recording())
             can_rec.stop_recording()
+            # 解码放在停机之后 —— 在回路里解码会拖慢 20 Hz 主环(2026-09-01 教训)
+            from can_hs_recorder import decode as _candec
+            rec["can_hs"], rec["can_q200"] = _candec(can_raw)
             # 固件/SDK 版本要与数据同文件落盘: effort 标度规则依赖固件版本
             rec["can_hs_meta"] = can_rec.meta(getattr(robot.arm, "piper", None))
         p = (outdir or PROBE) / f"replay_{tag}{arm}.json"   # tag 含 ep 与轮次
