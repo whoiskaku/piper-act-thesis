@@ -16,7 +16,7 @@
     python sim/step2_g/fig_pp2_gq_vs_real.py
 """
 from __future__ import annotations
-import gc, json, sys
+import argparse, gc, json, sys
 from pathlib import Path
 import numpy as np
 
@@ -31,6 +31,10 @@ C_REAL, C_GQ, C_PV = "#1f6fb2", "#8b2fb0", "#9aa0a6"
 
 def main() -> int:
     gc.disable()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--contact", action="store_true",
+                    help="紫线换成 G-q-v1 + 桌面接触补丁，灰线为无补丁的 G-q-v1")
+    A = ap.parse_args()
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -38,7 +42,17 @@ def main() -> int:
     from sim.step2_fidelity import CALIB
     from sim.step2_gap_baseline import bare_logs
     import g_q_v1 as GQ
-    import g_pi_phys_v1 as PV
+    if A.contact:
+        import contact_patch as CP
+        from g_q_v1 import THETA_STAR as _TH
+        _zt = json.loads((CP.OUT / "calib.json").read_text())["z_best_mm"] / 1000.0
+        _xml = CP.build_xml(_zt, CP.OUT / "table_best.xml")
+        LBL_MAIN, LBL_REF = f"G-q-v1 + テーブル接触 (z_t={_zt*1000:.0f}mm)", "G-q-v1（参照）"
+        TAG, SUB = "contact", "テーブル接触パッチ あり vs なし"
+    else:
+        import g_pi_phys_v1 as PV
+        LBL_MAIN, LBL_REF = "G-q-v1", "G-π-phys-v1（参照）"
+        TAG, SUB = "gq", "G-q-v1 vs G-π-phys-v1"
 
     R = load_calib(CALIB)[0]
     eps = []
@@ -46,8 +60,12 @@ def main() -> int:
         fr = json.loads(p.read_text())["frames"]
         act = np.asarray([f["a"] for f in fr], float)
         real = np.asarray([f["imu"] for f in fr], float)[:, 3:6]
-        gq = GQ.predict_gyro(act)
-        pv = PV.predict_gyro(act, nframes=len(fr))
+        if A.contact:
+            gq = CP.roll(_xml, act, _TH)[1]
+            pv = GQ.predict_gyro(act)
+        else:
+            gq = GQ.predict_gyro(act)
+            pv = PV.predict_gyro(act, nframes=len(fr))
         k = min(len(gq), len(pv), len(real) - L)
         a_ = bandpass41(real[L:L + k])
         bq = bandpass41(gq[:k] @ R.T)
@@ -77,9 +95,9 @@ def main() -> int:
         c = int(np.argmax(np.abs(e["real"][:, ax_i])))        # 最大振幅の周辺を切る
         s = max(0, min(c - span // 2, e["n"] - span)); sl = slice(s, s + span)
         t = np.arange(sl.stop - sl.start) / 20.0
-        ax.plot(t, e["pv"][sl, ax_i], color=C_PV, lw=1.4, label="G-π-phys-v1（参照）")
+        ax.plot(t, e["pv"][sl, ax_i], color=C_PV, lw=1.4, label=LBL_REF)
         ax.plot(t, e["real"][sl, ax_i], color=C_REAL, lw=2.4, label="実機 IMU")
-        ax.plot(t, e["gq"][sl, ax_i], color=C_GQ, lw=2.0, ls="--", label="G-q-v1")
+        ax.plot(t, e["gq"][sl, ax_i], color=C_GQ, lw=2.0, ls="--", label=LBL_MAIN)
         ax.set_title(f"{title}   残差/実測 {e['rq']:.3f}"
                      f"（phys-v1 {e['rp']:.3f}）   軸 ω{'xyz'[ax_i]}",
                      fontsize=13, color="#22223b", loc="left")
@@ -95,8 +113,8 @@ def main() -> int:
 
     a3 = fig.add_subplot(gs[1, 2])
     x = np.arange(len(eps)); o = np.argsort(rq)
-    a3.bar(x - 0.2, rp[o], 0.4, color=C_PV, label="G-π-phys-v1")
-    a3.bar(x + 0.2, rq[o], 0.4, color=C_GQ, label="G-q-v1")
+    a3.bar(x - 0.2, rp[o], 0.4, color=C_PV, label=LBL_REF.split("（")[0])
+    a3.bar(x + 0.2, rq[o], 0.4, color=C_GQ, label=LBL_MAIN)
     a3.axhline(1.0, color="#c1121f", ls="--", lw=1.6)
     a3.text(0.3, 1.02, "1.0 = 出力ゼロ相当", color="#c1121f", fontsize=10)
     a3.set_title(f"全 {len(eps)} 集   中央値 {np.median(rq):.3f} vs {np.median(rp):.3f}",
@@ -105,7 +123,7 @@ def main() -> int:
     a3.set_ylabel("残差 / 実測", fontsize=10.5)
     a3.set_xticks([]); a3.legend(fontsize=10, frameon=False); a3.grid(alpha=0.25, axis="y")
 
-    fig.suptitle("pp2（pick-and-place）：G-q-v1 の IMU 出力 と 実機 IMU",
+    fig.suptitle(f"pp2（pick-and-place）：{LBL_MAIN.split(chr(40))[0].strip()} の IMU 出力 と 実機 IMU",
                  fontsize=18, fontweight="bold", color="#22223b", y=0.982)
     fig.text(0.5, 0.912,
              "帯域 0.5–9 Hz・大域シフト L=1（両モデル共通）・G-q-v1 はこの 17 集を"
@@ -116,7 +134,7 @@ def main() -> int:
              "残差/実測 は 1.0 が「出力ゼロ」相当 ⇒ 帯域エネルギーの約 44% しか説明できていない。",
              ha="center", fontsize=10, color="#c1121f")
     OUT.mkdir(parents=True, exist_ok=True)
-    p = OUT / "fig5_pp2_gq_vs_real.png"
+    p = OUT / (f"fig5_pp2_{TAG}_vs_real.png")
     fig.savefig(p, dpi=170, facecolor="white")
     print(f"\n  → {p}")
     return 0

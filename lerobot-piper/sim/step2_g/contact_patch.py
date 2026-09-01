@@ -57,7 +57,16 @@ for _p in (ROOT, ROOT / "sim", ROOT / "sim/step2_g"):
 
 FPS = 20.0
 OUT = ROOT / "outputs/step2_g/contact"
-CFG = json.loads((ROOT / "sim/object_sim_config.json").read_text())["contact"]
+# **配置订正（2026-08-30，标定跑完后）**：
+# `object_sim_config.json` 的 `solref timeconst = 0.2 s` 是给「61 g 胶带静置桌面」
+# 标定的（`calib_contact` 2026-05-30），**不适用于刚性伺服下压**。实测：
+#   timeconst 0.2 → 仿真最低 z −10.1 mm（比实测 −6.39 还低）⇒ 压穿, 干预未实现
+#   timeconst 0.02（MuJoCo 默认）→ 被挡住
+# ⇒ 改用 MuJoCo 默认 solref。这是修正配置缺陷，不是参数搜索：
+#   只取标准默认值一个点，预算与预注册相同（8×17 标定 + 1×17 评估）。
+#   其余接触参数（friction/solimp/condim）仍用已标定值。
+CFG = {**json.loads((ROOT / "sim/object_sim_config.json").read_text())["contact"],
+       "solref": [0.02, 1.0]}
 GRIP_GEOMS = ("link6", "gripper_base", "link7", "link8")   # 只这几个参与碰撞
 Z_GRID = np.linspace(-0.030, 0.005, 8)                     # 桌面顶面 z (m), 固定 8 点
 
