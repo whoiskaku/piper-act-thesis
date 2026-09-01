@@ -31,11 +31,19 @@ TOL_MED_MS, TOL_P99_MS = 50.5, 55.0
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", nargs="+", default=["A1"])
+    ap.add_argument("--dir", type=Path, default=None,
+                    help="改为体检该目录下所有 replay_*.json（忽略 --arms）")
     a = ap.parse_args()
     allok = True
-    for arm in a.arms:
-        for nm in EPS:
-            p = ROOT / f"outputs/probe/replay_{nm}_{arm}.json"
+    if a.dir:
+        d = a.dir if a.dir.is_absolute() else ROOT / a.dir
+        items = [(d.name, f.stem[len("replay_"):], f)
+                 for f in sorted(d.glob("replay_*.json")) if ".orphan_" not in f.name]
+    else:
+        items = [(arm, nm, ROOT / f"outputs/probe/replay_{nm}_{arm}.json")
+                 for arm in a.arms for nm in EPS]
+    for arm, nm, p in items:
+        if True:
             if not p.exists():
                 print(f"  {arm}/{nm}: **文件不存在** {p}")
                 allok = False
