@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""**留出集里效果最好的一条** —— G-vNext vs 真机 IMU，单轴 × 三个频段。
+"""**留出集里效果最好的一条** —— G-2 vs 真机 IMU，单轴 × 三个频段。
 
 ⚠ 这是**挑出来的最好一条**，不是典型水平。所以底部一行画出**全部 8 条**的分布，
 把本图这条标出来，读者一眼能看到它在哪个位置。
@@ -87,7 +87,7 @@ def main() -> int:
             ax.axvspan(t[w][0], t[w][-1], color=MUTED, alpha=.16, lw=0, zorder=0)
         ax.plot(tt, a_, color=C_REAL, lw=2.0, label="真机 IMU", zorder=2)
         ax.plot(tt, s_, color=C_NX, lw=1.5, ls=(0, (4, 2.4)),
-                label="G-vNext（预测）", zorder=3)
+                label="G-2", zorder=3)
         lbl = "全频段（不带通）" if band is None else f"{band[0]}–{band[1]} Hz"
         ax.set_ylabel(f"{lbl}\n[rad/s]", fontsize=10, color=INK2)
         ax.text(0.996, 0.05, f"ρ² = {rho2(aa, sm):.3f}（全集）",
@@ -134,7 +134,7 @@ def main() -> int:
         ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color(MUTED)
     ax.tick_params(colors=INK2, labelsize=9)
-    fig.suptitle("G-vNext vs 真机 IMU：留出集里**效果最好的一条**"
+    fig.suptitle("G-2 vs 真机 IMU：留出集里**效果最好的一条**"
                  "　　（需与中位集/最难集图成对出示）",
                  fontsize=13.5, y=0.982, color=INK)
     fig.text(0.5, 0.006,

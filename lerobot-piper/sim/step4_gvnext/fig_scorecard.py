@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""**G-vNext 进展记分图** —— 留出集（未見軌跡 + 跨セッション）上分频段的达成度。
+"""**G-2 进展记分图** —— 留出集（未見軌跡 + 跨セッション）上分频段的达成度。
 
-形式：每个频段一组**有序**横条（G-q-v1 → +r_q → G-vNext），共用 ρ² 轴；
+形式：每个频段一组**有序**横条（G-q-v1 → +r_q → G-2），共用 ρ² 轴；
 门槛 / 刚体天花板 / 可重复性上界作参考线。三条是同一件事的递进 ⇒ 单色 ordinal 梯
 （step 250/450/650，已过 `validate_palette.js --ordinal`）；门槛用保留的 status 色
 并配 ✓/✗ 图标 + 文字，不靠颜色单独表意。
@@ -57,7 +57,7 @@ def main() -> int:
     zq, zs = np.load(RQ / "rq_fir.npz"), np.load(RS / "rs_fir.npz")
     sq = json.loads((RQ / "select.json").read_text())
     ss = json.loads((RS / "select.json").read_text())
-    arms = ("G-q-v1", "+ r_q", "+ r_s = G-vNext")
+    arms = ("G-q-v1", "+ r_q", "+ r_s = G-2")
     acc = {a: {b: [] for b in BANDS} for a in (*arms, "天井")}
     for f in valid_files(S2, "replay_pp2f*.json"):
         dd = load(f)
@@ -71,7 +71,7 @@ def main() -> int:
         Ps = fir_design(rs_features(dd, t20, qh)[:n], ss["nlag"]) @ zs["W"]
         pred = {"G-q-v1": kin_gyro_fs(qb, FPS)[:n],
                 "+ r_q": kin_gyro_fs(qh, FPS)[:n],
-                "+ r_s = G-vNext": kin_gyro_fs(qh, FPS)[:n] + Ps,
+                "+ r_s = G-2": kin_gyro_fs(qh, FPS)[:n] + Ps,
                 "天井": Kt[:n]}
         for a, S in pred.items():
             m = min(len(Ab), len(S))
@@ -124,7 +124,7 @@ def main() -> int:
                label="可重复性上界 = 真机自身（pp2 跨会话实测）")],
         loc="lower center", ncol=3, frameon=False, fontsize=9.5,
         bbox_to_anchor=(0.5, -0.015))
-    fig.suptitle("G-vNext 在**未見軌跡 + 跨セッション**留出上的达成度"
+    fig.suptitle("G-2 在**未見軌跡 + 跨セッション**留出上的达成度"
                  "　　0.5–3 Hz 已过门槛；3–9 Hz 的门槛本身高于刚体天井",
                  fontsize=13.5, y=0.985, color=INK)
     fig.text(0.5, 0.085,

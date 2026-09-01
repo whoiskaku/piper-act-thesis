@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""**G-vNext 的 IMU 输出 vs 真机 IMU —— 不带通、全频段原始波形。**
+"""**G-2 的 IMU 输出 vs 真机 IMU —— 不带通、全频段原始波形。**
 
 与 `fig9_gvnext_holdout.png` 的区别：那张按 0.5–3 / 3–9 Hz 分带看形状；
 **本图不做任何带通**，直接叠三轴陀螺的原始波形（含直流）。
@@ -91,7 +91,7 @@ def main() -> int:
             # （配对的 tritan ΔE 落在 6–8 下限带，规范要求配二次编码）。
             ax.plot(t, A[:, r], color=C_REAL, lw=2.0, label="真机 IMU", zorder=2)
             ax.plot(t, S[:, r], color=C_NX, lw=1.5, ls=(0, (4, 2.4)),
-                    label="G-vNext（预测）", zorder=3)
+                    label="G-2", zorder=3)
             ax.set_ylabel(f"{AX[r]}  [rad/s]", fontsize=9.5, color=INK2)
             ax.grid(color=MUTED, alpha=.28, lw=.8)
             ax.set_axisbelow(True)
@@ -113,7 +113,7 @@ def main() -> int:
                           edgecolor=MUTED)
             if r == 2:
                 ax.set_xlabel("時間 [s]", fontsize=9.5, color=INK2)
-    fig.suptitle("G-vNext 的 IMU 输出 vs 真机 IMU —— **不带通、全频段原始波形**"
+    fig.suptitle("G-2 的 IMU 输出 vs 真机 IMU —— **不带通、全频段原始波形**"
                  "　　留出集（未见轨迹 + 跨会话）",
                  fontsize=13.5, y=0.985, color=INK)
     fig.text(0.5, 0.008,

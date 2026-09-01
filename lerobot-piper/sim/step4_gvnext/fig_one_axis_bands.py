@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""**单轴 × 三个频段**：G-vNext 的 IMU 输出 vs 真机 IMU。
+"""**单轴 × 三个频段**：G-2 的 IMU 输出 vs 真机 IMU。
 
 行 = 全频段（不带通）/ 0.5–3 Hz / 3–9 Hz　　列 = 留出集的中位集与最难集。
 轴 = 该集**全频段能量最大**的那一轴（图中标出）。
@@ -94,7 +94,7 @@ def main() -> int:
                            zorder=0)
             ax.plot(tt, a_, color=C_REAL, lw=2.0, label="真机 IMU", zorder=2)
             ax.plot(tt, s_, color=C_NX, lw=1.5, ls=(0, (4, 2.4)),
-                    label="G-vNext（预测）", zorder=3)
+                    label="G-2", zorder=3)
             lbl = "全频段（不带通）" if band is None else f"{band[0]}–{band[1]} Hz"
             ax.set_ylabel(f"{lbl}\n[rad/s]", fontsize=9.5, color=INK2)
             # ρ² 一律是**全集**的值（三行同口径）；第三行只是画面放大，
@@ -123,7 +123,7 @@ def main() -> int:
         print(f"  {nm} 軸{AX[j]}: 全频段 {rho2(A[:,j],S[:,j]):.3f}  "
               f"0.5–3 Hz {rho2(bp(A,0.5,3)[:,j],bp(S,0.5,3)[:,j]):.3f}  "
               f"3–9 Hz {rho2(bp(A,3,9)[:,j],bp(S,3,9)[:,j]):.3f}")
-    fig.suptitle("G-vNext vs 真机 IMU：**单轴 × 三个频段**"
+    fig.suptitle("G-2 vs 真机 IMU：**单轴 × 三个频段**"
                  "　　留出集（未见轨迹 + 跨会话）",
                  fontsize=13.5, y=0.985, color=INK)
     fig.text(0.5, 0.008,
