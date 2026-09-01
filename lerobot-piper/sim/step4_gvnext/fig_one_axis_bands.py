@@ -89,19 +89,11 @@ def main() -> int:
             aa = A[:, j] if band is None else bp(A, *band)[:, j]
             sMs = S[:, j] if band is None else bp(S, *band)[:, j]
             tt, a_, s_ = (t[w], aa[w], sMs[w]) if r == 2 else (t, aa, sMs)
-            if r < 2:                                 # 标出 3–9 Hz 行的放大窗口
-                ax.axvspan(t[w][0], t[w][-1], color=MUTED, alpha=.16, lw=0,
-                           zorder=0)
             ax.plot(tt, a_, color=C_REAL, lw=2.0, label="真机 IMU", zorder=2)
             ax.plot(tt, s_, color=C_NX, lw=1.5, ls=(0, (4, 2.4)),
                     label="G-2", zorder=3)
             lbl = "全频段（不带通）" if band is None else f"{band[0]}–{band[1]} Hz"
             ax.set_ylabel(f"{lbl}\n[rad/s]", fontsize=9.5, color=INK2)
-            # ρ² 一律是**全集**的值（三行同口径）；第三行只是画面放大，
-            # 不要写成"此窗口"——那会凭空多出一个口径不同的数字。
-            ax.text(0.995, 0.05, f"ρ² = {rho2(aa, sMs):.3f}（全集）",
-                    transform=ax.transAxes, ha="right", va="bottom",
-                    fontsize=10.5, color=INK)
             ax.grid(color=MUTED, alpha=.28, lw=.8)
             ax.set_axisbelow(True)
             for sp in ("top", "right"):
@@ -110,15 +102,13 @@ def main() -> int:
                 ax.spines[sp].set_color(MUTED)
             ax.tick_params(colors=INK2, labelsize=8.5)
             if r == 0:
-                ax.set_title(f"{kind}  {nm}　軸 {AX[j]}（全频段能量最大轴）"
-                             f"　　全频段 ρ² = {rk[nm]:.3f}",
+                ax.set_title(f"{kind}  {nm}　軸 {AX[j]}（全频段能量最大轴）",
                              fontsize=12, color=INK, loc="left", pad=8)
                 if c == 0:
                     ax.legend(fontsize=9.5, loc="upper right", framealpha=.92,
                               edgecolor=MUTED)
             if r == 2:
-                ax.set_xlabel("時間 [s]　※画面放大到带内能量最强的 4 秒（上两行灰带处）；"
-                              "ρ² 仍为全集值",
+                ax.set_xlabel("時間 [s]　※本行画面放大到带内能量最强的 4 秒",
                               fontsize=9.5, color=INK2)
         print(f"  {nm} 軸{AX[j]}: 全频段 {rho2(A[:,j],S[:,j]):.3f}  "
               f"0.5–3 Hz {rho2(bp(A,0.5,3)[:,j],bp(S,0.5,3)[:,j]):.3f}  "

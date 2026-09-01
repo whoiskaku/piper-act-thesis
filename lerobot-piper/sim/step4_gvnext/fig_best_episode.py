@@ -83,16 +83,11 @@ def main() -> int:
         aa = A[:, j] if band is None else bp(A, *band)[:, j]
         sm = S[:, j] if band is None else bp(S, *band)[:, j]
         tt, a_, s_ = (t[w], aa[w], sm[w]) if r == 2 else (t, aa, sm)
-        if r < 2:
-            ax.axvspan(t[w][0], t[w][-1], color=MUTED, alpha=.16, lw=0, zorder=0)
         ax.plot(tt, a_, color=C_REAL, lw=2.0, label="真机 IMU", zorder=2)
         ax.plot(tt, s_, color=C_NX, lw=1.5, ls=(0, (4, 2.4)),
                 label="G-2", zorder=3)
         lbl = "全频段（不带通）" if band is None else f"{band[0]}–{band[1]} Hz"
         ax.set_ylabel(f"{lbl}\n[rad/s]", fontsize=10, color=INK2)
-        ax.text(0.996, 0.05, f"ρ² = {rho2(aa, sm):.3f}（全集）",
-                transform=ax.transAxes, ha="right", va="bottom",
-                fontsize=11, color=INK)
         ax.grid(color=MUTED, alpha=.28, lw=.8); ax.set_axisbelow(True)
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
@@ -100,13 +95,12 @@ def main() -> int:
             ax.spines[sp].set_color(MUTED)
         ax.tick_params(colors=INK2, labelsize=9)
         if r == 0:
-            ax.set_title(f"**最好集** {nm}　軸 {AX[j]}（全频段能量最大轴）"
-                         f"　　三轴合计 全频段 ρ² = {rk[nm]:.3f}",
+            ax.set_title(f"**最好集** {nm}　軸 {AX[j]}（全频段能量最大轴）",
                          fontsize=12.5, color=INK, loc="left", pad=8)
             ax.legend(fontsize=10, loc="upper right", framealpha=.92,
                       edgecolor=MUTED)
         if r == 2:
-            ax.set_xlabel("時間 [s]　※放大到带内最强 4 秒；ρ² 仍为全集值",
+            ax.set_xlabel("時間 [s]　※本行画面放大到带内能量最强的 4 秒",
                           fontsize=9.5, color=INK2)
     # ── 分布条：8 条留出集的全频段 ρ²，标出本图这条 ─────────────────────
     ax = fig.add_subplot(gs[3]); ax.set_facecolor(SURFACE)
