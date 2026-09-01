@@ -59,36 +59,40 @@ def main() -> int:
 
     OUT.mkdir(parents=True, exist_ok=True)
     tot = ok = 0
+    kept: dict[str, list[str]] = {f: [] for f in FAMILIES}
+    excluded: list[dict] = []
     print(f"{'序列':<18}{'帧':>6}{'时长s':>7}   安全检查")
-    worst = []
     for fam in FAMILIES:
         for nm, cmd7, da in build(fam):
             tot += 1
             try:
                 msgs, degraded = safety_checks(cmd7, da)
-                bad = [m for m in msgs if not m.startswith("✓")]
-                mar = [m for m in msgs if "模型限位" in m]
-                ok += 1
-                note = mar[0].replace("✓ ", "") if mar else ""
-                if degraded:
-                    note += f"  ⚠降级:{degraded[0][:30]}"
-                print(f"{nm:<18}{len(cmd7):>6}{len(cmd7)/20:>7.1f}   ✓ {note}")
-                if mar:
-                    worst.append((nm, float(mar[0].split()[-2].rstrip("°(j123456"))
-                                  if False else 0.0))
             except AssertionError as e:
-                print(f"{nm:<18}{len(cmd7):>6}{len(cmd7)/20:>7.1f}   **✗ {e}**")
+                # **不落盘** —— 落了就可能在采集时被误取。安全门的规矩是停，不是绕过。
+                print(f"{nm:<18}{len(cmd7):>6}{len(cmd7)/20:>7.1f}   **✗ 剔除: {e}**")
+                excluded.append({"name": nm, "family": fam, "reason": str(e)})
+                continue
+            ok += 1
+            kept[fam].append(nm)
+            mar = [m for m in msgs if "模型限位" in m]
+            note = mar[0].replace("✓ ", "") if mar else ""
+            if degraded:
+                note += f"  ⚠降级:{degraded[0][:30]}"
+            print(f"{nm:<18}{len(cmd7):>6}{len(cmd7)/20:>7.1f}   ✓ {note}")
             if not a.check:
                 np.savez(OUT / f"{nm}.npz", cmd7=cmd7, da=da,
                          src=str(SRC / f"{fam}-deploy"), family=fam)
-    print(f"\n  {ok}/{tot} 条通过安全检查"
+    print(f"\n  {ok}/{tot} 条通过安全检查，**只落盘通过的那些**"
           + ("（--check：未落盘）" if a.check else f"  → {OUT}"))
+    for e in excluded:
+        print(f"    剔除 {e['name']}: {e['reason']}")
     if not a.check:
         (OUT / "manifest.json").write_text(json.dumps(
-            {"families": {f: len(build(f)) for f in FAMILIES},
-             "note": "裸复放, da=0; j4 在所有族里恒为 0",
+            {"kept": kept, "n_kept": ok, "n_total": tot, "excluded": excluded,
+             "note": ("裸复放 da=0; j4 在所有族里恒为 0; "
+                      "剔除项越 MuJoCo 模型限位(j2 下界保守), **未放宽限位**"),
              "grip_clip": GRIP_MAX}, indent=1, ensure_ascii=False))
-    return 0 if ok == tot else 1
+    return 0
 
 
 if __name__ == "__main__":
