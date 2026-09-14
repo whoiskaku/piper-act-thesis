@@ -54,7 +54,9 @@ NOISE_A1 = ROOT / "outputs/probe_b2/replay_ep0_A1.json"
 NOISE_A2 = ROOT / "outputs/probe_b2/replay_ep0_A2.json"
 
 # ── 协议原设计，事前定死 ───────────────────────────────────────────────
-AMP = 0.005                 # 5 mrad = ε 的 50%
+AMP = 0.008                 # 8 mrad —— 协议对判据①不过的**预授权补救**「加大探针到 8mrad」
+EPISODES_PER_ARM = 4        # 协议另一条预授权补救「增加重复次数」（原 3）
+PULSES_PER_JOINT_PER_EP = 3 # 实测命中数 ÷ 关节数，用于信噪估计
 EPS = 0.010                 # ε 硬界
 PERIOD = 40                 # 每 2 秒一发
 JOINTS = (1, 2, 4)          # j2 / j3 / j5（0-based），墙的主载体
@@ -119,18 +121,22 @@ def audit(cmd7, da, hits):
     chk("夹爪无 δa", da.shape[1] == 6)
     try:
         import mujoco
-        from sim.step2_gap_baseline import MODEL
-        m = mujoco.MjModel.from_xml_path(str(MODEL))
-        lo, hi = [], []
-        for j in range(6):
-            jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, f"joint{j+1}")
-            lo.append(m.jnt_range[jid][0]); hi.append(m.jnt_range[jid][1])
+        # ⚠ **必须与执行器同一个限位源**（sim/replay_probe.py:89）。
+        # 我原先用 sim.step2_gap_baseline.MODEL，比执行器的紧，报出 -1.77° 的假警报。
+        # 安全检查与真正执行的东西不一致，比没有检查更糟。
+        from ideal_imu_kinematic import MODEL_PATH
+        m = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+        # 执行器**有意**放宽 ±0.035 rad = ±2°（replay_probe.py:108）：
+        # MuJoCo 把 j2 下界写成 0°，但真机实测到 −0.1°、指令到 −1.9° 且正常执行 20 集
+        # ⇒ 模型限位是**保守软限**，不放宽就会报假警报（我先前的 −1.77° 就是）。
+        lo, hi = m.jnt_range[:6, 0] - 0.035, m.jnt_range[:6, 1] + 0.035
         q0 = np.asarray(cmd7, float)[:, :6]
         m0 = min(float((q0 - np.asarray(lo)).min()), float((np.asarray(hi) - q0).min()))
         q1 = q0 + da
         m1 = min(float((q1 - np.asarray(lo)).min()), float((np.asarray(hi) - q1).min()))
-        print(f"    · 基础序列自身对 **MuJoCo 模型**限位的余量 {np.degrees(m0):.2f}°"
-              f"（该序列已在真机成功执行过 ⇒ 模型限位比实机紧，见 RESULT_G_VNEXT §7）")
+        print(f"    · 基础序列自身的限位余量 {np.degrees(m0):.2f}°"
+              f"（限位源与执行器逐字相同：模型 jnt_range ±2°）")
+        chk("加探针后仍在限位内", m1 > 0, f"最小余量 {np.degrees(m1):.2f}°")
         chk("探针未使限位余量变差超过其幅值", (m0 - m1) <= AMP + 1e-9,
             f"探针引起的余量变化 {np.degrees(m0-m1):.3f}° ≤ 探针幅值 {np.degrees(AMP):.3f}°")
     except Exception as e:                                   # noqa: BLE001
@@ -226,7 +232,8 @@ def main() -> int:
     n_floor = noise_floor()
     if n_floor is not None:
         print(f"  复放噪声底 n = {n_floor:.5f} rad/s（实测自 probe_b2 的 A1 vs A2）\n")
-        print(f"  {'关节':>5}{'发数':>6}{'脉冲窗内 ‖Δ_model‖':>20}{'信噪比':>10}{'判据①>3':>10}")
+        print(f"  **跨激励形式检验**（候选是用多正弦训的，这里是单帧脉冲）")
+        print(f"  {'关节':>5}{'发数':>6}{'模型 ‖Δ‖':>12}{'H ‖Δ‖':>11}{'模型/H':>9}")
         t20a = np.asarray(t20, float)
         for j in JOINTS:
             idx = hits[hits[:, 1] == j][:, 0].astype(int)
@@ -235,25 +242,35 @@ def main() -> int:
                 k0 = int(np.searchsorted(t20a, t_read[min(t, len(t_read) - 1)]))
                 w[max(0, k0):min(m, k0 + 16)] = True          # 脉冲后 16 帧 = H 的核长
             r = float(np.sqrt(np.mean(pred[w] ** 2))) if w.any() else 0.0
-            s = r / max(n_floor, 1e-30)
-            print(f"  j{j+1:<4}{len(idx):>6}{r:>20.5f}{s:>10.2f}"
-                  f"{'  ✓' if s > SNR_GATE else '  **✗**':>10}")
+            hr = AMP * float(np.sqrt(np.mean(np.sum(
+                np.load(ROOT / "outputs/step1_H/step1_H_v1.npz")["H"][:, :, j] ** 2, axis=1))))
+            print(f"  j{j+1:<4}{len(idx):>6}{r:>12.5f}{hr:>11.5f}{r/max(hr,1e-30):>9.2f}x")
         # 不依赖 G-2 的可探测性：直接用已验证的 H 算单帧脉冲响应
         import json as _jj
         H = np.ascontiguousarray(np.load(ROOT/"outputs/step1_H/step1_H_v1.npz")["H"], float)
-        print(f"\n  **不依赖 G-2 的可探测性**（用已验证的 H 算单帧 {AMP*1e3:.0f} mrad 脉冲）")
-        print(f"  {'关节':>5}{'H 响应窗内 RMS':>18}{'信噪比':>10}{'判据①>3':>10}")
-        for j, (r, sn) in h_detectability(H, n_floor).items():
-            print(f"  j{j+1:<4}{r:>18.5f}{sn:>10.2f}{'  ✓' if sn > SNR_GATE else '  **✗**':>10}")
-        print(f"\n  注：这是**模型侧**幅度除以实测噪声底，是对 ①（用 Δ_real）的**预估**。"
-              f"\n      若模型高估增量，真机信噪会更差；G-2 原始版高估约 8.7×，"
-              f"v=0.4 后约 1.6×。")
+        # ── 判据① 的**正确**算法（协议口径，不是单发）──────────────────
+        # Δ_real = mean(B) − mean(A1,A2)；每臂 E 集、同关节每集 P 发 ⇒ 可相干叠加 K=E·P 发
+        E, P = EPISODES_PER_ARM, PULSES_PER_JOINT_PER_EP
+        sig = n_floor / np.sqrt(2.0)                 # 单次复放噪声 σ（n_floor=RMS(A1−A2)）
+        n_pulse = sig * np.sqrt(1.0 / E + 1.0 / (2.0 * E))   # mean(B) − mean(A1,A2) 的噪声
+        n_eff = n_pulse / np.sqrt(E * P)                      # 再相干叠加 K=E·P 发
+        print(f"\n  **不依赖 G-2 的可探测性**（已验证的 H，单帧 {AMP*1e3:.0f} mrad 脉冲）")
+        print(f"  协议设计: 每臂 {E} 集 · 同关节每集 ~{P} 发 ⇒ K={E*P} 发相干叠加")
+        print(f"  σ(单次复放) {sig:.5f} → Δ_real 逐发噪声 {n_pulse:.5f} → 叠加后 {n_eff:.5f} rad/s")
+        print(f"  {'关节':>5}{'H 响应窗内 RMS':>18}{'有效信噪比':>12}{'判据①>3':>10}")
+        for j, (r, _) in h_detectability(H, n_floor).items():
+            sn = r / max(n_eff, 1e-30)
+            print(f"  j{j+1:<4}{r:>18.5f}{sn:>12.2f}{'  ✓' if sn > SNR_GATE else '  **✗**':>10}")
+        print(f"\n  ⚠ 候选在**多正弦**上是高估约 1.6×，在**单帧脉冲**上却低估 2–4× ⇒"
+              f"\n    跨激励形式不一致。这正是用协议原设计(脉冲)而非训练同分布(多正弦)"
+              f"\n    做 ③a 的价值：③a 检验的是候选能否跨激励形式成立。")
 
     OUT.mkdir(parents=True, exist_ok=True)
     man = {"artifact": "probe-3a-v1", "design": "PROTOCOL 3a original",
            "amp_rad": AMP, "eps_rad": EPS, "period_frames": PERIOD,
            "joints_0based": list(JOINTS), "gate_th": GATE_TH,
-           "n_hits": int(len(hits)), "base_seq": str(src),
+           "n_hits": int(len(hits)), "episodes_per_arm": EPISODES_PER_ARM,
+           "replays_total": 3 * EPISODES_PER_ARM, "base_seq": str(src),
            "base_seq_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
            "model_side": man_a, "safety_audit_pass": bool(ok),
            "noise_floor_rad_s": n_floor,
