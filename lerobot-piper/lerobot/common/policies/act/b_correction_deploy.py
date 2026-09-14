@@ -168,6 +168,14 @@ class BCorrectionDeployWrapper:
         else:
             self._artifact_sha256 = None
         self.renderer = IdealChunkRenderer() if (self.use_pi or self.use_step1) else None
+        # ── chunk 渲染移出 20 Hz 关键路径（2026-09-14）─────────────────────
+        # 原先 render 同步跑在 chunk 边界那一帧上，与 ACT 推理/FF/plan 挤同一个
+        # 50 ms 预算。实测 MuJoCo **释放 GIL**（后台渲染时主线程只多 3 ms/202 ms），
+        # 故改为后台线程；渲染未就绪的帧 δa 置零（保守，且只影响 chunk 头 1 帧）。
+        from concurrent.futures import ThreadPoolExecutor
+        self._render_pool = ThreadPoolExecutor(max_workers=1) if self.renderer else None
+        self._pending = None            # (future, cmd) 或 None
+        self._frame_t = None            # 上一帧的墙钟, 用于帧间隔统计
         self.asm = FeatureAssembler(R, b, L=lag) if self.use_pi else None
         self.ff_lag, self.ff_blend = ff_lag, ff_blend
 
@@ -286,15 +294,11 @@ class BCorrectionDeployWrapper:
             cmd = apply_ff12(cmd, self._prev_tail, lag=self.ff_lag, blend=self.ff_blend)
 
         if self.use_pi or self.use_step1:
+            # **不在本帧渲染** —— 提交后台, 由 `_drain_pending()` 在就绪后装配。
+            prev = None if self._prev_tail is None else self._prev_tail.copy()
             t0 = time.perf_counter()
-            ideal = self.renderer.render(cmd, self._prev_tail)              # (T,6) sim系
-            self.stats["render_ms"].append((time.perf_counter() - t0) * 1e3)
-            if self.use_pi:
-                self.asm.on_new_chunk(cmd, ideal)
-            if self.use_step1:
-                t1 = time.perf_counter()
-                self.step1.set_chunk(cmd, ideal)
-                self.stats["plan_ms"].append((time.perf_counter() - t1) * 1e3)
+            fut = self._render_pool.submit(self.renderer.render, cmd, prev)
+            self._pending = (fut, cmd, t0)
 
         self._chunk_raw = cmd
         self._prev_tail = cmd.copy()
@@ -359,8 +363,33 @@ class BCorrectionDeployWrapper:
             return np.zeros(6, np.float32)
         return frame.delta
 
+    def _drain_pending(self) -> bool:
+        """后台 ideal 就绪则装配。→ 是否**仍在等待**（等待中 δa 必须置零）。"""
+        if self._pending is None:
+            return False
+        fut, cmd, t0 = self._pending
+        if not fut.done():
+            self.stats["render_pending_frames"] = \
+                self.stats.get("render_pending_frames", 0) + 1
+            return True
+        ideal = fut.result()
+        self.stats["render_ms"].append((time.perf_counter() - t0) * 1e3)
+        if self.use_pi:
+            self.asm.on_new_chunk(cmd, ideal)
+        if self.use_step1:
+            t1 = time.perf_counter()
+            self.step1.set_chunk(cmd, ideal)
+            self.stats["plan_ms"].append((time.perf_counter() - t1) * 1e3)
+        self._pending = None
+        return False
+
     @torch.no_grad()
     def select_action(self, batch):
+        # 帧间隔统计（部署门禁看的是**这个**，不是后台渲染本身的耗时）
+        _now = time.perf_counter()
+        if self._frame_t is not None:
+            self.stats.setdefault("frame_ms", []).append((_now - self._frame_t) * 1e3)
+        self._frame_t = _now
         if len(self._queue) == 0:
             chunk = self._new_chunk(batch)
             self._queue.extend(chunk.transpose(0, 1))
@@ -384,8 +413,12 @@ class BCorrectionDeployWrapper:
             a = a.clone()
             a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)
         elif self.use_pi or self.use_step1:
-            da = self._delta_step1(batch) if self.use_step1 else self._delta(batch)
-            if self.apply_delta:
+            # 后台 ideal 未就绪 ⇒ δa 置零（保守）。渲染实测 30 ms，故通常只影响
+            # 每个 chunk 的头 1 帧；这一帧由 FF 的 blend 覆盖，不留空档。
+            waiting = self._drain_pending()
+            da = (np.zeros(6, np.float32) if waiting else
+                  (self._delta_step1(batch) if self.use_step1 else self._delta(batch)))
+            if self.apply_delta and not waiting:
                 a = a.clone()
                 a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)     # 夹爪不动
         self.stats["frames"] += 1
