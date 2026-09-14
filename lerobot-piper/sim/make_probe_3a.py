@@ -54,12 +54,14 @@ NOISE_A1 = ROOT / "outputs/probe_b2/replay_ep0_A1.json"
 NOISE_A2 = ROOT / "outputs/probe_b2/replay_ep0_A2.json"
 
 # ── 协议原设计，事前定死 ───────────────────────────────────────────────
-AMP = 0.008                 # 8 mrad —— 协议对判据①不过的**预授权补救**「加大探针到 8mrad」
+AMP = 0.005                 # 5 mrad —— 可行性检查选定（j5: ① 5.17 / ④ 0.088 最优）
 EPISODES_PER_ARM = 4        # 协议另一条预授权补救「增加重复次数」（原 3）
 PULSES_PER_JOINT_PER_EP = 3 # 实测命中数 ÷ 关节数，用于信噪估计
 EPS = 0.010                 # ε 硬界
 PERIOD = 40                 # 每 2 秒一发
-JOINTS = (1, 2, 4)          # j2 / j3 / j5（0-based），墙的主载体
+JOINTS = (4,)               # **只 j5** —— 可行性检查: j2/j3 在 pp2 上 ④ 结构性不可行
+WAVELET = np.array([1, 1, -1, -1, 1, 1, -1, -1], float)   # 8 帧 5 Hz 方波（复用 v2 波形）
+LRESP = 24                  # 响应窗 = 8 帧小波 + 16 帧尾巴（H 的核长）
 GATE_TH = 0.04              # 静止段不发，与部署 still-gate 同判据
 BAND = (0.5, 9.0)
 SNR_GATE = 3.0
@@ -76,7 +78,8 @@ def build_probe(cmd7, moving):
     da = np.zeros((T, 6))
     hits = []
     k = 0
-    for t in range(PERIOD, T - PERIOD, PERIOD):
+    nw = len(WAVELET)
+    for t in range(PERIOD, T - PERIOD - nw, PERIOD):
         if not moving[t]:                                      # 静止段不发
             continue
         j = JOINTS[k % len(JOINTS)]
@@ -84,7 +87,7 @@ def build_probe(cmd7, moving):
         # ⚠ 全部取 **+**；± 配对改为**跨复放**（`_p` / `_m` 两条序列，帧号完全相同）。
         # 旧设计把 ± 分散在**不同时刻**的脉冲上 ⇒ 两侧落在**不同位形**，
         # 而逐发响应范数实测差 4×(j2)–27×(j3) ⇒ 判据④ 被位形变化主导，**测不到符号非线性**。
-        da[t, j] = AMP
+        da[t:t + nw, j] = AMP * WAVELET
         hits.append([t, j, 1.0])
     return da, np.asarray(hits, float).reshape(-1, 3)
 
@@ -92,13 +95,17 @@ def build_probe(cmd7, moving):
 def h_detectability(H, n_floor):
     """**不依赖 G-2**：用已验证的 H 直接算单帧 5 mrad 脉冲的响应幅度。
 
-    单帧脉冲 δa=AMP 打在关节 j ⇒ 响应 `H[k][:, j]·AMP`，k=0…15。
-    窗内 RMS = AMP · sqrt(mean_k ‖H[k][:,j]‖²)。这是**协议原设计能不能被测到**
-    的直接判据，与我们正在检验的 G-2 无关。
+    把**实际波形**（8 帧小波 × AMP）与 H 卷积，取响应窗 LRESP 内的 RMS。
+    这是**探针能不能被测到**的直接判据，与我们正在检验的 G-2 无关。
     """
     out = {}
+    nw, L = len(WAVELET), LRESP
     for j in JOINTS:
-        r = AMP * float(np.sqrt(np.mean(np.sum(H[:, :, j] ** 2, axis=1))))
+        u = np.zeros(L); u[:nw] = AMP * WAVELET
+        y = np.zeros((L, 3))
+        for k in range(len(H)):
+            y[k:] += np.outer(u[:L - k], H[k][:, j])
+        r = float(np.sqrt(np.mean(y ** 2)))
         out[j] = (r, r / max(n_floor, 1e-30) if n_floor else float("nan"))
     return out
 
@@ -113,8 +120,10 @@ def audit(cmd7, da, hits):
     chk("|δa| ≤ ε", np.abs(da).max() <= EPS + 1e-12,
         f"max {np.abs(da).max()*1e3:.2f} mrad ≤ {EPS*1e3:.0f}")
     chk("同帧仅一关节", int(np.max((np.abs(da) > 0).sum(1))) <= 1)
-    chk("脉冲均为单帧", all(np.count_nonzero(da[:, j]) == int((hits[:, 1] == j).sum())
-                            for j in JOINTS))
+    chk("每发均为完整 8 帧小波",
+        all(np.count_nonzero(da[:, j]) == len(WAVELET) * int((hits[:, 1] == j).sum())
+            for j in JOINTS))
+    chk("小波零均值（不留静态偏置）", abs(float(WAVELET.sum())) < 1e-12)
     chk("每关节发数 ≥ 2（跨复放 ± 配对后每侧同样发数）",
         all(int((hits[:, 1] == j).sum()) >= 2 for j in JOINTS),
         " / ".join(f"j{j+1} {int((hits[:,1]==j).sum())} 发" for j in JOINTS))
@@ -210,7 +219,7 @@ def main() -> int:
     print(f"  still-gate（真机陀螺模长 ≥ {GATE_TH}）: 运动帧占 "
           f"{moving.mean()*100:.0f}%（逐关节命令速度是**错**判据，会让 j5 打不出来）")
     da, hits = build_probe(cmd7, moving)
-    print(f"探针（协议原设计）: {AMP*1e3:.0f} mrad 单帧脉冲 · 每 {PERIOD} 帧一发 · "
+    print(f"探针: {AMP*1e3:.0f} mrad × 8 帧 5 Hz 小波 · 每 {PERIOD} 帧一发 · "
           f"j{'/j'.join(str(j+1) for j in JOINTS)} · 正负各半 · 静止段不发")
     print(f"  基础序列 {src.name}（训练族，T={len(cmd7)}）· 命中 {len(hits)} 发\n")
     print("  安全审计（零机时）")
@@ -235,7 +244,7 @@ def main() -> int:
     n_floor = noise_floor()
     if n_floor is not None:
         print(f"  复放噪声底 n = {n_floor:.5f} rad/s（实测自 probe_b2 的 A1 vs A2）\n")
-        print(f"  **跨激励形式检验**（候选是用多正弦训的，这里是单帧脉冲）")
+        print(f"  **跨激励形式检验**（候选是用多正弦训的，这里是 8 帧 5 Hz 小波）")
         print(f"  {'关节':>5}{'发数':>6}{'模型 ‖Δ‖':>12}{'H ‖Δ‖':>11}{'模型/H':>9}")
         t20a = np.asarray(t20, float)
         for j in JOINTS:
@@ -245,34 +254,40 @@ def main() -> int:
                 k0 = int(np.searchsorted(t20a, t_read[min(t, len(t_read) - 1)]))
                 w[max(0, k0):min(m, k0 + 16)] = True          # 脉冲后 16 帧 = H 的核长
             r = float(np.sqrt(np.mean(pred[w] ** 2))) if w.any() else 0.0
-            hr = AMP * float(np.sqrt(np.mean(np.sum(
-                np.load(ROOT / "outputs/step1_H/step1_H_v1.npz")["H"][:, :, j] ** 2, axis=1))))
+            hr = h_detectability(np.ascontiguousarray(np.load(
+                ROOT / "outputs/step1_H/step1_H_v1.npz")["H"], float), None)[j][0]
             print(f"  j{j+1:<4}{len(idx):>6}{r:>12.5f}{hr:>11.5f}{r/max(hr,1e-30):>9.2f}x")
         # 不依赖 G-2 的可探测性：直接用已验证的 H 算单帧脉冲响应
         import json as _jj
         H = np.ascontiguousarray(np.load(ROOT/"outputs/step1_H/step1_H_v1.npz")["H"], float)
         # ── 判据① 的**正确**算法（协议口径，不是单发）──────────────────
         # Δ_real = mean(B) − mean(A1,A2)；每臂 E 集、同关节每集 P 发 ⇒ 可相干叠加 K=E·P 发
-        E, P = EPISODES_PER_ARM, PULSES_PER_JOINT_PER_EP
-        sig = n_floor / np.sqrt(2.0)                 # 单次复放噪声 σ（n_floor=RMS(A1−A2)）
-        n_pulse = sig * np.sqrt(1.0 / E + 1.0 / (2.0 * E))   # mean(B) − mean(A1,A2) 的噪声
-        n_eff = n_pulse / np.sqrt(E * P)                      # 再相干叠加 K=E·P 发
-        print(f"\n  **不依赖 G-2 的可探测性**（已验证的 H，单帧 {AMP*1e3:.0f} mrad 脉冲）")
-        print(f"  协议设计: 每臂 {E} 集 · 同关节每集 ~{P} 发 ⇒ K={E*P} 发相干叠加")
-        print(f"  σ(单次复放) {sig:.5f} → Δ_real 逐发噪声 {n_pulse:.5f} → 叠加后 {n_eff:.5f} rad/s")
+        # **跨复放 ± 配对**的正确算法：奇分量 Δ_odd = (mean(Bp) − mean(Bm))/2，
+        # 裸臂项在奇分量里**精确抵消** ⇒ 噪声只来自 Bp/Bm 各 EB 集。
+        EB = EPISODES_PER_ARM // 2                    # Bp 2 集 / Bm 2 集
+        P = int(len(hits))                            # j5 每集实发数
+        sig = n_floor / np.sqrt(2.0)                  # 单次复放 σ（n_floor=RMS(A1−A2)）
+        n_odd = sig * 0.5 * np.sqrt(1.0 / EB + 1.0 / EB)
+        n_eff = n_odd / np.sqrt(P)                    # 相干叠加 P 发
+        print(f"\n  **不依赖 G-2 的可探测性**（已验证的 H，{AMP*1e3:.0f} mrad × 8 帧小波）")
+        print(f"  设计: Bp {EB} 集 / Bm {EB} 集 · 每集 {P} 发 ⇒ 奇分量相干叠加 {P} 发")
+        print(f"  σ(单次复放) {sig:.5f} → 奇分量噪声 {n_odd:.5f} → 叠加后 {n_eff:.5f} rad/s")
         print(f"  {'关节':>5}{'H 响应窗内 RMS':>18}{'有效信噪比':>12}{'判据①>3':>10}")
         for j, (r, _) in h_detectability(H, n_floor).items():
             sn = r / max(n_eff, 1e-30)
             print(f"  j{j+1:<4}{r:>18.5f}{sn:>12.2f}{'  ✓' if sn > SNR_GATE else '  **✗**':>10}")
-        print(f"\n  ⚠ 候选在**多正弦**上是高估约 1.6×，在**单帧脉冲**上却低估 2–4× ⇒"
-              f"\n    跨激励形式不一致。这正是用协议原设计(脉冲)而非训练同分布(多正弦)"
-              f"\n    做 ③a 的价值：③a 检验的是候选能否跨激励形式成立。")
+        print(f"\n  参照：候选在**多正弦**（训练激励）上高估约 1.6×，"
+              f"在**单帧脉冲**上低估 2–4×。\n    小波介于两者之间 —— "
+              f"③a 检验的正是候选能否跨激励形式成立。")
 
     OUT.mkdir(parents=True, exist_ok=True)
     man = {"artifact": "probe-3a-v1", "design": "PROTOCOL 3a original",
            "amp_rad": AMP, "eps_rad": EPS, "period_frames": PERIOD,
            "joints_0based": list(JOINTS), "gate_th": GATE_TH,
-           "n_hits": int(len(hits)), "lr": 16, "episodes_per_arm": EPISODES_PER_ARM,
+           "n_hits": int(len(hits)), "lr": LRESP, "wavelet": WAVELET.tolist(),
+           "scope": ("**j5-only**: j2/j3 在 pp2 上判据④ 结构性不可行（任务占满其加速度预算）。"
+                     "本次只回答「G-2 增量模型在 pp2 的 **j5 通道**上准不准」，**不授权全臂**。"),
+           "episodes_per_arm": EPISODES_PER_ARM,
            "replays_total": 3 * EPISODES_PER_ARM, "base_seq": str(src),
            "base_seq_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
            "model_side": man_a, "safety_audit_pass": bool(ok),
@@ -299,7 +314,7 @@ def main() -> int:
                                                   sgn * hits[:, 2]]),
                             pred=pr.astype(np.float32),
                             omega0=om_l.astype(np.float32),
-                            lr=np.int64(16),
+                            lr=np.int64(LRESP),
                             manifest_json=np.asarray(json.dumps(
                                 {**man, "sign": suf}, ensure_ascii=False, sort_keys=True)))
     np.savez_compressed(OUT / "probe_3a.npz",
@@ -307,7 +322,7 @@ def main() -> int:
                         hits=hits, pred=pred_l.astype(np.float32),
                         pred_m=predm_l.astype(np.float32),
                         omega0=om_l.astype(np.float32),
-                        lr=np.int64(16),            # 单帧脉冲的响应窗 = H 的核长
+                        lr=np.int64(LRESP),         # 8 帧小波 + 16 帧尾巴
                         manifest_json=np.asarray(json.dumps(man, ensure_ascii=False,
                                                             sort_keys=True)))
     (OUT / "probe_3a.json").write_text(json.dumps(man, ensure_ascii=False,

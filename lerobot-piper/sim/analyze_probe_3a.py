@@ -122,8 +122,11 @@ def main() -> int:
         A0 = [base + sh(om0 @ R_t) + rng.normal(0, sig, (T, 3))]
         A1 = [mk(np.zeros_like(pred)) for _ in REPS_A]
         A2 = [mk(np.zeros_like(pred)) for _ in REPS_A]
-        Bp = [mk(g_t * (pred @ R_t)) for _ in REPS_P]
-        Bm = [mk(g_t * (1 + f) * (pred_m @ R_t)) for _ in REPS_M]
+        # ⚠ 用**奇分量**合成，f=0 才是**严格**反对称。若直接用 pred / pred_m，
+        # 会把 **G-2 自身的偶次含量**当成"真机非线性"注入进来（自测曾因此误报 ④ 失灵）。
+        P_odd = 0.5 * ((pred - pred_m) @ R_t)
+        Bp = [mk(g_t * P_odd) for _ in REPS_P]
+        Bm = [mk(-g_t * (1 + f) * P_odd) for _ in REPS_M]
         print(f"=== 自检（注入 R={np.degrees(th):.0f}°, L={L_t}, g={g_t}, σ={sig}, "
               f"**符号非线性 f={f}**）===")
     else:
@@ -229,8 +232,11 @@ def main() -> int:
         print(f"  → {FIG}")
 
     if a.self_test:
-        e_g, e_a = abs(agg["g"] - 1.35) / 1.35, abs(ang - 37.0)
-        print(f"\n  自检: g {agg['g']:.3f} vs 1.35（误差 {e_g*100:.1f}%）· "
+        # 注入 f 后奇分量幅值变成 (1+(1+f))/2 = (2+f)/2 倍 ⇒ 期望 g = 1.35·(2+f)/2。
+        # 先前直接拿 1.35 比，导致 f≠0 的用例误报"核心回收 ✗"。
+        g_exp = 1.35 * (2 + a.nonlin) / 2
+        e_g, e_a = abs(agg["g"] - g_exp) / g_exp, abs(ang - 37.0)
+        print(f"\n  自检: g {agg['g']:.3f} vs 期望 {g_exp:.3f}（误差 {e_g*100:.1f}%）· "
               f"旋转 {ang:.1f}° vs 37° · 位移 {L} vs 3 · cos {agg['cos']:.3f} · "
               f"④ {amax:.3f} vs 注入 f={a.nonlin}")
         core = e_g < 0.05 and e_a < 2.0 and L == 3 and agg["cos"] > 0.95
