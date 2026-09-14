@@ -97,7 +97,7 @@ def analyze(runs, verbose=True):
     out["g_members"] = [float(x) for x in gs_member]
     out["g_m0"] = float(gs_member[0])
 
-    snrs, coss, asyms = [], [], []
+    snrs, coss, asyms, nrs = [], [], [], []
     for j in joints:
         s, p, n = savg("s", j), savg("p", j, member=0), savg("n", j)
         snr = float(np.linalg.norm(s) / max(np.linalg.norm(n), 1e-12))
@@ -116,15 +116,20 @@ def analyze(runs, verbose=True):
             asym_exp = float(exp_num / max(np.linalg.norm(acc[1]), 1e-12))
         else:
             asym = asym_exp = float("nan")
-        snrs.append(snr); coss.append(cos); asyms.append((asym, asym_exp))
+        # 范数比：g = cos × 范数比。必须**分开报** —— 方向差配上范数低估可以
+        # 乘出一个「看着正常」的 g≈1（用户 2026-09-02 订正）。
+        nr = float(np.linalg.norm(s) / max(np.linalg.norm(p), 1e-12))
+        snrs.append(snr); coss.append(cos); asyms.append((asym, asym_exp)); nrs.append(nr)
         out["per_joint"][f"j{j+1}"] = {
             "n": sum(1 for p in pulses if p["j"] == j), "snr": snr, "cos": cos,
+            "norm_ratio": nr,
             "asym": asym, "asym_noise_expected": asym_exp,
             "g": float((s * p).sum() / max((p ** 2).sum(), 1e-12)),
             "peak_real_mrad": float(np.abs(s).max() * 1e3),
             "peak_model_mrad": float(np.abs(p).max() * 1e3)}
     out["snr"] = float(np.mean(snrs))
     out["cos"] = float(np.mean(coss))
+    out["norm_ratio"] = float(np.mean(nrs))
     out["noise_rms_mrad"] = float(np.sqrt(np.mean([p["n"] ** 2 for p in pulses])) * 1e3)
     nonlin = [a > max(0.3, 2 * e) for a, e in asyms if a == a]
     out["pass"] = bool(out["snr"] > 3 and out["cos"] > 0.6 and not any(nonlin))
@@ -132,18 +137,24 @@ def analyze(runs, verbose=True):
     if verbose:
         print(f"脉冲池: {out['n_pulses']} 发(剔接触后) · {out['n_joints']} 关节 · K={K} 成员")
         print(f"复放噪声底(单帧) = {out['noise_rms_mrad']:.2f} mrad/s")
-        print(f"\n{'关节':>5}{'发数':>5}{'信噪':>7}{'g':>8}{'cos':>8}"
+        print(f"\n{'关节':>5}{'发数':>5}{'信噪':>7}{'cos':>8}{'范数比':>8}{'g':>8}"
               f"{'奇对称':>8}{'(噪声预期)':>11}{'真实峰':>9}{'模型峰':>9}")
         for jn, v in out["per_joint"].items():
             f1 = "" if v["snr"] > 3 else " ✗①"
             f4 = "" if not (v["asym"] > max(0.3, 2 * v["asym_noise_expected"])) else " ✗④"
-            print(f"{jn:>5}{v['n']:>5}{v['snr']:>7.1f}{v['g']:>8.3f}{v['cos']:>8.3f}"
+            print(f"{jn:>5}{v['n']:>5}{v['snr']:>7.1f}{v['cos']:>8.3f}"
+                  f"{v['norm_ratio']:>8.3f}{v['g']:>8.3f}"
                   f"{v['asym']:>8.3f}{v['asym_noise_expected']:>11.3f}"
                   f"{v['peak_real_mrad']:>9.1f}{v['peak_model_mrad']:>9.1f}{f1}{f4}")
         print(f"\n增益 g   = {out['g'][0]:.3f} ± {out['g'][1]:.3f}  (K 成员均值±分歧)"
               f"   [成员0: {out['g_m0']:.3f}]")
         print(f"         逐成员: {np.round(out['g_members'], 3).tolist()}")
         print(f"方向 cos = {out['cos']:.3f}   {'✓' if out['cos'] > 0.6 else '✗ 判据② — 停下回查 Ĝ'}")
+        print(f"范数比   = {out['norm_ratio']:.3f}  ‖Δ_real‖/‖Δ_model‖")
+        print(f"         **g = cos × 范数比**（{out['cos']:.3f} × {out['norm_ratio']:.3f}"
+              f" = {out['cos']*out['norm_ratio']:.3f}）—— g 把方向与尺度混在一起，"
+              f"\n         方向差 + 范数低估可以乘出一个「看着正常」的 g≈1。"
+              f"**g 不进通过条件**，判据是 ①信噪 ②cos>0.6 ④正负线性。")
         print(f"信噪     = {out['snr']:.1f}    {'✓' if out['snr'] > 3 else '✗ 判据① — 加大探针/增加复放'}")
         print(f"\n预注册判据: {'✅ 全部通过 — 可进 ③b' if out['pass'] else '❌ 未通过'}")
         g = out["g"][0]
