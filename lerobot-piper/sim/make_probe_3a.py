@@ -80,10 +80,12 @@ def build_probe(cmd7, moving):
         if not moving[t]:                                      # 静止段不发
             continue
         j = JOINTS[k % len(JOINTS)]
-        sgn = 1.0 if (k // len(JOINTS)) % 2 == 0 else -1.0     # 每轮一组换号 ⇒ 正负各半
         k += 1
-        da[t, j] = sgn * AMP
-        hits.append([t, j, sgn])
+        # ⚠ 全部取 **+**；± 配对改为**跨复放**（`_p` / `_m` 两条序列，帧号完全相同）。
+        # 旧设计把 ± 分散在**不同时刻**的脉冲上 ⇒ 两侧落在**不同位形**，
+        # 而逐发响应范数实测差 4×(j2)–27×(j3) ⇒ 判据④ 被位形变化主导，**测不到符号非线性**。
+        da[t, j] = AMP
+        hits.append([t, j, 1.0])
     return da, np.asarray(hits, float).reshape(-1, 3)
 
 
@@ -113,11 +115,9 @@ def audit(cmd7, da, hits):
     chk("同帧仅一关节", int(np.max((np.abs(da) > 0).sum(1))) <= 1)
     chk("脉冲均为单帧", all(np.count_nonzero(da[:, j]) == int((hits[:, 1] == j).sum())
                             for j in JOINTS))
-    chk("正负各半（逐关节）", all(
-        abs(int((hits[(hits[:, 1] == j)][:, 2] > 0).sum())
-            - int((hits[(hits[:, 1] == j)][:, 2] < 0).sum())) <= 1 for j in JOINTS),
-        " / ".join(f"j{j+1} +{int((hits[(hits[:,1]==j)][:,2]>0).sum())}"
-                   f"/-{int((hits[(hits[:,1]==j)][:,2]<0).sum())}" for j in JOINTS))
+    chk("每关节发数 ≥ 2（跨复放 ± 配对后每侧同样发数）",
+        all(int((hits[:, 1] == j).sum()) >= 2 for j in JOINTS),
+        " / ".join(f"j{j+1} {int((hits[:,1]==j).sum())} 发" for j in JOINTS))
     chk("夹爪无 δa", da.shape[1] == 6)
     try:
         import mujoco
@@ -224,8 +224,11 @@ def main() -> int:
     w0 = omega(dd)
     c = cmd7.copy(); c[:, :6] += da
     w1 = omega({**dd, "cmd": c})
-    m = min(len(w0), len(w1))
+    cm = cmd7.copy(); cm[:, :6] -= da
+    w1m = omega({**dd, "cmd": cm})
+    m = min(len(w0), len(w1), len(w1m))
     pred = bp(w1[:m] - w0[:m], *BAND)
+    predm = bp(w1m[:m] - w0[:m], *BAND)
     print(f"\n  Δ_model 带内 RMS = {np.sqrt(np.mean(pred**2)):.5f} rad/s")
 
     # ── 逐关节信噪比预测（v2 去掉 j5 的那条理由，先量化）──────────────
@@ -269,7 +272,7 @@ def main() -> int:
     man = {"artifact": "probe-3a-v1", "design": "PROTOCOL 3a original",
            "amp_rad": AMP, "eps_rad": EPS, "period_frames": PERIOD,
            "joints_0based": list(JOINTS), "gate_th": GATE_TH,
-           "n_hits": int(len(hits)), "episodes_per_arm": EPISODES_PER_ARM,
+           "n_hits": int(len(hits)), "lr": 16, "episodes_per_arm": EPISODES_PER_ARM,
            "replays_total": 3 * EPISODES_PER_ARM, "base_seq": str(src),
            "base_seq_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
            "model_side": man_a, "safety_audit_pass": bool(ok),
@@ -277,9 +280,34 @@ def main() -> int:
            "caliber": ("Δ_model = ω̂(u+δa) − ω̂(u)（单边，与真机 Δ_real = B−(A1+A2)/2 同口径）；"
                        "R 与位移上机当日用**独立标定数据**定死，**不得由探针结果反挑**；"
                        "②或④不过 ⇒ 停，不进 ③b。")}
+    # ⚠ pred/omega0 原本在 t20 网格（586），而 hits 与真机 IMU 在**控制环网格**（581）。
+    # 三者必须同一索引，否则脉冲窗会错位 ⇒ 在此重采到控制环网格。
+    t20a = np.asarray(t20, float)[:m]
+    to_loop = lambda X: np.stack([np.interp(t_read, t20a, X[:, c]) for c in range(3)], 1)
+    pred_l, predm_l = to_loop(pred), to_loop(predm)
+    om_l = to_loop(bp(w0[:m], *BAND))
+    # omega0 = 名义 ω̂（**机体系**，绝对量）—— 分析侧用 A0 拟合 R 时需要它；
+    # pred 是增量，拟合不了绝对旋转。
+    # ⚠ 两条序列：`_p`(+δa) 与 `_m`(−δa)，**帧号完全相同**。
+    # B 臂 r1/r2 跑 `_p`、r3/r4 跑 `_m` ⇒ 判据④ 的两侧位形**逐帧严格相同**；
+    # ①②③ 改用奇分量 (Δ⁺−Δ⁻)/2，顺带**精确抵消任何偶次污染**。
+    for suf, sgn, pr in (("_p", +1.0, pred_l), ("_m", -1.0, predm_l)):
+        np.savez_compressed(OUT / f"probe_3a{suf}.npz",
+                            cmd7=cmd7.astype(np.float32),
+                            da=(sgn * da).astype(np.float32),
+                            hits=np.column_stack([hits[:, 0], hits[:, 1],
+                                                  sgn * hits[:, 2]]),
+                            pred=pr.astype(np.float32),
+                            omega0=om_l.astype(np.float32),
+                            lr=np.int64(16),
+                            manifest_json=np.asarray(json.dumps(
+                                {**man, "sign": suf}, ensure_ascii=False, sort_keys=True)))
     np.savez_compressed(OUT / "probe_3a.npz",
                         cmd7=cmd7.astype(np.float32), da=da.astype(np.float32),
-                        hits=hits, pred=pred.astype(np.float32),
+                        hits=hits, pred=pred_l.astype(np.float32),
+                        pred_m=predm_l.astype(np.float32),
+                        omega0=om_l.astype(np.float32),
+                        lr=np.int64(16),            # 单帧脉冲的响应窗 = H 的核长
                         manifest_json=np.asarray(json.dumps(man, ensure_ascii=False,
                                                             sort_keys=True)))
     (OUT / "probe_3a.json").write_text(json.dumps(man, ensure_ascii=False,
