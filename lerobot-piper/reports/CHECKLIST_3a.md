@@ -16,16 +16,22 @@
 | 关节 | **只 j5** | j2/j3 在 pp2 上 ④ 结构性不可行，见 §6 |
 | 发数 | 每集 **10 发**，每 40 帧一发 | 静止段不发（真机陀螺模长 < 0.04 rad/s） |
 | ± 配对 | **跨复放**：`_p`(+δa) / `_m`(−δa)，**帧号完全相同** | 见 §2 |
+| B 块顺序 | **ABBA**：Bp(r1) → Bm(r2) → Bm(r3) → Bp(r4) | 漂移平衡，见 §1 |
 | 响应窗 | `LR = 24`（8 帧小波 + 16 帧尾巴 = H 的核长） | |
 | 模型侧 | **`g2-incr-v1`**（v=0.4，`r_q` 冻结，W sha `ecbba75b66fd380e…`） | 已冻结，**不再调 v** |
 
 ## 1. 执行顺序（12 次复放 + 1 次标定）
 
 ```
-A0 ×1 (标定)  →  A1 ×4 (裸)  →  Bp ×2 (+δa)  →  Bm ×2 (−δa)  →  A2 ×4 (裸)
+A0 ×1 (标定)  →  A1 ×4 (裸)  →  Bp(r1) → Bm(r2) → Bm(r3) → Bp(r4)  →  A2 ×4 (裸)
 ```
 
 `A1` 先、`A2` 后把 B 夹在中间，`(A1+A2)/2` 才能抵消线性漂移。
+
+**B 块内用 ABBA 平衡**：`Bp` 占位置 {1,4}、`Bm` 占 {2,3}，两者平均采集位置都是 2.5
+⇒ B 块内的**线性漂移精确抵消**。
+若写成 `Bp,Bp,Bm,Bm`，扰动符号就与**采集时段**混在一起，漂移会伪装成符号不对称
+—— 而判据④ 正是符号对称性检验。**顺序不可调换。**
 
 ```bash
 cd ~/claude-test-2/lerobot-piper
@@ -43,10 +49,15 @@ $PY sim/replay_probe.py --robot piper --arm A1 --seqfile outputs/probe_3a/probe_
 # ③ 其余 11 条
 for i in 2 3 4; do $PY sim/replay_probe.py --robot piper --arm A1 \
     --seqfile outputs/probe_3a/probe_3a_p.npz --outdir outputs/probe_3a/r$i; done
-for i in 1 2;   do $PY sim/replay_probe.py --robot piper --arm Bp \
-    --seqfile outputs/probe_3a/probe_3a_p.npz --outdir outputs/probe_3a/r$i; done
-for i in 3 4;   do $PY sim/replay_probe.py --robot piper --arm Bm \
-    --seqfile outputs/probe_3a/probe_3a_m.npz --outdir outputs/probe_3a/r$i; done
+# B 块：ABBA 顺序，**按此逐条执行，不要合并成循环**
+$PY sim/replay_probe.py --robot piper --arm Bp \
+    --seqfile outputs/probe_3a/probe_3a_p.npz --outdir outputs/probe_3a/r1
+$PY sim/replay_probe.py --robot piper --arm Bm \
+    --seqfile outputs/probe_3a/probe_3a_m.npz --outdir outputs/probe_3a/r2
+$PY sim/replay_probe.py --robot piper --arm Bm \
+    --seqfile outputs/probe_3a/probe_3a_m.npz --outdir outputs/probe_3a/r3
+$PY sim/replay_probe.py --robot piper --arm Bp \
+    --seqfile outputs/probe_3a/probe_3a_p.npz --outdir outputs/probe_3a/r4
 for i in 1 2 3 4; do $PY sim/replay_probe.py --robot piper --arm A2 \
     --seqfile outputs/probe_3a/probe_3a_p.npz --outdir outputs/probe_3a/r$i; done
 ```

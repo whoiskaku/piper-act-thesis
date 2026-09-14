@@ -50,7 +50,11 @@ for _p in (ROOT, HERE):
 ROOTD = ROOT / "outputs/probe_3a"
 SEQ = ROOTD / "probe_3a.npz"
 FIG = ROOTD / "fig_3a_pulse.png"
-REPS_P, REPS_M, REPS_A = ("r1", "r2"), ("r3", "r4"), ("r1", "r2", "r3", "r4")
+# ⚠ **ABBA 漂移平衡**：Bp 占位置 {1,4}、Bm 占 {2,3}，两者平均采集位置都是 2.5
+# ⇒ B 块内的**线性漂移精确抵消**。若写成 (r1,r2)/(r3,r4)，扰动符号就与采集时段
+# 混在一起，漂移会伪装成符号不对称 —— 而 ④ 正是符号对称性检验。
+REPS_P, REPS_M = ("r1", "r4"), ("r2", "r3")
+REPS_A = ("r1", "r2", "r3", "r4")
 SHIFTS = range(0, 7)
 SNR_GATE, COS_GATE, ASYM_GATE = 3.0, 0.6, 0.3
 
