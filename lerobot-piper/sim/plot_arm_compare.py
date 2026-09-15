@@ -79,6 +79,12 @@ def main():
     ap.add_argument("--root", default="outputs/ab2")
     ap.add_argument("--min-frames", type=int, default=500)
     ap.add_argument("--base", default="A", help="基线臂名。ab3 用同会话对照 A2")
+    ap.add_argument("--n", type=int, default=10,
+                    help="每臂纳入的集数。⚠ 旧默认是 10，对 40 集的块必须显式给 40")
+    ap.add_argument("--base-ep", type=int, default=None,
+                    help="基线臂单独的集号（默认与 --ep 相同）。"
+                         "**有会话漂移时必须用它**：同序号的两集采集位可能相差很远，"
+                         "漂移会把对比放大或缩小。")
     a_ = ap.parse_args()
     O = a_.other
     AB2 = ROOT / a_.root
@@ -86,12 +92,23 @@ def main():
                              ).read_text())["R"], np.float32)
     bp = _bp()
     B = a_.base
-    fA, fO = eps(B, AB2, a_.min_frames), eps(O, AB2, a_.min_frames)
+    fA = eps(B, AB2, a_.min_frames, a_.n)
+    fO = eps(O, AB2, a_.min_frames, a_.n)
     STYLE.setdefault(B, ("tab:blue", B))
     STYLE.setdefault(O, ("tab:brown", O))       # 新臂名不必预先登记
-    k = min(a_.ep, len(fA) - 1, len(fO) - 1)
-    rA, iA = load(fA[k], R)
-    rO, iO = load(fO[k], R)
+    kB = a_.ep if a_.base_ep is None else a_.base_ep
+    kO = a_.ep
+    # ⚠ **越界要报错, 不能静默钳位**。原实现是 `k = min(--ep, len-1, len-1)`,
+    #   而 `eps()` 默认只取前 10 集 ⇒ `--ep 34` 会被悄悄画成第 9 集, 图与标题全错。
+    if not (0 <= kB < len(fA)):
+        raise SystemExit(f"--base-ep {kB} 越界: {B} 臂只有 {len(fA)} 集"
+                         f"（--n={a_.n}；40 集的块要显式 --n 40）")
+    if not (0 <= kO < len(fO)):
+        raise SystemExit(f"--ep {kO} 越界: {O} 臂只有 {len(fO)} 集"
+                         f"（--n={a_.n}；40 集的块要显式 --n 40）")
+    k = kO
+    rA, iA = load(fA[kB], R)
+    rO, iO = load(fO[kO], R)
     gA, gO = bp(rA - iA), bp(rO - iO)
     eA = float((gA ** 2).sum() / len(gA)); eO = float((gO ** 2).sum() / len(gO))
 
@@ -103,8 +120,9 @@ def main():
 
     c_o, lab_o = STYLE[O]
     fig, ax = plt.subplots(4, 1, figsize=(13, 11))
-    ttl = (f"{B}({STYLE[B][1]}) vs {O}({lab_o}) —— **同一配对序号 第{k}集**"
-           f"（同 --ep 的各图基线面板一致）\n"
+    _same = "同一配对序号" if kB == kO else f"**{B}=第{kB}集 / {O}=第{kO}集（按采集位配对）**"
+    ttl = (f"{B}({STYLE[B][1]}) vs {O}({lab_o}) —— {_same} 第{k}集"
+           f"\n"
            f"陀螺 y 轴，gap 未对齐口径　|　闭环策略 ⇒ 两臂轨迹并非逐点相同，作分布对照")
     fig.suptitle(ttl, fontsize=11)
 
@@ -137,13 +155,14 @@ def main():
     ax[3].semilogy(fq, P[O], c=c_o, lw=1.4, label=f"{O} {lab_o}")
     ax[3].axvspan(0.5, 9, color="gray", alpha=.12); ax[3].set_xlim(0, 10)
     ax[3].set_xlabel("频率 (Hz)"); ax[3].set_ylabel("PSD")
-    ax[3].set_title("④ gap 频谱（10 集平均，灰 = 评分带）", fontsize=10)
+    ax[3].set_title(f"④ gap 频谱（{B} {len(fA)} 集 / {O} {len(fO)} 集平均，灰 = 评分带）",
+                    fontsize=10)
     ax[3].legend(fontsize=9); ax[3].grid(alpha=.3)
 
     fig.tight_layout(rect=[0, 0, 1, 0.945])
-    out = AB2 / f"{B}{O}_curves.png"
+    out = AB2 / (f"{B}{O}_curves.png" if kB == kO else f"{B}{kB}_{O}{kO}_curves.png")
     fig.savefig(out, dpi=140)
-    print(f"→ {out.relative_to(ROOT.parent)}   (两臂均用第 {k} 集)")
+    print(f"→ {out.relative_to(ROOT.parent)}   ({B}=第{kB}集 / {O}=第{kO}集)")
     print(f"  {O}/{B} 逐频段 PSD 比（<1 = 改善）:")
     for lo, hi in [(0.5, 2), (2, 4), (4, 6), (6, 8), (8, 9)]:
         m = (fq >= lo) & (fq < hi)
