@@ -59,6 +59,17 @@ cd /home/enolab-guo/claude-test-2/lerobot-piper
 export PY=/home/enolab-guo/miniconda3/envs/lerobot/bin/python
 mkdir -p outputs/ab5
 
+# ── libstdc++ 冲突修正（**这行必须有**，否则 control_robot 起不来）──────────
+# 症状: `import cv2` 报 /usr/lib/.../libstdc++.so.6: version `CXXABI_1.3.15' not found
+# 成因: ROS noetic 的 setup 把 /usr/lib/x86_64-linux-gnu 顶到 LD_LIBRARY_PATH 最前,
+#   lerobot 的依赖先把**系统**旧 libstdc++(只到 CXXABI_1.3.12)载入进程, 之后 cv2
+#   复用已加载的那个 ⇒ 缺符号。单独 `import cv2` 不复现(那时系统库还没被载进来)。
+# 修法: 预加载 conda env 自带的(CXXABI_1.3.15)让它先占位。**只动 libstdc++**,
+#   不改 LD_LIBRARY_PATH ⇒ 不遮蔽 ROS 需要的其他系统库。
+#   与 `scripts/collect_step1_stage1.sh` 里 ab4 采集用的是同一条, 已实测全链正常;
+#   本次另测了 g2wall 的 **spawn 子进程**不受影响(往返 39.4 / 105.8 ms 不变)。
+export LD_PRELOAD="/home/enolab-guo/miniconda3/envs/lerobot/lib/libstdc++.so.6${LD_PRELOAD:+:$LD_PRELOAD}"
+
 POLICY=outputs/train/2026-07-01/ACT_pickplace2_noimu_seed42/checkpoints/100000/pretrained_model
 MANIFEST=outputs/p2_pi/pi_g2wall_v1.json
 
