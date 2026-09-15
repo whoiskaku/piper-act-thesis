@@ -215,8 +215,18 @@ def main() -> int:
           f"**零空档** · 不读 IMU · sha {g['ckpt_sha256'][:8]}…")
     print(f"  δa RMS {np.sqrt((das**2).mean())*1e3:.2f} mrad "
           f"(对照 C 臂 0.54) · 触界 {g['sat_pct']:.1f}%")
-    print(f"\n  ⚠ **事前预测**: D−A ≈ **−0.1%**（对照 C−A 实测 −8.0%）——"
-          f"用真机已验证的 H 推算，见 RESULT 文档。")
+    # 事前预测从**该 checkpoint 自己的**核验产物读，避免印成上一个实验的数
+    pred = ROOT / f"outputs/p2_pi/verify_pi_distill.json"
+    try:
+        v = json.loads(pred.read_text())
+        if v.get("tag") == a.ckpt:
+            print(f"\n  ⚠ **事前预测**（用真机已验证的 H 推算，同法预测 C 臂 −7.6% / 实测 −8.0%）：")
+            print(f"     α = **{v['alpha']:.2f}** · 预测交付 **{v['pi_delivery']*100:+.2f}%**"
+                  f"（教师 {v['teacher_delivery']*100:+.2f}%）· 对照 C 臂真机 **−8.0%**")
+        else:
+            print(f"\n  ⚠ 未找到 `{a.ckpt}` 的核验产物 —— 先跑 sim/verify_pi_distill.py")
+    except Exception:
+        print(f"\n  ⚠ 未找到核验产物 —— 先跑 sim/verify_pi_distill.py --tag {a.ckpt}")
     OUT.write_text(json.dumps(
         {"checks": ok, "all_pass": allok, "act_ms": a.act_ms,
          "frame_ms": {"p50": float(np.median(fm)), "p99": p99,
