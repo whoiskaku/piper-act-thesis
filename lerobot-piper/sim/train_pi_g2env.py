@@ -55,6 +55,7 @@ for _p in (ROOT, HERE, ROOT / "sim/step4_gvnext"):
         sys.path.insert(0, str(_p))
 
 ENV = ROOT / "outputs/p2_pi/g2env"
+ALIGN_L = 3            # gap[i] = omega[i+L] - ideal[i]；H 在 gap 轴、J 在 omega 轴
 OUT = ROOT / "outputs/p2_pi"
 EPS = 0.010            # **瞬时峰值**硬界（tanh 结构性保证，部署时外面仍限幅兜底）
 CHUNK, MLAG = 100, 16
@@ -126,6 +127,21 @@ def build_inputs(u: np.ndarray, starts, n):
     return np.stack(xs), spans
 
 
+def response_h(H: torch.Tensor, da: torch.Tensor, n: int) -> torch.Tensor:
+    """`gap[i] = Σ_τ H[τ] @ δa[i−τ]` —— H 定义在 **gap 时间轴**（常数核）。
+
+    ⚠ 与 `J` 不同轴：`J[t,k]` 是 δa[t] → **ω**[t+k]，而 `gap[i] = ω[i+L] − ideal[i]`。
+    两者差 `L = ALIGN_L = 3`。本函数配合 `--plant h` 使用，目标须取 `tgt[L:]`。
+    """
+    out = torch.zeros(n, 3, device=da.device, dtype=da.dtype)
+    for tau in range(MLAG):
+        m = n - tau
+        if m <= 0:
+            break
+        out[tau:tau + m] = out[tau:tau + m] + da[:m] @ H[tau].T
+    return out
+
+
 def response(J: torch.Tensor, da: torch.Tensor, n: int) -> torch.Tensor:
     """Σ_k J[t,k] @ δa[t] 落在 ω[t+k] ——「ω 时间轴」，与 tgt 同轴。"""
     out = torch.zeros(n + MLAG, 3, device=da.device, dtype=da.dtype)
@@ -137,7 +153,7 @@ def response(J: torch.Tensor, da: torch.Tensor, n: int) -> torch.Tensor:
     return out[:n]
 
 
-def episode_loss(net, e, bp, lam_a, lam_s, dev, want_da=False):
+def episode_loss(net, e, bp, lam_a, lam_s, dev, want_da=False, plant="j", H=None):
     x, spans = e["_x"], e["_spans"]
     da_chunks = net(x)                                             # (C,100,6)
     n = e["n"]
@@ -145,9 +161,22 @@ def episode_loss(net, e, bp, lam_a, lam_s, dev, want_da=False):
     for i, (s0, lc) in enumerate(spans):
         da[s0:s0 + lc] = da_chunks[i, :lc]
     da = da * e["_free"]                                           # 接触门控
-    resid = e["_tgt"] + response(e["_J"], da, n)
+    if plant == "distill":
+        # 直接回归教师 δa*。**不再优化 H 的目标** —— 那会过量驱动到 H 已知失准的区间
+        # (D 臂教训: 2.16mrad 结构化 δa 下 H 预测 −0.1%、真机 +25%)。
+        star = e["_star"]
+        m = min(len(star), n)
+        loss = ((da[:m] - star[:m]) ** 2).mean() / (EPS ** 2)
+        reg = lam_s * ((da[1:] - da[:-1]) ** 2).mean() / (EPS ** 2) if lam_s > 0 else 0.0
+        return ((loss + reg, loss.detach(), da.detach()) if want_da
+                else (loss + reg, loss.detach()))
+    if plant == "h":
+        ng = n - ALIGN_L
+        resid = e["_tgt_gap"] + response_h(H, da[:ng], ng)
+    else:
+        resid = e["_tgt"] + response(e["_J"], da, n)
     num = (bp(resid.unsqueeze(0))[0] ** 2).sum()
-    loss = num / e["_den"]
+    loss = num / (e["_den_gap"] if plant == "h" else e["_den"])
     reg = lam_a * (da ** 2).mean() / (EPS ** 2)
     if lam_s > 0:
         reg = reg + lam_s * ((da[1:] - da[:-1]) ** 2).mean() / (EPS ** 2)
@@ -164,6 +193,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="pi_g2env_v1")
+    ap.add_argument("--plant", default="j", choices=("j", "h", "distill"),
+                    help="j=G-2 自己的雅可比(已判否) / h=优化实测 H 的目标(会过量驱动) / "
+                         "**distill=直接回归教师 δa\***（推荐）")
     a = ap.parse_args()
 
     import train_pi_e2 as TP
@@ -191,20 +223,47 @@ def main() -> int:
         e["_J"] = torch.from_numpy(e["J"]).to(DEV)
         e["_free"] = torch.from_numpy((~e["contact"]).astype(np.float32)).to(DEV)[:, None]
         e["_den"] = (bp(e["_tgt"].unsqueeze(0))[0] ** 2).sum().clamp_min(1e-30)
+        e["_tgt_gap"] = e["_tgt"][ALIGN_L:]                        # ω 轴 → gap 轴
+        e["_den_gap"] = (bp(e["_tgt_gap"].unsqueeze(0))[0] ** 2).sum().clamp_min(1e-30)
+        if a.plant == "distill":
+            # ⚠ **不手写求解器** —— 本会话已两次栽在 J/H 的时基换算上。
+            # 教师 δa* 由 `sim/precompute_star.py` 用**跑过真机的 G2WallRuntime**
+            # 原样算出并缓存，保证与 C 臂逐位同源。
+            f = ENV / (e["name"].replace("/", "__") + "__star.npy")
+            if not f.exists():
+                raise SystemExit(f"缺教师 δa*: {f}\n  先跑 python -u sim/precompute_star.py")
+            e["_star"] = torch.from_numpy(np.load(f).astype(np.float32)).to(DEV)
 
+    Ht = Hnp = None
+    if a.plant in ("h", "distill"):
+        Hnp = np.ascontiguousarray(
+            np.load(ROOT / "outputs/step1_H/step1_H_v1.npz")["H"], np.float64)
+        Ht = torch.from_numpy(Hnp.astype(np.float32)).to(DEV)
     net = PiNet().to(DEV)
     opt = torch.optim.Adam(net.parameters(), lr=a.lr)
     npar = sum(p.numel() for p in net.parameters())
     print(f"π: {npar} 参数 · 设备 {DEV} · 训练 {len(tr_i)} 集 / 验证 {len(val_i)} 集")
     print(f"λ_a={a.lam_a} λ_s={a.lam_s} · ε={EPS*1e3:.0f} mrad(tanh 结构硬界)")
-    print(f"⚠ 损失里的被控对象是 **J**(相对误差 0.444, 未过事前门禁) ⇒ 训完须用真 G-2 复核\n")
+    if a.plant == "distill":
+        print(f"损失 = **直接回归教师 δa***(冻结 G-2+H 解析解, 零空档)")
+        print(f"  **不优化 H 的目标** —— 那会过量驱动到 H 已知失准的区间")
+        print(f"  (实测: 优化 H 目标得 α=1.97 / δa 3.78mrad = 教师的 5.4×;")
+        print(f"   而 D 臂在 2.16mrad 就已被真机否掉)")
+        print(f"  **验收按 α**, 门槛 **α ≥ 0.75**, 目标 α≈1 ⇒ 交付 12.86%\n")
+    elif a.plant == "h":
+        print(f"被控对象 = **实测 H**(真机辨识, β=0.955) —— G-2 只负责**预测墙**;")
+        print(f"  最优解即 C 臂的解析解 ⇒ π 实为**蒸馏 C 并消除其 3-4 帧空档**;")
+        print(f"  **验收按 α**(沿教师的有用分量)，门槛 **α ≥ 0.75**\n")
+    else:
+        print(f"⚠ 损失里的被控对象是 **J**(相对误差 0.444, 未过事前门禁) ⇒ 训完须用真 G-2 复核\n")
     print(f"{'step':>6}{'训练 loss':>11}{'验证 loss':>11}{'验证降幅':>10}{'δa RMS':>9}")
 
     def evaluate(idx):
         net.eval(); tot = []; rms = []
         with torch.no_grad():
             for i in idx:
-                _, l, da = episode_loss(net, eps[i], bp, 0, 0, DEV, want_da=True)
+                _, l, da = episode_loss(net, eps[i], bp, 0, 0, DEV, want_da=True,
+                                        plant=a.plant, H=Ht)
                 tot.append(float(l)); rms.append(float((da ** 2).mean().sqrt()) * 1e3)
         net.train()
         return float(np.mean(tot)), float(np.mean(rms))
@@ -212,7 +271,8 @@ def main() -> int:
     best, best_state, t0 = 1e9, None, time.perf_counter()
     for step in range(1, a.steps + 1):
         i = int(rng.choice(tr_i))
-        loss, _ = episode_loss(net, eps[i], bp, a.lam_a, a.lam_s, DEV)
+        loss, _ = episode_loss(net, eps[i], bp, a.lam_a, a.lam_s, DEV,
+                               plant=a.plant, H=Ht)
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step()
@@ -239,6 +299,7 @@ def main() -> int:
         {"artifact": a.tag, "n_params": npar, "device": DEV,
          "train_episodes": [eps[i]["name"] for i in tr_i],
          "val_episodes": [eps[i]["name"] for i in sorted(val_i)],
+         "plant": a.plant,
          "hparams": {"steps": a.steps, "lr": a.lr, "lam_a": a.lam_a,
                      "lam_s": a.lam_s, "seed": a.seed, "eps_rad": EPS},
          "val_loss_J": best, "val_reduction_J_percent": (1 - best) * 100,
