@@ -234,6 +234,40 @@ def main() -> int:
     print(f"\n  ⚠ 用 H 训练、再用同一个 H 打分。H 已过跨 seed 与幅值线性，"
           f"足以筛掉明显不合适的候选，\n    但**不能代替真机直测**；"
           f"G-2 对真实 pp2 扰动是否够准，只有 ③a 能回答。")
+    # ── 冻结选中候选（③a 的模型侧要指向它）────────────────────────────
+    P = [stack3(e, v_sel) for e in TR]
+    W_sel = fit([p[0] for p in P], [p[1] for p in P], lam)
+    art = ROOT / "outputs/step4_gvnext/g2_incr_v1.npz"
+    man = {
+        "artifact": "g2-incr-v1",
+        "model": "omega_hat = kin(G-q-v1(u) + r_q) + r_s_incr;  r_q FROZEN, only r_s refit",
+        "v": float(v_sel), "w_band": W_BAND, "rs_nlag": nlag, "rs_lam": lam,
+        "v_grid": list(V_GRID), "selected_by": "training-family OOF incremental relative error",
+        "W_sha256": hashlib.sha256(np.ascontiguousarray(W_sel, np.float64).tobytes()).hexdigest(),
+        "rq_frozen_sha256": hashlib.sha256(
+            np.ascontiguousarray(zq["W"], np.float64).tobytes()).hexdigest(),
+        "H_sha256": meta["H"]["sha256"], "H_artifact": str(H_ART),
+        "dev_metrics": res[v_sel],
+        "scope": {
+            "validated_offline": "increment vs measured H on 8 unseen trajectories (8/8 improved)",
+            "NOT_validated": ("trained against H and scored against the SAME H -- circular. "
+                              "Only PROTOCOL 3a (A1/B/A2 real replay) can say whether this "
+                              "candidate is accurate for real pp2 perturbations."),
+            "offline_cos": res[v_sel]["cos_med"],
+            "cos_gate_3a": 0.6,
+            "absolute_cost": {"0.5-3Hz": res[v_sel]["abs"]["0.5-3.0"] - res[0.0]["abs"]["0.5-3.0"],
+                              "3-9Hz": res[v_sel]["abs"]["3.0-9.0"] - res[0.0]["abs"]["3.0-9.0"]},
+            "v_at_grid_edge": bool(v_sel == max(V_GRID)),
+        },
+    }
+    np.savez_compressed(art, W=np.ascontiguousarray(W_sel, np.float64),
+                        v=np.float64(v_sel), nlag=np.int64(nlag), lam=np.float64(lam),
+                        manifest_json=np.asarray(json.dumps(man, ensure_ascii=False,
+                                                            sort_keys=True)))
+    art.with_suffix(".json").write_text(
+        json.dumps(man, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    print(f"\n  冻结候选 → {art}  （W sha {man['W_sha256'][:16]}…）")
+
     OUT.write_text(json.dumps({
         "v_grid": list(V_GRID), "v_selected": v_sel, "oof": {str(k): v for k, v in oof.items()},
         "dev": {str(k): v for k, v in res.items()}, "improve": ok,
