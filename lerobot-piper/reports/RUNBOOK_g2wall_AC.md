@@ -131,17 +131,23 @@ $PY lerobot/scripts/control_robot.py "${COMMON[@]}" \
 
 ```bash
 $PY - <<'PY'
-import json, glob
-rows = [json.loads(open(p).read())["summary"] for p in sorted(glob.glob("outputs/ab5/Csafe_ep*.json"))]
-gate = {"frame_ms p99 ≤60": None, "空档 3-5%": None, "sat ≈0.3%": None,
-        "gated 15-17%": None, "δa RMS ≈0.6mrad": None, "stale/nan = 0": None,
-        "进程卸载 on": None}
-for i, s in enumerate(rows):
-    g = s["g2wall"]
-    print(f"ep{i}: 帧{s['frames']}  空档{g['blackout_pct']:.1f}%  sat{s['sat_pct']:.2f}%  "
-          f"gated{s['gated_pct']:.1f}%  δa{s['da_mean_mrad']:.2f}mrad  "
-          f"stale{s['stale']} nan{s['nan']}  卸载{g.get('process_offload')}  "
-          f"推迟{g.get('defer_frames')}  标定差{g.get('calib_delta_deg')}°")
+import json, glob, re
+import numpy as np
+from pathlib import Path
+# ⚠ 两个**取错就会误判**的字段（我第一次判读时两个都踩了）:
+#   · `gated_pct` 要取 **summary["g2wall"]["gated_pct"]**。wrapper 顶层那个
+#     只被 π/step1 路径累加，**对 g2wall 恒为 0** —— 看起来像「接触门控没生效」。
+#   · `da_mean_mrad` 是**平均绝对值**，而冒烟报的 0.62 是 **RMS**。
+#     二者天然差 ~0.8 倍，直接对比会把正常值误判成偏低。下面**直接从 da 重算 RMS**。
+for p in sorted(glob.glob("outputs/ab5/Csafe_ep*.json"),
+                key=lambda x: int(re.search(r'ep(\d+)', x).group(1))):
+    d = json.loads(Path(p).read_text()); s = d["summary"]; g = s["g2wall"]
+    da = np.asarray([f["da"] for f in d["frames"]], float)
+    print(f"{Path(p).stem}: 帧{s['frames']}  空档{g['blackout_pct']:.1f}%  "
+          f"gated{g['gated_pct']:.1f}%  δa RMS {np.sqrt((da**2).mean())*1e3:.3f}mrad  "
+          f"max {np.abs(da).max()*1e3:.2f}  sat{g['sat_pct']:.2f}%  "
+          f"stale{s['stale']} nan{s['nan']}  stageA失败{g['stage_a_fail']}  "
+          f"卸载{g.get('process_offload')}  标定差{g.get('calib_delta_deg'):.2f}°")
 PY
 ```
 
