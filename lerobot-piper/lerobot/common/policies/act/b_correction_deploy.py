@@ -17,6 +17,8 @@
     C 本方法:      BCORR_CKPT=<ckpt> BCORR_MODE=full    （π 实时校正）
     C' G-2 预测墙:  BCORR_CKPT=<pi_g2wall_v1.json> BCORR_MODE=g2wall
                    （`pi-g2wall-v1`, 自由参数 **0**; **不读 IMU**、**不含 FF**）
+    D  纯 π 网络:   BCORR_CKPT=<pi_g2env_v1.pt> BCORR_MODE=pi_net
+                   （`pi-g2env-v1`，在冻结 G-2 环境里训出；运行时**无 G-2/H/求解器**）
     诊断:          BCORR_MODE=pi_only（π 但不含 FF）/ record（只落盘特征不施加）
 
 安全（方案 C, 用户 2026-07-15 选定）:
@@ -59,7 +61,7 @@ from lerobot.common.policies.act.step1_correction_runtime import (
 _MDEG_TO_RAD = math.pi / 180.0 / 1000.0
 _GRIP_SCALE = 1.0 / 800000.0        # 与 refine_deploy 一致
 MODES = ("off", "ff", "pi_only", "full", "record", "probe",
-         "step1_b", "step1_c", "step1_v2", "g2wall")
+         "step1_b", "step1_c", "step1_v2", "g2wall", "pi_net")
 
 
 PROBE_N = 2000                   # 100 s @20Hz —— 覆盖 30 s 一集, 正常不会绕回
@@ -134,8 +136,12 @@ class BCorrectionDeployWrapper:
         # g2wall: **G-2 预测墙 + H 解析求解**(pi-g2wall-v1, 自由参数 0)。
         # **不读 IMU**(纯前馈: 只吃本 chunk 的 ACT 指令)、**不含 FF**(用户 2026-09-15)。
         self.use_g2wall = mode == "g2wall"
+        # pi_net: **纯 π 网络**(pi-g2env-v1)。运行时无 G-2/H/求解器/MuJoCo,
+        # 一次前向出整 chunk ⇒ **没有空档**(g2wall 每 chunk 空 3-4 帧)。
+        # **不读 IMU**(v1 纯前馈); FF 不在本线。
+        self.use_pinet = mode == "pi_net"
         self.apply_delta = mode in ("full", "pi_only", "probe", "step1_b", "step1_c",
-                                    "step1_v2", "g2wall")
+                                    "step1_v2", "g2wall", "pi_net")
         self.use_ff = mode in ("full", "ff")
         # probe: 外生激励, **不读 IMU、不经 π** —— 序列由种子完全决定
         # **逐集换 seed**(PREREG_STEP1.md §8): 旧实现整批只有 1 个噪声实现 ——
@@ -211,6 +217,16 @@ class BCorrectionDeployWrapper:
                 if verbose and self._g2w_pool is not None:
                     print(f"[g2wall] 进程卸载 **开**（stage A/B 在子进程，不抢主线程 GIL）")
 
+        # ── pi_net: 启动期校验检查点 ──────────────────────────────────────
+        self.pinet = None
+        if self.use_pinet:
+            from lerobot.common.policies.act.pi_net_runtime import PiNetRuntime
+            if not pi_ckpt:
+                raise ValueError("pi_net 需要检查点: 设 BCORR_CKPT=…/pi_g2env_v1.pt")
+            self.pinet = PiNetRuntime(pi_ckpt, device=device, verbose=verbose)
+            self._artifact_sha256 = self.pinet.ckpt_sha256
+
+        # ⚠ pi_net **不需要** renderer —— 运行时不跑 MuJoCo
         self.renderer = (IdealChunkRenderer()
                          if (self.use_pi or self.use_step1 or self.use_g2wall) else None)
         # ── chunk 渲染移出 20 Hz 关键路径（2026-09-14）─────────────────────
@@ -240,6 +256,7 @@ class BCorrectionDeployWrapper:
                       "plan_ms": []}
         self._last_step1_frame: Step1Frame | None = None
         self._last_g2w_frame = None
+        self._last_pinet_frame = None
         self._log = [] if log_path else None
         self._chunks = [] if log_path else None
         self.log_path = Path(log_path) if log_path else None
@@ -251,6 +268,7 @@ class BCorrectionDeployWrapper:
                   f"step1={'B' if mode == 'step1_b' else ('C' if mode == 'step1_c' else 'off')}"
                   + (" seam=on(v2: 运行时不读 IMU)" if self.use_seam else "")
                   + (" g2wall=on(**不读 IMU**, 纯前馈; FF 不在本线)" if self.use_g2wall else "")
+                  + (" pi_net=on(**纯 π 网络**; 无 G-2/H/求解器; 无空档)" if self.use_pinet else "")
                   + (f" probe: {len(self.probe_seeds)} seeds "
                      f"{self.probe_seeds[:4]}{'…' if len(self.probe_seeds) > 4 else ''} "
                      f"@{self.probe_mrad:g}mrad" if self.probe is not None else ""))
@@ -305,12 +323,15 @@ class BCorrectionDeployWrapper:
         if self.step1 is not None:
             # 与是否开日志无关：z/HP/H 历史绝不能跨 episode 继承。
             self.step1.reset()
+        if self.pinet is not None:
+            self.pinet.reset()
         if self.g2w is not None:
             # resp(已提交 δa 的未来响应)与热身前缀绝不能跨 episode 继承。
             self.g2w.reset()
         self._pending_a = self._pending_b = self._g2w_submit = None
         self._last_step1_frame = None
         self._last_g2w_frame = None
+        self._last_pinet_frame = None
 
     def to(self, device):
         self.act.to(device)
@@ -372,6 +393,10 @@ class BCorrectionDeployWrapper:
             # 却把争抢挪到只做 0.14 ms 求解的空闲帧上。
             self._g2w_submit = (cmd, prev)
             self._pending_a = self._pending_b = None
+
+        if self.use_pinet:
+            # **同步**一次前向（实测 <2 ms）⇒ 第 0 帧就有 δa，没有空档
+            self.pinet.begin_chunk(cmd)
 
         self._chunk_raw = cmd
         self._prev_tail = cmd.copy()
@@ -542,6 +567,13 @@ class BCorrectionDeployWrapper:
             da = self.seam.step()
             a = a.clone()
             a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)
+        elif self.use_pinet:
+            fr = self.pinet.step()
+            self._last_pinet_frame = fr
+            da = fr.delta
+            if self.apply_delta and np.any(da):
+                a = a.clone()
+                a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)   # 夹爪不动
         elif self.use_g2wall:
             # 纯前馈: **不读 IMU**。每帧都必须调 step() —— 空档期它输出 0 但会
             # 推进 `_k` 与 `resp`(已提交 δa 的未来响应), 少调一次整条就错位。
@@ -573,6 +605,10 @@ class BCorrectionDeployWrapper:
                 "a": a[0].detach().cpu().numpy().tolist(),
                 "imu": imu.detach().cpu().numpy().reshape(-1).tolist() if imu is not None else None,
                 "state": batch["observation.state"].detach().cpu().numpy().reshape(-1).tolist()}
+            if self._last_pinet_frame is not None:
+                pf = self._last_pinet_frame
+                row.update({"pi_stage": pf.stage, "pi_k": pf.k,
+                            "pi_contact": pf.contact_gated, "pi_sat": pf.saturated})
             if self._last_g2w_frame is not None:
                 gf = self._last_g2w_frame
                 row.update({"g2w_stage": gf.stage, "g2w_k": gf.k,
@@ -634,6 +670,8 @@ class BCorrectionDeployWrapper:
                 "artifact_sha256": self._artifact_sha256}
         if self.step1 is not None:
             out["step1"] = self.step1.summary()
+        if self.pinet is not None:
+            out["pi_net"] = self.pinet.summary()   # ⚠ summary 必须**无副作用**
         if self.g2w is not None:
             out["g2wall"] = self.g2w.summary()
             out["g2wall"]["blackout_frames"] = int(s.get("g2w_blackout", 0))
