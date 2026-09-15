@@ -32,16 +32,22 @@ FPS, CHUNK = 20.0, 100
 ARMS = ("A", "B", "C")            # 原三臂设计的默认值; 可用 --arms 覆盖
 
 
-def arm_episodes(root: Path, arm: str, min_frames: int, n: int | None):
+def arm_episodes(root: Path, arm: str, min_frames: int, n: int | None,
+                 exclude: set[int] | None = None):
     """按**采集次序**取该臂的有效集。
 
-    两处必须这样做, 否则配对会错位(2026-08-04 修):
+    三处必须这样做, 否则配对会错位(2026-08-04 / 2026-09-16 修):
       · 排序用 ep 后的整数, 不能用字典序 —— ep10 会排到 ep2 前面, ≥10 集必错
       · 过滤掉中断集(frames 过少), 与 plot_arm_compare/gcheck 的口径一致
+      · `exclude` 按**集号**剔除, 且**对所有臂同样施加** —— `report()` 是按列表
+        **下标**配对的, 若只从一个臂删集, 该集号之后的配对会整体错位一位。
     """
     import re
     fs = sorted(root.glob(f"{arm}_ep*.json"),
                 key=lambda p: int(re.search(r"ep(\d+)", p.name).group(1)))
+    if exclude:
+        fs = [f for f in fs
+              if int(re.search(r"ep(\d+)", f.name).group(1)) not in exclude]
     fs = [f for f in fs
           if json.loads(f.read_text()).get("summary", {}).get("frames", 0) > min_frames]
     return fs[:n] if n else fs
@@ -147,6 +153,10 @@ def main():
     ap.add_argument("--n", type=int, default=10, help="每臂取前 n 集(按采集次序)")
     ap.add_argument("--min-frames", type=int, default=500, help="低于此帧数视为中断集, 剔除")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--exclude", default="",
+                    help="逗号分隔的**集号**, 从**所有臂**同时剔除(保持配对对齐)。"
+                         "⚠ 事前剔除规则只有 --min-frames; 用了本项即为**事后剔除**, "
+                         "报告时必须与未剔除的数字并列。")
     a = ap.parse_args()
     arms = tuple(s.strip() for s in a.arms.split(",") if s.strip())
     assert arms[0] == "A", f"第一个臂必须是基线 A, 收到 {arms}"
@@ -160,6 +170,10 @@ def main():
         print(f"\n自检: {'✅ 检验流程正确(效应量与显著性都回收)' if ok else '❌ 流程有问题'}")
         return 0 if ok else 1
 
+    excl = {int(x) for x in a.exclude.replace(" ", "").split(",") if x}
+    if excl:
+        print(f"⚠ **事后剔除集号 {sorted(excl)}**（从所有臂同时剔除以保持配对对齐）。"
+              f"\n   事前剔除规则只有 --min-frames；报告时必须与未剔除的数字并列。\n")
     root = ROOT / a.root
     man = json.loads((ROOT / f"outputs/p2_labels/{a.task}-deploy/manifest.json").read_text())
     R = np.array(man["R"], np.float32)
@@ -167,7 +181,7 @@ def main():
     rend = IdealChunkRenderer()
     E, S = {}, {}
     for arm in arms:
-        fs = arm_episodes(root, arm, a.min_frames, a.n)
+        fs = arm_episodes(root, arm, a.min_frames, a.n, excl)
         assert fs, f"未找到 {root}/{arm}_ep*.json (或全部短于 {a.min_frames} 帧)"
         rs = [load_run(f, R, rend) for f in fs]
         E[arm] = [r["energy"] / r["n"] for r in rs]            # 每帧能量(消除长度差)
@@ -181,7 +195,7 @@ def main():
         print(f"  ⚠ 各臂集数不等 {[len(E[x]) for x in arms]} ⇒ 配对截断到最短")
     res = report(E, a.task, arms)
     (root / "ab_result.json").write_text(json.dumps(
-        {"arms": list(arms),
+        {"arms": list(arms), "excluded_episodes": sorted(excl),
          "per_arm_energy": {k: list(map(float, v)) for k, v in E.items()},
          "per_arm_summary": {k: [r["summary"] for r in S[k]] for k in arms},
          "tests": res}, indent=1))
