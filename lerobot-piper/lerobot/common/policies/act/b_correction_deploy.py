@@ -15,6 +15,8 @@
     A 裸 ACT:      不设 BCORR_CKPT（或 BCORR_MODE=off）
     B 逆算前馈:    BCORR_CKPT=<ckpt> BCORR_MODE=ff      （FF1/2, 指导教員的逆算案对照臂）
     C 本方法:      BCORR_CKPT=<ckpt> BCORR_MODE=full    （π 实时校正）
+    C' G-2 预测墙:  BCORR_CKPT=<pi_g2wall_v1.json> BCORR_MODE=g2wall
+                   （`pi-g2wall-v1`, 自由参数 **0**; **不读 IMU**、**不含 FF**）
     诊断:          BCORR_MODE=pi_only（π 但不含 FF）/ record（只落盘特征不施加）
 
 安全（方案 C, 用户 2026-07-15 选定）:
@@ -57,7 +59,7 @@ from lerobot.common.policies.act.step1_correction_runtime import (
 _MDEG_TO_RAD = math.pi / 180.0 / 1000.0
 _GRIP_SCALE = 1.0 / 800000.0        # 与 refine_deploy 一致
 MODES = ("off", "ff", "pi_only", "full", "record", "probe",
-         "step1_b", "step1_c", "step1_v2")
+         "step1_b", "step1_c", "step1_v2", "g2wall")
 
 
 PROBE_N = 2000                   # 100 s @20Hz —— 覆盖 30 s 一集, 正常不会绕回
@@ -129,8 +131,11 @@ class BCorrectionDeployWrapper:
         self.use_step1 = mode in ("step1_b", "step1_c")
         # v2: 接缝脉冲, **不读 IMU、不用任何模型**(PREREG_STEP1_V2.md)
         self.use_seam = mode == "step1_v2"
+        # g2wall: **G-2 预测墙 + H 解析求解**(pi-g2wall-v1, 自由参数 0)。
+        # **不读 IMU**(纯前馈: 只吃本 chunk 的 ACT 指令)、**不含 FF**(用户 2026-09-15)。
+        self.use_g2wall = mode == "g2wall"
         self.apply_delta = mode in ("full", "pi_only", "probe", "step1_b", "step1_c",
-                                    "step1_v2")
+                                    "step1_v2", "g2wall")
         self.use_ff = mode in ("full", "ff")
         # probe: 外生激励, **不读 IMU、不经 π** —— 序列由种子完全决定
         # **逐集换 seed**(PREREG_STEP1.md §8): 旧实现整批只有 1 个噪声实现 ——
@@ -167,7 +172,47 @@ class BCorrectionDeployWrapper:
             self._artifact_sha256 = hashlib.sha256(Path(pi_ckpt).read_bytes()).hexdigest()
         else:
             self._artifact_sha256 = None
-        self.renderer = IdealChunkRenderer() if (self.use_pi or self.use_step1) else None
+
+        # ── g2wall: 启动期校验冻结件(H sha / G-2 W sha / 求解器常量) ──────────
+        # 校验失败在这里**抛**(还没上机, 早失败好); 运行中的异常一律 δa 置零并记录。
+        self.g2w = None
+        if self.use_g2wall:
+            from lerobot.common.policies.act.g2wall_runtime import G2WallRuntime
+            if not pi_ckpt:
+                raise ValueError("g2wall 需要 manifest: 设 BCORR_CKPT=…/pi_g2wall_v1.json")
+            self.g2w = G2WallRuntime(pi_ckpt, R, b, verbose=verbose)
+            self._artifact_sha256 = hashlib.sha256(Path(pi_ckpt).read_bytes()).hexdigest()
+            # 标定差异只**报告**不阻拦: 冻结评价用的是 step1_H_v1 里的标定(pp2a-deploy),
+            # 而部署应当用**当日本会话**的标定。已实测重拟 R 救不回换会话的损失
+            # (ab2: 26.3% → 25.4%, 两 R 差 4.8° 属正常绑带漂移) ⇒ 这是泛化问题。
+            try:
+                frozen_R = np.asarray(json.loads(
+                    (Path(__file__).resolve().parents[4]
+                     / "outputs/step1_H/step1_H_v1.json").read_text()
+                )["calibration"]["R"], np.float64)
+                ang = np.degrees(np.arccos(np.clip(
+                    (np.trace(frozen_R.T @ np.asarray(R, np.float64)) - 1) / 2, -1, 1)))
+                self._calib_delta_deg = float(ang)
+                if verbose:
+                    print(f"[g2wall] 本次标定 R 与冻结评价所用 R 相差 **{ang:.2f}°** "
+                          f"（只报告不阻拦；换会话的损失**不是**标定问题）")
+            except Exception as exc:
+                self._calib_delta_deg = None
+                if verbose:
+                    print(f"[g2wall] ⚠ 标定比对跳过: {type(exc).__name__}: {exc}")
+            # **进程卸载**(默认开): G-2 与 ideal 渲染都是持 GIL 的逐帧 Python 循环,
+            # 放线程里会把 chunk 边界附近的帧顶到 59.7-63.2 ms(门禁 60)。换进程后
+            # 主进程只剩 pickle 几 KB + 逐帧 0.15 ms 求解。spawn 而非 fork(CUDA)。
+            self._g2w_pool = None
+            if os.environ.get("BCORR_G2WALL_PROC", "1") != "0":
+                from lerobot.common.policies.act.g2wall_runtime import make_worker_pool
+                self._g2w_pool = make_worker_pool(pi_ckpt, R, b,
+                                                  self.g2w.prefix, self.g2w.n_a)
+                if verbose and self._g2w_pool is not None:
+                    print(f"[g2wall] 进程卸载 **开**（stage A/B 在子进程，不抢主线程 GIL）")
+
+        self.renderer = (IdealChunkRenderer()
+                         if (self.use_pi or self.use_step1 or self.use_g2wall) else None)
         # ── chunk 渲染移出 20 Hz 关键路径（2026-09-14）─────────────────────
         # 原先 render 同步跑在 chunk 边界那一帧上，与 ACT 推理/FF/plan 挤同一个
         # 50 ms 预算。实测 MuJoCo **释放 GIL**（后台渲染时主线程只多 3 ms/202 ms），
@@ -175,6 +220,12 @@ class BCorrectionDeployWrapper:
         from concurrent.futures import ThreadPoolExecutor
         self._render_pool = ThreadPoolExecutor(max_workers=1) if self.renderer else None
         self._pending = None            # (future, cmd) 或 None
+        # g2wall 是**两段式**: A(渲 ideal + G-2 头段) 先落地, B(整 chunk) 随后回填。
+        # 两段都在同一个单 worker 池上排队, 天然保证 A 先于 B。
+        self.g2wall_defer = int(os.environ.get("BCORR_G2WALL_DEFER", 1))
+        self._g2w_submit = None         # (cmd, prev) 待提交的 stage A
+        self._pending_a = None          # (future, t0) 或 None —— 返回 ideal
+        self._pending_b = None          # (future, t0) 或 None
         self._frame_t = None            # 上一帧的墙钟, 用于帧间隔统计
         self.asm = FeatureAssembler(R, b, L=lag) if self.use_pi else None
         self.ff_lag, self.ff_blend = ff_lag, ff_blend
@@ -188,6 +239,7 @@ class BCorrectionDeployWrapper:
                       "da_abs_sum": 0.0, "render_ms": [], "infer_ms": [],
                       "plan_ms": []}
         self._last_step1_frame: Step1Frame | None = None
+        self._last_g2w_frame = None
         self._log = [] if log_path else None
         self._chunks = [] if log_path else None
         self.log_path = Path(log_path) if log_path else None
@@ -198,6 +250,7 @@ class BCorrectionDeployWrapper:
                   f"ff={'on' if self.use_ff else 'off'} "
                   f"step1={'B' if mode == 'step1_b' else ('C' if mode == 'step1_c' else 'off')}"
                   + (" seam=on(v2: 运行时不读 IMU)" if self.use_seam else "")
+                  + (" g2wall=on(**不读 IMU**, 纯前馈; FF 不在本线)" if self.use_g2wall else "")
                   + (f" probe: {len(self.probe_seeds)} seeds "
                      f"{self.probe_seeds[:4]}{'…' if len(self.probe_seeds) > 4 else ''} "
                      f"@{self.probe_mrad:g}mrad" if self.probe is not None else ""))
@@ -252,7 +305,12 @@ class BCorrectionDeployWrapper:
         if self.step1 is not None:
             # 与是否开日志无关：z/HP/H 历史绝不能跨 episode 继承。
             self.step1.reset()
+        if self.g2w is not None:
+            # resp(已提交 δa 的未来响应)与热身前缀绝不能跨 episode 继承。
+            self.g2w.reset()
+        self._pending_a = self._pending_b = self._g2w_submit = None
         self._last_step1_frame = None
+        self._last_g2w_frame = None
 
     def to(self, device):
         self.act.to(device)
@@ -299,6 +357,21 @@ class BCorrectionDeployWrapper:
             t0 = time.perf_counter()
             fut = self._render_pool.submit(self.renderer.render, cmd, prev)
             self._pending = (fut, cmd, t0)
+
+        if self.use_g2wall:
+            # 同步只做便宜的三件事(建计划 / 接触门控 / 帧号归零)。
+            # ⚠ 帧号必须**此刻**归零: 后台没落地的那几帧 `step()` 仍照常推进 `_k`,
+            #   若等 stage A 落地再归零, 空档帧会被当成 chunk 内偏移 ⇒ δa 整条错位。
+            self.g2w.begin_chunk(cmd)
+            prev = None if self._prev_tail is None else self._prev_tail.copy()
+            # ⚠ **不在本帧提交** stage A。后台的 G-2 前向是持 GIL 的 Python 循环
+            # （`kin_gyro_fs`/`_sim` 逐帧调 mujoco），会**抢主线程时间** —— 而
+            # chunk 边界这一帧恰好最忙（ACT 推理在这里）。实测 ACT=40 ms 时
+            # 该帧到 **63.2 ms**，超 60 ms 门禁（`sim/smoke_g2wall.py` 检 5b）。
+            # 推迟 `g2wall_defer` 帧提交：空档不增（提交晚 1 帧但落地仍在同一帧），
+            # 却把争抢挪到只做 0.14 ms 求解的空闲帧上。
+            self._g2w_submit = (cmd, prev)
+            self._pending_a = self._pending_b = None
 
         self._chunk_raw = cmd
         self._prev_tail = cmd.copy()
@@ -363,6 +436,63 @@ class BCorrectionDeployWrapper:
             return np.zeros(6, np.float32)
         return frame.delta
 
+    def _submit_g2wall(self) -> None:
+        """到点后把 stage A 递给后台（推迟 `g2wall_defer` 帧，见 `_new_chunk` 的注释）。"""
+        if self._g2w_submit is None or self.g2w._k < self.g2wall_defer:
+            return
+        cmd, prev = self._g2w_submit
+        self._g2w_submit = None
+        t0 = time.perf_counter()
+        if self._g2w_pool is not None:
+            from lerobot.common.policies.act.g2wall_runtime import _worker_build
+            pre = self.g2w._prefix
+            self._pending_a = (self._g2w_pool.submit(
+                _worker_build, cmd, prev, pre, min(self.g2w.n_a, len(cmd))), t0, cmd, prev, pre)
+        else:
+            def _stage_a(c=cmd, pv=prev):
+                ideal = self.renderer.render(c, pv)  # 必须**整 chunk**(filtfilt 非因果)
+                self.g2w.fill_stage_a(ideal)
+                return ideal
+            self._pending_a = (self._render_pool.submit(_stage_a), t0)
+
+    def _drain_g2wall(self) -> None:
+        """非阻塞收割两段后台。**不返回 waiting** —— g2wall 空档期靠 `serve_to=0`
+        让 `step()` 自然输出 0，同时照常推进 `_k` 与 `resp`。"""
+        if self._pending_a is not None and self._pending_a[0].done():
+            fut, t0 = self._pending_a[0], self._pending_a[1]
+            self.stats["render_ms"].append((time.perf_counter() - t0) * 1e3)
+            try:
+                if self._g2w_pool is not None:
+                    from lerobot.common.policies.act.g2wall_runtime import (
+                        _worker_build, apply_stage)
+                    e0, m = fut.result()
+                    apply_stage(self.g2w, e0, m, "A")
+                    _, _, cmd, prev, pre = self._pending_a
+                    self._pending_b = (self._g2w_pool.submit(
+                        _worker_build, cmd, prev, pre, len(cmd)), time.perf_counter())
+                else:
+                    ideal = fut.result()
+                    self._pending_b = (self._render_pool.submit(
+                        self.g2w.fill_stage_b, ideal), time.perf_counter())
+            except Exception as exc:                       # 运行中**不抛**
+                self.stats["nan"] += 1
+                if self.verbose:
+                    print(f"[g2wall] ⚠ stage A 后台任务异常 → 本 chunk δa 保持 0: "
+                          f"{type(exc).__name__}: {exc}")
+            self._pending_a = None
+        if self._pending_b is not None and self._pending_b[0].done():
+            try:
+                r = self._pending_b[0].result()
+                if self._g2w_pool is not None:
+                    from lerobot.common.policies.act.g2wall_runtime import apply_stage
+                    apply_stage(self.g2w, r[0], r[1], "B")
+            except Exception as exc:
+                self.stats["nan"] += 1
+                if self.verbose:
+                    print(f"[g2wall] ⚠ stage B 后台任务异常 → 沿用 stage A: "
+                          f"{type(exc).__name__}: {exc}")
+            self._pending_b = None
+
     def _drain_pending(self) -> bool:
         """后台 ideal 就绪则装配。→ 是否**仍在等待**（等待中 δa 必须置零）。"""
         if self._pending is None:
@@ -412,6 +542,19 @@ class BCorrectionDeployWrapper:
             da = self.seam.step()
             a = a.clone()
             a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)
+        elif self.use_g2wall:
+            # 纯前馈: **不读 IMU**。每帧都必须调 step() —— 空档期它输出 0 但会
+            # 推进 `_k` 与 `resp`(已提交 δa 的未来响应), 少调一次整条就错位。
+            self._submit_g2wall()
+            self._drain_g2wall()
+            fr = self.g2w.step()
+            self._last_g2w_frame = fr
+            da = fr.delta
+            if fr.stage == "none":
+                self.stats["g2w_blackout"] = self.stats.get("g2w_blackout", 0) + 1
+            if self.apply_delta and np.any(da):
+                a = a.clone()
+                a[0, :6] = a[0, :6] + torch.from_numpy(da).to(a.device)     # 夹爪不动
         elif self.use_pi or self.use_step1:
             # 后台 ideal 未就绪 ⇒ δa 置零（保守）。渲染实测 30 ms，故通常只影响
             # 每个 chunk 的头 1 帧；这一帧由 FF 的 blend 覆盖，不留空档。
@@ -430,6 +573,13 @@ class BCorrectionDeployWrapper:
                 "a": a[0].detach().cpu().numpy().tolist(),
                 "imu": imu.detach().cpu().numpy().reshape(-1).tolist() if imu is not None else None,
                 "state": batch["observation.state"].detach().cpu().numpy().reshape(-1).tolist()}
+            if self._last_g2w_frame is not None:
+                gf = self._last_g2w_frame
+                row.update({"g2w_stage": gf.stage, "g2w_k": gf.k,
+                            "g2w_horizon": gf.horizon,
+                            "g2w_contact": gf.contact_gated,
+                            "g2w_sat": gf.saturated,
+                            "e0hat": None if gf.e0hat is None else gf.e0hat.tolist()})
             if self._last_step1_frame is not None:
                 sf = self._last_step1_frame
                 row.update({
@@ -484,6 +634,15 @@ class BCorrectionDeployWrapper:
                 "artifact_sha256": self._artifact_sha256}
         if self.step1 is not None:
             out["step1"] = self.step1.summary()
+        if self.g2w is not None:
+            out["g2wall"] = self.g2w.summary()
+            out["g2wall"]["blackout_frames"] = int(s.get("g2w_blackout", 0))
+            out["g2wall"]["blackout_pct"] = 100.0 * s.get("g2w_blackout", 0) / n
+            out["g2wall"]["calib_delta_deg"] = getattr(self, "_calib_delta_deg", None)
+            out["g2wall"]["defer_frames"] = self.g2wall_defer
+            out["g2wall"]["process_offload"] = self._g2w_pool is not None
+            out["g2wall"]["stage_a_wall_ms_max"] = (
+                float(max(s["render_ms"])) if s["render_ms"] else 0.0)
         return out
 
     def _flush(self):

@@ -311,8 +311,25 @@ class G2WallRuntime:
                       "frames_stage_a": 0, "frames_stage_b": 0}
 
     # ---- chunk 装配 ----
-    def _build(self, cmd_raw: np.ndarray, ideal: np.ndarray, n_head: int) -> tuple:
-        """→ (ê₀[0:n_head], 有效长度)。`ideal` 已是标定后的传感器系角速度 (≥n_head,3)。"""
+    @staticmethod
+    def _ideal3(ideal: np.ndarray, R, b) -> np.ndarray:
+        """渲染器的**原始** (T,6) 仿真 IMU → 标定后的传感器系角速度 (T,3)。
+
+        ⚠ 入参统一收在这里：`IdealChunkRenderer.render` 返回的是未标定的 (T,6)，
+        而 ê₀ 要的是标定后的 3 轴角速度。第一版让调用方自己转，结果部署 wrapper
+        直接把 (T,6) 递了进来 ⇒ 每个 chunk 的 stage A/B 都 broadcast 失败、
+        全程 δa=0（由 `sim/smoke_g2wall.py` 检 6c 抓出：接触门控 0% vs 离线 17%）。
+        """
+        arr = np.asarray(ideal)
+        if arr.ndim != 2 or arr.shape[1] not in (3, 6):
+            raise ValueError(f"ideal 形状应为 (T,6) 原始或 (T,3) 已标定, 实为 {arr.shape}")
+        if arr.shape[1] == 3:
+            return arr.astype(float)
+        return calibrate_ideal_imu(arr.astype(np.float32), R, b)[:, 3:6].astype(float)
+
+    def _build(self, cmd_raw: np.ndarray, ideal_in: np.ndarray, n_head: int) -> tuple:
+        """→ (ê₀[0:n_head], 有效长度)。`ideal_in` = 渲染器的原始 (T,6) 或已标定 (T,3)。"""
+        ideal = self._ideal3(ideal_in, self.R, self.b)
         cmd = np.asarray(cmd_raw, float)
         head = cmd[:n_head]
         pre = self._prefix if self._prefix is not None else np.zeros((0, 7))
@@ -463,3 +480,91 @@ class G2WallRuntime:
 
 __all__ = ["G2WallRuntime", "G2WallFrame", "G2WallError", "install_model_cache",
            "ALIGN_L", "M", "N_LAGS", "EPS", "PREFIX", "N_A", "W_A", "TAIL_GUARD"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 进程卸载：把 stage A/B 整个搬出主进程的 GIL
+# ════════════════════════════════════════════════════════════════════════════
+# 为什么必须换进程而不是线程
+# --------------------------
+# G-2 的前向是**持 GIL 的 Python 逐帧循环**（`kin_gyro_fs` 对每帧调 `mj_forward`，
+# `_sim` 的伺服 rollout 同理），`IdealChunkRenderer` 也一样。实测两条放在两个线程里
+# **并行毫无收益**（131 ms vs 串行 136 ms）⇒ 它们确实在抢同一个 GIL。
+#
+# 后果是主线程被拖慢：`sim/smoke_g2wall.py` 检 5 实测，线程方案下 chunk 边界附近
+# 会出现 **59.7–63.2 ms** 的帧（门禁 60 ms），且随机器负载漂移 —— 真机上还要叠
+# 相机采集与机器人通信，这个余量守不住。
+#
+# 换进程后主进程只剩「pickle 几 KB + 逐帧 0.15 ms 求解」，与 G-2 的耗时完全解耦。
+#
+# ⚠ **必须 spawn 不能 fork**：主进程里 ACT 已经初始化了 CUDA，fork 会带崩子进程。
+_W: "G2WallRuntime | None" = None
+_WREND = None
+
+
+def _worker_init(manifest: str, R: list, b: list, prefix: int, n_a: int) -> None:
+    # ⚠ **必须 gc.disable()**：本仓已记录 mujoco+scipy 同进程时 GC 会段错误，
+    # 而子进程里崩溃**连输出都吞掉**，表现为父进程无声卡死 —— 第一版漏了这一句，
+    # 子进程就是这么挂住 670 s 的。
+    import gc as _gc
+    _gc.disable()
+    import faulthandler as _fh, sys as _sys
+    _fh.enable(file=_sys.stderr)              # 真崩了至少留个栈
+    global _W, _WREND
+    import numpy as _np
+    from lerobot.common.policies.act.b_runtime import IdealChunkRenderer
+    _W = G2WallRuntime(manifest, _np.asarray(R, _np.float32), _np.asarray(b, _np.float32),
+                       verbose=False, prefix=prefix, n_a=n_a)
+    _WREND = IdealChunkRenderer()
+    _WREND.render(_np.zeros((8, 7), _np.float32), None)     # 预热，别让第一个 chunk 付
+
+
+def _worker_build(cmd, prev, prefix_cmds, n_head):
+    """子进程：渲 ideal（整 chunk）+ 跑 G-2 → `(ê₀, 有效长度)`。"""
+    import numpy as _np
+    ideal = _WREND.render(_np.asarray(cmd, _np.float32),
+                          None if prev is None else _np.asarray(prev, _np.float32))
+    _W._prefix = None if prefix_cmds is None else _np.asarray(prefix_cmds, float)
+    return _W._build(cmd, ideal, int(n_head))
+
+
+def make_worker_pool(manifest, R, b, prefix: int, n_a: int, timeout: float = 60.0):
+    """→ `ProcessPoolExecutor(1)`（已初始化并预热）；失败返回 `None` 由调用方退回线程。"""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    import numpy as _np
+    try:
+        pool = ProcessPoolExecutor(
+            max_workers=1, mp_context=mp.get_context("spawn"),
+            initializer=_worker_init,
+            initargs=(str(manifest), _np.asarray(R).tolist(), _np.asarray(b).tolist(),
+                      int(prefix), int(n_a)))
+        # 真跑一发，确认子进程起得来、数值路径通
+        e0, m = pool.submit(_worker_build, _np.zeros((32, 7)), None, None, 32).result(timeout)
+        if _np.asarray(e0).shape != (32, 3) or m != 32:
+            raise RuntimeError(f"子进程自检返回异常: {_np.asarray(e0).shape}, {m}")
+        return pool
+    except BaseException as exc:      # 含 TimeoutError 与子进程崩溃 —— 一律别卡住
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        print(f"[g2wall] ⚠ 进程池起不来({type(exc).__name__}: {exc}) → 退回线程池。"
+              f"**帧时余量会变薄**，请看冒烟的 frame_ms 门禁。")
+        return None
+
+
+def apply_stage(rt: "G2WallRuntime", e0, m: int, stage: str) -> None:
+    """把子进程算好的 ê₀ 装进当前计划（主进程侧，只做赋值，微秒级）。"""
+    plan = rt._plan
+    if plan is None:
+        return
+    m = int(min(m, plan.T))
+    plan.e0hat[:m] = np.asarray(e0)[:m]
+    plan.valid_to = max(plan.valid_to, m)
+    plan.serve_to = max(plan.serve_to,
+                        min(rt.w_a, plan.T) if stage == "A" else m)
+    plan.stage = stage
+
+
+__all__ += ["make_worker_pool", "apply_stage", "_worker_build", "_worker_init"]
