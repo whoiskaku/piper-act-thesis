@@ -113,7 +113,7 @@ x = blk(ax, cur, YC, .066, H, "δa", "", "out")
 shape(ax, cur + .033, YC, "100 × 6"); cur = x
 arrow(ax, cur, cur + G, YC + H / 2); cur += G
 
-blk(ax, cur, YC, .088, H, "接触门控", "+ 硬限幅", "safe", ls="--")
+blk(ax, cur, YC, .088, H, "硬限幅", "|δa| ≤ ε", "safe", ls="--")
 
 # ── 输入构成 ───────────────────────────────────────────
 yb, hb = .155, .046
@@ -142,7 +142,7 @@ for i, (k, t) in enumerate([("learn", "可学习层（共 68,806 参数）"),
 fig.text(.010, .020,
          "图 1  补正网络 π 的结构。整段 chunk 的指令在其起始时刻即已全部已知，"
          "故 chunk 内的双向卷积不违反因果性（非 TCN: 对称填充、无残差）。\n"
-         "         幅值上界 ε 由 tanh 结构性保证；接触门控与硬限幅置于网络之外，不交由网络保证。"
+         "         幅值上界 ε 由 tanh 结构性保证，网络外再限幅一次作为冗余保护。"
          "单次前向 0.83 ms，每 chunk 只调用一次，因而补正自 chunk 首帧即可施加。",
          ha="left", va="bottom", fontsize=7.9, color="#333333", linespacing=1.55)
 
