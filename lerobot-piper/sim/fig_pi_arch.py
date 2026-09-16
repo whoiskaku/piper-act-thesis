@@ -40,6 +40,19 @@ GRY = "#6c757d"
 YC, H, G = .50, .28, .019                  # 主行底边 / 高度 / 常规间隙
 
 
+def stack(ax, x, y, w, h, top, bot, kind, n=3, off=.0075):
+    """重复层收成「叠层」块 —— 4 个只差一个数字的方框是视觉冗余。"""
+    ec, fc = C[kind]
+    for i in range(n - 1, 0, -1):
+        ax.add_patch(Rectangle((x + i * off, y + i * off * 2.2), w, h,
+                               fc=fc, ec=ec, lw=0.9, alpha=.55))
+    ax.add_patch(Rectangle((x, y), w, h, fc=fc, ec=ec, lw=1.3))
+    ax.text(x + w / 2, y + h / 2 + .034, top, ha="center", va="center", fontsize=8.4)
+    ax.text(x + w / 2, y + h / 2 - .034, bot, ha="center", va="center",
+            fontsize=7.8, color=ec)
+    return x + w + (n - 1) * off
+
+
 def blk(ax, x, y, w, h, top, bot, kind, ls="-"):
     ec, fc = C[kind]
     ax.add_patch(Rectangle((x, y), w, h, fc=fc, ec=ec, lw=1.2, ls=ls))
@@ -65,7 +78,7 @@ def arrow(ax, x0, x1, y, txt=""):
                 fontsize=7.4, color=GRY)
 
 
-fig, ax = plt.subplots(figsize=(12.6, 3.9))
+fig, ax = plt.subplots(figsize=(10.6, 3.9))
 ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
 cur = .018
 
@@ -74,15 +87,17 @@ shape(ax, cur + .033, YC, "21 × 200"); cur = x
 arrow(ax, cur, cur + G, YC + H / 2); cur += G
 
 xs0 = cur
-for d in (1, 2, 4, 8):
-    x = blk(ax, cur, YC, .086, H, "Conv1d  k=5", f"dilation {d}", "learn")
-    shape(ax, cur + .043, YC, "64 × 200"); cur = x
-    arrow(ax, cur, cur + G, YC + H / 2); cur += G
-xs1 = cur - G
+x = stack(ax, cur, YC, .215, H, "空洞卷积 × 4     k = 5,  64 ch",
+          "dilation = 1, 2, 4, 8", "learn")
+shape(ax, cur + .1075, YC, "64 × 200")
+xs1 = x
+cur = x
+arrow(ax, cur, cur + G, YC + H / 2); cur += G
 
 ax.annotate("", xy=(xs0, YC - .098), xytext=(xs1, YC - .098),
             arrowprops=dict(arrowstyle="|-|", lw=0.8, color=GRY, shrinkA=0, shrinkB=0))
-ax.text((xs0 + xs1) / 2, YC - .132, "感受野 61 帧（3.05 s）",
+ax.text((xs0 + xs1) / 2, YC - .132,
+        "感受野 61 帧（3.05 s）· 对称填充，chunk 内双向 · 无残差",
         ha="center", va="top", fontsize=7.8, color=GRY)
 
 x = blk(ax, cur, YC, .078, H, "Conv1d  1×1", "64 → 6", "learn")
@@ -113,12 +128,12 @@ ax.text(.096, yb + hb / 2,
         ha="left", va="center", fontsize=7.8, color=GRY)
 
 # ── 图例 ──────────────────────────────────────────────
-lx, ly, lw, lh = .565, yb - .004, .026, .030
+lx, ly, lw, lh = .500, yb - .004, .026, .030
 for i, (k, t) in enumerate([("learn", "可学习层（共 68,806 参数）"),
                             ("fixed", "固定算子（无参数）"),
                             ("safe", "网络外的安全约束")]):
     ec, fc = C[k]
-    xx = lx + i * .148
+    xx = lx + i * .172
     ax.add_patch(Rectangle((xx, ly), lw, lh, fc=fc, ec=ec, lw=1.0,
                            ls="--" if k == "safe" else "-"))
     ax.text(xx + lw + .008, ly + lh / 2, t, ha="left", va="center",
@@ -126,8 +141,8 @@ for i, (k, t) in enumerate([("learn", "可学习层（共 68,806 参数）"),
 
 fig.text(.010, .020,
          "图 1  补正网络 π 的结构。整段 chunk 的指令在其起始时刻即已全部已知，"
-         "故 chunk 内的双向卷积不违反因果性。幅值上界 ε 由 tanh 结构性保证；\n"
-         "         接触门控与硬限幅置于网络之外，不交由网络保证。"
+         "故 chunk 内的双向卷积不违反因果性（非 TCN: 对称填充、无残差）。\n"
+         "         幅值上界 ε 由 tanh 结构性保证；接触门控与硬限幅置于网络之外，不交由网络保证。"
          "单次前向 0.83 ms，每 chunk 只调用一次，因而补正自 chunk 首帧即可施加。",
          ha="left", va="bottom", fontsize=7.9, color="#333333", linespacing=1.55)
 
