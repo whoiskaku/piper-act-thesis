@@ -78,18 +78,17 @@ def arrow(ax, x0, x1, y, txt=""):
                 fontsize=7.4, color=GRY)
 
 
-fig, ax = plt.subplots(figsize=(9.8, 3.9))
+fig, ax = plt.subplots(figsize=(9.4, 3.5))
 ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
 cur = .018
 
-x = blk(ax, cur, YC, .066, H, "指令序列", "", "data")
-shape(ax, cur + .033, YC, "21 × 200"); cur = x
+x = blk(ax, cur, YC, .082, H, "ACT 指令", "", "data")
+shape(ax, cur + .041, YC, "6 × 100"); cur = x
 arrow(ax, cur, cur + G, YC + H / 2); cur += G
 
 xs0 = cur
 x = stack(ax, cur, YC, .215, H, "空洞卷积 × 4     k = 5,  64 ch",
           "dilation = 1, 2, 4, 8", "learn")
-shape(ax, cur + .1075, YC, "64 × 200")
 xs1 = x
 cur = x
 arrow(ax, cur, cur + G, YC + H / 2); cur += G
@@ -99,33 +98,22 @@ ax.annotate("", xy=(xs0, YC - .098), xytext=(xs1, YC - .098),
 ax.text((xs0 + xs1) / 2, YC - .132,
         "感受野 61 帧（3.05 s）· 对称填充，chunk 内双向 · 无残差",
         ha="center", va="top", fontsize=7.8, color=GRY)
+ax.text((xs0 + xs1) / 2, YC - .190, "（网络实际输入另含上一 chunk 与一、二阶差分）",
+        ha="center", va="top", fontsize=7.2, color=GRY, style="italic")
 
-x = blk(ax, cur, YC, .078, H, "Conv1d  1×1", "64 → 6", "learn")
-shape(ax, cur + .039, YC, "6 × 200"); cur = x
-GW = .062                                  # 该处要放标注, 间隙加宽
-arrow(ax, cur, cur + GW, YC + H / 2, "裁剪：取末 100 帧"); cur += GW
+x = blk(ax, cur, YC, .078, H, "Conv1d  1×1", "→ 6 通道", "learn")
+cur = x
+arrow(ax, cur, cur + G, YC + H / 2); cur += G
 
 x = blk(ax, cur, YC, .074, H, "tanh × ε", "ε = 10 mrad", "fixed")
-shape(ax, cur + .037, YC, "6 × 100"); cur = x
+cur = x
 arrow(ax, cur, cur + G, YC + H / 2); cur += G
 
 x = blk(ax, cur, YC, .066, H, "δa", "", "out")
 shape(ax, cur + .033, YC, "100 × 6"); cur = x
 
-# ── 输入构成 ───────────────────────────────────────────
-yb, hb = .155, .046
-ec_d, fc_d = C["data"]
-ax.add_patch(Rectangle((.018, yb), .033, hb, fc="white", ec=ec_d, lw=0.8))
-ax.add_patch(Rectangle((.051, yb), .033, hb, fc=fc_d, ec=ec_d, lw=0.8))
-ax.text(.018, yb - .026, "上一段", ha="left", va="top", fontsize=7.4, color=GRY)
-ax.text(.084, yb - .026, "本段", ha="right", va="top", fontsize=7.4, color=GRY)
-ax.plot([.051, .051], [yb + hb + .010, YC - .058], ls=":", lw=0.7, color=GRY)
-ax.text(.096, yb + hb / 2,
-        "每帧 7 维（6 关节 + 夹爪）→ [ 去偏置指令, 一阶差分, 二阶差分 ] = 21 通道",
-        ha="left", va="center", fontsize=7.8, color=GRY)
-
 # ── 图例 ──────────────────────────────────────────────
-lx, ly, lw, lh = .560, yb - .004, .026, .030
+lx, ly, lw, lh = .560, .150, .026, .030
 for i, (k, t) in enumerate([("learn", "可学习层（共 68,806 参数）"),
                             ("fixed", "固定算子（无参数）")]):
     ec, fc = C[k]
