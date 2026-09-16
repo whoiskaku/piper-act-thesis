@@ -78,7 +78,7 @@ def arrow(ax, x0, x1, y, txt=""):
                 fontsize=7.4, color=GRY)
 
 
-fig, ax = plt.subplots(figsize=(10.6, 3.9))
+fig, ax = plt.subplots(figsize=(9.8, 3.9))
 ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
 cur = .018
 
@@ -111,9 +111,6 @@ arrow(ax, cur, cur + G, YC + H / 2); cur += G
 
 x = blk(ax, cur, YC, .066, H, "δa", "", "out")
 shape(ax, cur + .033, YC, "100 × 6"); cur = x
-arrow(ax, cur, cur + G, YC + H / 2); cur += G
-
-blk(ax, cur, YC, .088, H, "硬限幅", "|δa| ≤ ε", "safe", ls="--")
 
 # ── 输入构成 ───────────────────────────────────────────
 yb, hb = .155, .046
@@ -128,21 +125,19 @@ ax.text(.096, yb + hb / 2,
         ha="left", va="center", fontsize=7.8, color=GRY)
 
 # ── 图例 ──────────────────────────────────────────────
-lx, ly, lw, lh = .500, yb - .004, .026, .030
+lx, ly, lw, lh = .560, yb - .004, .026, .030
 for i, (k, t) in enumerate([("learn", "可学习层（共 68,806 参数）"),
-                            ("fixed", "固定算子（无参数）"),
-                            ("safe", "网络外的安全约束")]):
+                            ("fixed", "固定算子（无参数）")]):
     ec, fc = C[k]
     xx = lx + i * .172
-    ax.add_patch(Rectangle((xx, ly), lw, lh, fc=fc, ec=ec, lw=1.0,
-                           ls="--" if k == "safe" else "-"))
+    ax.add_patch(Rectangle((xx, ly), lw, lh, fc=fc, ec=ec, lw=1.0))
     ax.text(xx + lw + .008, ly + lh / 2, t, ha="left", va="center",
             fontsize=7.4, color="#333333")
 
 fig.text(.010, .020,
          "图 1  补正网络 π 的结构。整段 chunk 的指令在其起始时刻即已全部已知，"
          "故 chunk 内的双向卷积不违反因果性（非 TCN: 对称填充、无残差）。\n"
-         "         幅值上界 ε 由 tanh 结构性保证，网络外再限幅一次作为冗余保护。"
+         "         幅值上界 ε = 10 mrad 由 tanh 结构性保证。"
          "单次前向 0.83 ms，每 chunk 只调用一次，因而补正自 chunk 首帧即可施加。",
          ha="left", va="bottom", fontsize=7.9, color="#333333", linespacing=1.55)
 
