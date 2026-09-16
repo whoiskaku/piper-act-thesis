@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""π 网络结构图（论文风格，单联）→ `outputs/p2_pi/fig_pi_arch.{png,pdf}`
+"""π 网络结构图（论文风格）→ `outputs/p2_pi/fig_pi_arch.{png,pdf}`
 
 设计取向
 --------
-横向数据流；框内**只标层类型与张量维度**，不写说明文字；
-配色收敛到一个灰阶 + 一个强调色；说明放图注，不放框里。
-（三种训练目标的对比属于正文表格，不进结构图。）
+- **颜色编码功能类别**（数据 / 可学习层 / 固定算子 / 网络外的安全约束），不做装饰性配色；
+  取色盲友好的 Okabe–Ito 系。
+- 横向数据流；框内只写层类型，**层间标出张量维度**；说明进图注，不进框。
+- 带图例，使颜色的含义自明。
 
 ⚠ matplotlib **不解析 markdown** —— 正文里写星号强调会被原样画出来。
 
@@ -26,75 +27,111 @@ plt.rcParams.update({
 })
 
 OUT = Path(__file__).resolve().parents[1] / "outputs/p2_pi"
-ACC, GRY, LGY, EC = "#2f6f9f", "#8c8c8c", "#e8eaed", "#333333"
+
+# Okabe–Ito（色盲友好）；每类一个边色 + 对应浅底
+C = {
+    "data":  ("#333333", "#e9ecef"),   # 数据张量
+    "learn": ("#0072B2", "#d6e6f2"),   # 可学习层
+    "fixed": ("#009E73", "#d6efe6"),   # 固定算子（无参数）
+    "out":   ("#E69F00", "#fbecd2"),   # 输出
+    "safe":  ("#D55E00", "#fbe3d6"),   # 网络外的安全约束
+}
+GRY = "#6c757d"
+YC, H, G = .50, .28, .019                  # 主行底边 / 高度 / 常规间隙
 
 
-def tensor(ax, x, y, w, h, label, shape, fc=LGY):
-    ax.add_patch(Rectangle((x, y), w, h, fc=fc, ec=EC, lw=0.9))
-    ax.text(x + w / 2, y + h + .025, label, ha="center", va="bottom", fontsize=8.5)
-    ax.text(x + w / 2, y - .030, shape, ha="center", va="top", fontsize=8, color=GRY)
+def blk(ax, x, y, w, h, top, bot, kind, ls="-"):
+    ec, fc = C[kind]
+    ax.add_patch(Rectangle((x, y), w, h, fc=fc, ec=ec, lw=1.2, ls=ls))
+    ax.text(x + w / 2, y + h / 2 + (.030 if bot else 0), top,
+            ha="center", va="center", fontsize=8.4)
+    if bot:
+        ax.text(x + w / 2, y + h / 2 - .032, bot, ha="center", va="center",
+                fontsize=7.8, color=ec)
+    return x + w
 
 
-def layer(ax, x, y, w, h, top, bot):
-    ax.add_patch(Rectangle((x, y), w, h, fc="white", ec=ACC, lw=1.1))
-    ax.text(x + w / 2, y + h / 2 + .034, top, ha="center", va="center", fontsize=8.2)
-    ax.text(x + w / 2, y + h / 2 - .034, bot, ha="center", va="center",
-            fontsize=7.8, color=ACC)
+def shape(ax, x, y, txt):
+    ax.text(x, y - .038, txt, ha="center", va="top", fontsize=7.6, color=GRY)
 
 
-def arrow(ax, x0, x1, y):
+def arrow(ax, x0, x1, y, txt=""):
     ax.add_patch(FancyArrowPatch((x0, y), (x1, y), arrowstyle="-|>",
-                                 mutation_scale=9, lw=0.9, color=EC,
+                                 mutation_scale=9, lw=0.9, color="#333333",
                                  shrinkA=0, shrinkB=0))
+    if txt:
+        # ⚠ 标注必须放到**框行之上**；放在箭头旁会落进相邻方框里
+        ax.text((x0 + x1) / 2, YC + H + .030, txt, ha="center", va="bottom",
+                fontsize=7.4, color=GRY)
 
 
-fig, ax = plt.subplots(figsize=(11.2, 3.8))
+fig, ax = plt.subplots(figsize=(12.6, 3.9))
 ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
+cur = .018
 
-YC, H = .46, .30
+x = blk(ax, cur, YC, .066, H, "指令序列", "", "data")
+shape(ax, cur + .033, YC, "21 × 200"); cur = x
+arrow(ax, cur, cur + G, YC + H / 2); cur += G
 
-tensor(ax, .020, YC, .072, H, "指令序列", "21 × 200")
-arrow(ax, .092, .118, YC + H / 2)
+xs0 = cur
+for d in (1, 2, 4, 8):
+    x = blk(ax, cur, YC, .086, H, "Conv1d  k=5", f"dilation {d}", "learn")
+    shape(ax, cur + .043, YC, "64 × 200"); cur = x
+    arrow(ax, cur, cur + G, YC + H / 2); cur += G
+xs1 = cur - G
 
-x0, wc, gap = .118, .104, .020
-for i, d in enumerate((1, 2, 4, 8)):
-    x = x0 + i * (wc + gap)
-    layer(ax, x, YC, wc, H, "Conv1d  k=5", f"dilation {d}  ·  64ch")
-    arrow(ax, x + wc, x + wc + gap, YC + H / 2)
-xe = x0 + 4 * (wc + gap)
+ax.annotate("", xy=(xs0, YC - .098), xytext=(xs1, YC - .098),
+            arrowprops=dict(arrowstyle="|-|", lw=0.8, color=GRY, shrinkA=0, shrinkB=0))
+ax.text((xs0 + xs1) / 2, YC - .132, "感受野 61 帧（3.05 s）",
+        ha="center", va="top", fontsize=7.8, color=GRY)
 
-ax.annotate("", xy=(x0, YC - .075), xytext=(xe - gap, YC - .075),
-            arrowprops=dict(arrowstyle="|-|", lw=0.8, color=GRY,
-                            shrinkA=0, shrinkB=0))
-ax.text((x0 + xe - gap) / 2, YC - .112, "感受野 61 帧（3.05 s）",
-        ha="center", va="top", fontsize=8, color=GRY)
+x = blk(ax, cur, YC, .078, H, "Conv1d  1×1", "64 → 6", "learn")
+shape(ax, cur + .039, YC, "6 × 200"); cur = x
+GW = .062                                  # 该处要放标注, 间隙加宽
+arrow(ax, cur, cur + GW, YC + H / 2, "裁剪：取末 100 帧"); cur += GW
 
-layer(ax, xe, YC, .082, H, "Conv1d  1×1", "64 → 6")
-arrow(ax, xe + .082, xe + .102, YC + H / 2)
-layer(ax, xe + .102, YC, .082, H, "tanh × ε", "ε = 10 mrad")
-arrow(ax, xe + .184, xe + .204, YC + H / 2)
-tensor(ax, xe + .204, YC, .072, H, "补正量 δa", "100 × 6", fc="#dfe9f2")
+x = blk(ax, cur, YC, .074, H, "tanh × ε", "ε = 10 mrad", "fixed")
+shape(ax, cur + .037, YC, "6 × 100"); cur = x
+arrow(ax, cur, cur + G, YC + H / 2); cur += G
 
-# 输入构成（左下细条）
-yb, hb = .135, .050
-ax.add_patch(Rectangle((.020, yb), .036, hb, fc="white", ec=GRY, lw=0.8))
-ax.add_patch(Rectangle((.056, yb), .036, hb, fc=LGY, ec=GRY, lw=0.8))
-# 两个标签靠外缘对齐, 否则在这个宽度下会叠字
-ax.text(.020, yb - .028, "上一段", ha="left", va="top", fontsize=7.4, color=GRY)
-ax.text(.092, yb - .028, "本段", ha="right", va="top", fontsize=7.4, color=GRY)
-ax.plot([.056, .056], [yb + hb + .012, YC - .012], ls=":", lw=0.7, color=GRY)
-ax.text(.104, yb + hb / 2,
+x = blk(ax, cur, YC, .066, H, "δa", "", "out")
+shape(ax, cur + .033, YC, "100 × 6"); cur = x
+arrow(ax, cur, cur + G, YC + H / 2); cur += G
+
+blk(ax, cur, YC, .088, H, "接触门控", "+ 硬限幅", "safe", ls="--")
+
+# ── 输入构成 ───────────────────────────────────────────
+yb, hb = .155, .046
+ec_d, fc_d = C["data"]
+ax.add_patch(Rectangle((.018, yb), .033, hb, fc="white", ec=ec_d, lw=0.8))
+ax.add_patch(Rectangle((.051, yb), .033, hb, fc=fc_d, ec=ec_d, lw=0.8))
+ax.text(.018, yb - .026, "上一段", ha="left", va="top", fontsize=7.4, color=GRY)
+ax.text(.084, yb - .026, "本段", ha="right", va="top", fontsize=7.4, color=GRY)
+ax.plot([.051, .051], [yb + hb + .010, YC - .058], ls=":", lw=0.7, color=GRY)
+ax.text(.096, yb + hb / 2,
         "每帧 7 维（6 关节 + 夹爪）→ [ 去偏置指令, 一阶差分, 二阶差分 ] = 21 通道",
-        ha="left", va="center", fontsize=8, color=GRY)
+        ha="left", va="center", fontsize=7.8, color=GRY)
 
-fig.text(.012, .018,
+# ── 图例 ──────────────────────────────────────────────
+lx, ly, lw, lh = .565, yb - .004, .026, .030
+for i, (k, t) in enumerate([("learn", "可学习层（共 68,806 参数）"),
+                            ("fixed", "固定算子（无参数）"),
+                            ("safe", "网络外的安全约束")]):
+    ec, fc = C[k]
+    xx = lx + i * .148
+    ax.add_patch(Rectangle((xx, ly), lw, lh, fc=fc, ec=ec, lw=1.0,
+                           ls="--" if k == "safe" else "-"))
+    ax.text(xx + lw + .008, ly + lh / 2, t, ha="left", va="center",
+            fontsize=7.4, color="#333333")
+
+fig.text(.010, .020,
          "图 1  补正网络 π 的结构。整段 chunk 的指令在其起始时刻即已全部已知，"
-         "故 chunk 内的双向卷积不违反因果性。ε 由 tanh 结构性保证，\n"
-         "         接触门控与硬限幅置于网络之外。共 68,806 个参数，"
-         "单次前向 0.83 ms，每 chunk 只调用一次。",
-         ha="left", va="bottom", fontsize=8, color=EC, linespacing=1.5)
+         "故 chunk 内的双向卷积不违反因果性。幅值上界 ε 由 tanh 结构性保证；\n"
+         "         接触门控与硬限幅置于网络之外，不交由网络保证。"
+         "单次前向 0.83 ms，每 chunk 只调用一次，因而补正自 chunk 首帧即可施加。",
+         ha="left", va="bottom", fontsize=7.9, color="#333333", linespacing=1.55)
 
-fig.tight_layout(rect=[0, 0.09, 1, 1])
+fig.tight_layout(rect=[0, 0.085, 1, 1])
 OUT.mkdir(parents=True, exist_ok=True)
 fig.savefig(OUT / "fig_pi_arch.png", dpi=220)
 fig.savefig(OUT / "fig_pi_arch.pdf")
