@@ -313,7 +313,12 @@ def main() -> int:
             row[bname] = num / den if den else float("nan")
         print(f"    {tier} beta_ols  固定核 {row['固定核']:.3f} · 分箱核 {row['分箱核']:.3f}")
         aux[tier] = row
-    print("    ⚠ beta_ols 是**过原点的投影尺度**；真实响应若有两个正交分量而模型只抓到一个，"
+    print("    ⚠ β = ⟨gap, ĝap⟩/‖ĝap‖²。**β>1 表示：若只允许整体缩放预测，最小二乘会把它"
+          "放大** —— 即该投影意义下预测**偏小**，**不是偏强**。")
+    print("    ⚠ 目标含任务基线 ⇒ **不能**由 β 直接说「真实增量被低估了同样比例」。")
+    print("    ⚠ **口径**：此处用**去均值后的 raw**；`fit_step1_candidate.beta_ols` 对两者"
+          "**都做 bandpass41** ⇒ **两者不可互换引用**。")
+    print("    ⚠ β 是过原点的投影尺度；真实响应若有两个正交分量而模型只抓到一个，"
           "β 仍可为 1 ⇒ **不能独自判定**。")
     res["aux_beta_ols"] = aux
 
