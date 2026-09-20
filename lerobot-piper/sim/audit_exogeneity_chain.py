@@ -309,9 +309,11 @@ def main() -> int:
             omax = float(np.abs(obs[:2]).max())
             ounc = float(np.abs(obs[2]).max())
             ocon = float(np.abs(contrast).max())
-            pfw = float((null_max >= omax).mean())
-            punc = float((null_unc >= ounc).mean())
-            pcon = float((null_con >= ocon).mean())
+            # ⚠ 置换 p 必须用 (k+1)/(B+1)：B 次置换**报不出 p=0**，
+            #   零次超过对应的是 1/(B+1)（B=500 ⇒ 0.002），不是 0。
+            def _p(null, obs):
+                return float((int((null >= obs).sum()) + 1) / (a.nperm + 1))
+            pfw, punc, pcon = _p(null_max, omax), _p(null_unc, ounc), _p(null_con, ocon)
             idx = np.unravel_index(np.argmax(np.abs(obs[:2])), obs[:2].shape)
             icon = np.unravel_index(np.argmax(np.abs(contrast)), contrast.shape)
 
@@ -338,10 +340,11 @@ def main() -> int:
                   f"{'同号' if np.all(np.sign(vals) == np.sign(vals[0])) else '**异号**'}"
                   f"   ·（对比最强格） {np.round(vcon, 4).tolist()} ⇒ "
                   f"{'同号' if np.all(np.sign(vcon) == np.sign(vcon[0])) else '**异号**'}")
-            # 层**内**跨 seed 的图样一致性 —— 跨层 cos 必须与它对照才读得懂：
-            # 层内也只有 ~0.1 ⇒ 图样整体就是噪声；层内高而跨层低 ⇒ 结构不可迁移。
+            # 层**内**跨 seed 的图样一致性 —— 跨层 cos 必须与它对照才读得懂。
+            # ⚠ cos 只表示**图样方向的一致性**。没有做噪声分解，
+            #   **不得**把 cos≈0.14 换算成「共同成分占 14%、其余是噪声」。
             within, npair = _within(per_seed[:, 1] - per_seed[:, 0])
-            pwit = float((null_wit >= within).mean())
+            pwit = _p(null_wit, within)
             print(f"      对比图样的**层内**跨 seed 一致性：平均两两 cos = {within:+.3f}"
                   f"  ({npair} 对) · 零分布(只移bin) 中位 {np.median(null_wit):+.3f} "
                   f"95% {np.quantile(null_wit, .95):+.3f}  ⇒ p = {pwit:.3f}")
