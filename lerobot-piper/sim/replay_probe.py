@@ -71,6 +71,7 @@ def safety_checks(cmd7, da, model_path=None, probe_kind="single_joint_pulse"):
     回落常量 —— 此时的 dry-run **只能用于诊断接口, 不足以放行上机**。
     """
     degraded = []
+    blockers = []           # ⚠ **硬阻断**：非空时禁止进入任何运动
     try:
         from lerobot.common.policies.act.b_runtime import EPS_B
     except Exception as e:                                        # noqa: BLE001
@@ -145,6 +146,7 @@ def safety_checks(cmd7, da, model_path=None, probe_kind="single_joint_pulse"):
     except ImportError as e:                                      # noqa: BLE001
         msgs.append(f"⚠ 跳过限位检查（{type(e).__name__}: {e}）")
         degraded.append("关节限位检查被跳过")
+        blockers.append("关节限位检查被跳过 ⇒ 无法确认位置安全")
 
     # 指令连续性（探针不得制造跳变）
     # ⚠ 这是**整集最大值之比**，只说明相对峰值；**不能证明每一处跳变都小**。
@@ -170,9 +172,11 @@ def safety_checks(cmd7, da, model_path=None, probe_kind="single_joint_pulse"):
                                  f"{d2t[:, j].max()/DT**2*R2D:.0f}" for j in range(6)))
         msgs.append("⚠ **这些是指令差分，不是实测关节速度/加速度**；且仓内目前"
                     "**没有有出处又适用于本设备的速度/加速度上限**")
-        degraded.append("multi_joint_continuous：速度/加速度**无适用约束来源** "
-                        "⇒ 安全审查未完成，**不得据此放行运动采集**")
-    return msgs, degraded
+        blockers.append(
+            "multi_joint_continuous：速度/加速度**无有出处又适用于本设备的上限**"
+            "（G-v2 A_MAX 是阶跃拟合的模型参数，裸轨迹本身就超它；"
+            "发送路径无软件限幅）⇒ **安全审查未完成**")
+    return msgs, degraded, blockers
 
 
 
@@ -245,8 +249,8 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     total = cmd7[:, :6] + (da if use_probe else 0.0)
     print(f"=== 复放 {arm} ({'加探针' if use_probe else '裸'}) · {len(cmd7)} 帧 "
           f"= {len(cmd7)/FPS:.0f}s ===")
-    msgs, degraded = safety_checks(cmd7, da if use_probe else np.zeros_like(da),
-                                   probe_kind=probe_kind)
+    msgs, degraded, blockers = safety_checks(
+        cmd7, da if use_probe else np.zeros_like(da), probe_kind=probe_kind)
     for m in msgs:
         print("  " + m)
     for d in degraded:
@@ -266,8 +270,28 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             print("      请在 lerobot 环境下重跑: "
                   "~/miniconda3/envs/lerobot/bin/python sim/replay_probe.py …")
             return 2
+        if blockers:
+            print(f"\n  ⛔ **{len(blockers)} 项硬阻断**（dry-run 到此为止，"
+                  f"真机会在连接设备前退出）：")
+            for b in blockers:
+                print(f"     ⛔ {b}")
+            return 4
         print("  ✓ 全部安全检查通过 —— 可上机")
         return 0
+
+    # ---- ⛔ 运动入口硬阻断（**不是打印警告**）────────────────────────────
+    # 退出码 4 = 安全审查未完成。**发生在 make_robot / connect 之前**，
+    # 因此设备不会被连接、电机不会被使能、臂不会动。
+    # 解除方式**只有一条**：完成 `reports/CHECKLIST_3c_readonly.md` 的 R 阶段，
+    # 把有出处且适用的限值填进 `sim/audit_send_chain_3c.py` 的来源表，
+    # 使 safety_checks 不再产生 blockers。**不提供 --force 之类的旁路。**
+    if blockers:
+        print(f"\n  ⛔⛔ **拒绝上机：{len(blockers)} 项安全审查未完成** ⛔⛔")
+        for b in blockers:
+            print(f"     ⛔ {b}")
+        print("     ⇒ **设备未连接、电机未使能、臂未运动。**")
+        print("     ⇒ 解除条件见 reports/CHECKLIST_3c_readonly.md（R 阶段）。")
+        return 4
 
     # ---- 真机 ----
     import torch
@@ -662,9 +686,9 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.seqfile:                                  # 显式路径优先, 直接跑
         raise SystemExit(run(a.arm, a.dry_run, seqfile=a.seqfile, tag="",
-                             b2=a.b2, outdir=Path(a.outdir, probe_kind=a.probe_kind) if a.outdir else None,
+                             b2=a.b2, outdir=Path(a.outdir) if a.outdir else None,
                              robot_type=a.robot, settle_probe=a.settle_probe,
-                             canhs=not a.no_canhs))
+                             canhs=not a.no_canhs, probe_kind=a.probe_kind))
     if a.b2:
         import re as _re
         cfg = ("j2_" + a.amp + "_p" if _re.fullmatch(r"A\d+", a.arm)
@@ -673,8 +697,8 @@ if __name__ == "__main__":
         # 轮次后缀: 第2轮的 B 臂配置名与第1轮相同, 不加后缀会**覆盖首轮数据**
         tag = f"ep{a.ep}_" if a.round == 1 else f"ep{a.ep}_r{a.round}_"
         raise SystemExit(run(a.arm, a.dry_run, seqfile=seqfile,
-                             tag=tag, b2=True, outdir=PB2, canhs=not a.no_canhs))
+                             tag=tag, b2=True, outdir=PB2, canhs=not a.no_canhs, probe_kind=a.probe_kind))
     seqfile = f"probe_seq_pp2_ep{a.ep}.npz" if a.ep is not None else "probe_seq.npz"
     tag = f"ep{a.ep}_" if a.ep is not None else ""
     raise SystemExit(run(a.arm, a.dry_run, seqfile=seqfile, tag=tag,
-                         canhs=not a.no_canhs))
+                         canhs=not a.no_canhs, probe_kind=a.probe_kind))
