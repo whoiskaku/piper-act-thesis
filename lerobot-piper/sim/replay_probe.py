@@ -60,7 +60,11 @@ def load_seq(seqfile="probe_seq.npz", b2=False):
 EPS_B_FALLBACK = 0.010          # 与 lerobot/common/policies/act/b_runtime.py 一致
 
 
-def safety_checks(cmd7, da, model_path=None):
+# ⚠ **两种探针形态，检查不同** —— 新增 ③c 用的多关节模式时**不删旧模式的断言**。
+PROBE_KINDS = ("single_joint_pulse", "multi_joint_continuous")
+
+
+def safety_checks(cmd7, da, model_path=None, probe_kind="single_joint_pulse"):
     """出发前的全部断言 —— 任何一条不过就不上机。
 
     → (msgs, degraded)。`degraded=True` 表示有依赖缺失、部分检查被跳过或用了
@@ -78,8 +82,19 @@ def safety_checks(cmd7, da, model_path=None):
     assert np.abs(da).max() <= EPS_B + 1e-12, \
         f"探针 {np.abs(da).max()*1e3:.1f}mrad 超过 ε={EPS_B*1e3:.0f}mrad"
     msgs.append(f"✓ δa 峰值 {np.abs(da).max()*1e3:.1f} mrad ≤ ε {EPS_B*1e3:.0f} mrad")
-    assert (np.abs(da) > 0).sum(1).max() <= 1, "同帧多关节同时发"
-    msgs.append("✓ 同帧仅一关节")
+    # ── 形态分支 ────────────────────────────────────────────────────
+    if probe_kind not in PROBE_KINDS:
+        raise ValueError(f"probe_kind 须为 {PROBE_KINDS}，得到 {probe_kind!r}")
+    n_joint = int((np.abs(da) > 0).sum(1).max())
+    if probe_kind == "single_joint_pulse":
+        # **③a/b2 的旧模式，断言原样保留**
+        assert n_joint <= 1, "同帧多关节同时发"
+        msgs.append("✓ 同帧仅一关节（single_joint_pulse）")
+    else:
+        # **③c：多关节连续补正** —— 旧断言在此结构性不成立，故走独立分支，
+        # 但**不放松其它任何检查**，并额外报告逐关节的绝对差分（见文末）。
+        msgs.append(f"· 同帧最多 {n_joint} 个关节（multi_joint_continuous，"
+                    f"**已显式选择该模式**）")
     assert da.shape[1] == 6, "探针不得触及夹爪"
     msgs.append("✓ 夹爪不受探针影响")
 
@@ -132,10 +147,31 @@ def safety_checks(cmd7, da, model_path=None):
         degraded.append("关节限位检查被跳过")
 
     # 指令连续性（探针不得制造跳变）
+    # ⚠ 这是**整集最大值之比**，只说明相对峰值；**不能证明每一处跳变都小**。
     step = np.abs(np.diff(cmd7[:, :6] + da, axis=0)).max()
     base = np.abs(np.diff(cmd7[:, :6], axis=0)).max()
     assert step < base * 1.5 + 0.006, f"叠加探针后单帧跳变 {step*1e3:.1f}mrad 过大"
-    msgs.append(f"✓ 单帧最大跳变 {step*1e3:.1f} mrad (裸 {base*1e3:.1f})")
+    msgs.append(f"✓ 单帧最大跳变 {step*1e3:.1f} mrad (裸 {base*1e3:.1f}) "
+                f"—— **相对峰值检查，非逐时刻**")
+
+    if probe_kind == "multi_joint_continuous":
+        # ── ③c 追加：**逐时刻余量** + 逐关节绝对差分 ─────────────────────
+        # 约定：np.diff 索引 i ↔ 帧 i→i+1；二阶差分索引 i 涉及帧 i,i+1,i+2。
+        d1u = np.abs(np.diff(cmd7[:, :6], axis=0))
+        d1t = np.abs(np.diff(cmd7[:, :6] + da, axis=0))
+        ex = d1t - d1u
+        i1 = np.unravel_index(np.argmax(ex), ex.shape)
+        msgs.append(f"· 逐时刻最坏步长增量 {ex[i1]*1e3:+.3f} mrad @帧{i1[0]} "
+                    f"j{i1[1]+1}（绝对 {d1t[i1]*1e3:.3f}，基线同帧 {d1u[i1]*1e3:.3f}）")
+        d2t = np.abs(np.diff(cmd7[:, :6] + da, 2, axis=0))
+        R2D = 180.0 / np.pi
+        msgs.append("· 逐关节绝对指令差分 |Δ|max (rad/s) / |Δ²|max (°/s²)："
+                    + " · ".join(f"j{j+1} {d1t[:, j].max()/DT:.3f}/"
+                                 f"{d2t[:, j].max()/DT**2*R2D:.0f}" for j in range(6)))
+        msgs.append("⚠ **这些是指令差分，不是实测关节速度/加速度**；且仓内目前"
+                    "**没有有出处又适用于本设备的速度/加速度上限**")
+        degraded.append("multi_joint_continuous：速度/加速度**无适用约束来源** "
+                        "⇒ 安全审查未完成，**不得据此放行运动采集**")
     return msgs, degraded
 
 
@@ -200,7 +236,8 @@ def staged_return(robot, torch, grip: float) -> bool:
 
 
 def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
-        outdir=None, robot_type="piper", settle_probe=0.0, canhs=True):
+        outdir=None, robot_type="piper", settle_probe=0.0, canhs=True,
+        probe_kind="single_joint_pulse"):
     cmd7, da, z = load_seq(seqfile, b2)
     import re
     is_bare = bool(re.fullmatch(r"A\d+", arm))      # A1/A2/A3/A4… 全是裸复放
@@ -208,7 +245,8 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     total = cmd7[:, :6] + (da if use_probe else 0.0)
     print(f"=== 复放 {arm} ({'加探针' if use_probe else '裸'}) · {len(cmd7)} 帧 "
           f"= {len(cmd7)/FPS:.0f}s ===")
-    msgs, degraded = safety_checks(cmd7, da if use_probe else np.zeros_like(da))
+    msgs, degraded = safety_checks(cmd7, da if use_probe else np.zeros_like(da),
+                                   probe_kind=probe_kind)
     for m in msgs:
         print("  " + m)
     for d in degraded:
@@ -616,12 +654,15 @@ if __name__ == "__main__":
     ap.add_argument("--settle-probe", type=float, default=0.0, metavar="SEC",
                     help="**观测模式**: 预移动后静置 SEC 秒并记录, 然后退出, "
                          "不跑激励序列。用于测「粘滑会不会自己停」。")
+    ap.add_argument("--probe-kind", default="single_joint_pulse", choices=PROBE_KINDS,
+                    help="探针形态。**multi_joint_continuous 必须显式给出**"
+                         "（③c 的多关节连续补正；旧模式的「同帧仅一关节」断言不删）")
     ap.add_argument("--no-canhs", action="store_true",
                     help="关闭六关节高速 CAN 反馈记录(默认开; 被动只读, 不影响控制)")
     a = ap.parse_args()
     if a.seqfile:                                  # 显式路径优先, 直接跑
         raise SystemExit(run(a.arm, a.dry_run, seqfile=a.seqfile, tag="",
-                             b2=a.b2, outdir=Path(a.outdir) if a.outdir else None,
+                             b2=a.b2, outdir=Path(a.outdir, probe_kind=a.probe_kind) if a.outdir else None,
                              robot_type=a.robot, settle_probe=a.settle_probe,
                              canhs=not a.no_canhs))
     if a.b2:
