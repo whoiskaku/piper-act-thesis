@@ -121,8 +121,12 @@ def report(c, jk, pred_odd=None, tag="", cmd_even_rms=None):
         print(f"    {nm}  ‖·‖ {nrm(d):.5f} · RMS {rms(d):.6f}  逐轴 RMS "
               + " ".join(f"{a} {rms(d[:, i]):.6f}" for i, a in enumerate(AXES)))
     print(f"    不确定度 sd(Δ±) = {c['sd_side']:.6f} rad/s")
+    theo = c["N"] / (c["N"] + 2 * c["M"])
     print(f"    ⚠ **两侧共享同一条裸基线** ⇒ Cov(Δ⁺,Δ⁻) = {c['cov_pm']:.3e}，"
           f"**相关系数 {c['corr_pm']:+.3f}** —— 不可当独立处理")
+    print(f"       理论值（同方差、独立重复假设下）N/(N+2M) = "
+          f"{c['N']:.0f}/{c['N']+2*c['M']:.0f} = {theo:.3f}；"
+          f"**这是解析结果，不是真机证据**")
 
     print(f"\n  ── 奇分量 Δ_odd = ½(Δ⁺−Δ⁻)（裸基线**精确抵消**）──")
     snr = nrm(c["d_odd"]) / (c["sd_odd"] * np.sqrt(3 * T))
