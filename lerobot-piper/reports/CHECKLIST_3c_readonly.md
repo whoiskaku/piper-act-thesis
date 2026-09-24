@@ -27,6 +27,46 @@
 
 ---
 
+## 专用脚本：`sim/readonly_check_3c.py`
+
+**不走** `make_robot` / lerobot 的 robot 包装 —— 现有连接流程会**使能 + 标定归位**，
+断开流程也可能发送动作，**不能借它来「只读」**。本脚本直接用 `piper_sdk`。
+
+### 三层保护（**结构性，不是注释**）
+
+| | |
+|---|---|
+| **允许清单代理** | 在**属性访问层**拦截：不在清单里的方法名**取到的瞬间就抛** `ForbiddenCall`，调用方**没有机会**调到禁用方法；写属性一律拒绝 |
+| **`piper_init=False`** | `ConnectPort` 的默认 `piper_init=True` 会自动调 `PiperInit()`，**立刻发三条查询帧** ⇒ 本脚本关掉它，把「发帧」显式化、可拒绝 |
+| **两道确认** | `--i-confirm-arm-is-idle`（现场确认）+ `--send-query-frames`（同意发查询帧），**都不给就不连接设备** |
+
+### ⚠ 查询也是往总线写帧
+
+`Search*` 系列会发 CAN **查询**帧（如最大加速度查询 `0x472`）。
+它们**不是运动指令**，但**确实是总线写入** ⇒ 默认**不发**。
+要读**固件侧**的限速/加速度/固件版本才需要 `--send-query-frames`。
+
+`DisconnectPort()` **已读源码核实**：只置标志位、停读线程、`join`，**不发任何动作**。
+
+### 三步执行
+
+```
+# ① 离线自检（**不碰 CAN**）—— 审查用这个，已跑通 7/7
+python -u sim/readonly_check_3c.py --dry-run
+
+# ② 现场确认机械臂静止、无其他程序发指令后（**不要切换电机状态**）
+python -u sim/readonly_check_3c.py --i-confirm-arm-is-idle
+
+# ③ 需要固件侧限值时，额外显式同意发查询帧
+python -u sim/readonly_check_3c.py --i-confirm-arm-is-idle --send-query-frames
+```
+
+离线自检 7 项（全过）：允许清单可用 · **19 个使能/动作/夹爪/配置方法全被拦截** ·
+查询帧默认也拦 · 写属性被拒 · 显式开启后查询帧才可用 ·
+**开了查询帧后动作方法仍被拦** · 未导入 lerobot robot 包装。
+
+---
+
 ## R 阶段清单
 
 ### R1 环境与版本（不连臂也能做一半）
