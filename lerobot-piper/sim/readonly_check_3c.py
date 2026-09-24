@@ -77,6 +77,12 @@ class ForbiddenCall(RuntimeError):
     pass
 
 
+# ⚠ **程序性故障**（接线错、字段名错、签名错）必须以非零退出码暴露；
+#   而被动读取下**预期的 `no_reply`**（设备没回）**不算程序失败**。
+PROGRAM_ERRORS = (NameError, AttributeError, TypeError, KeyError, IndexError,
+                  ImportError, SyntaxError)
+
+
 def make_readonly(inner, allow: set[str]):
     """内部对象存**闭包**（`p._inner` 不存在）；连接入口**参数固定**。
 
@@ -198,21 +204,29 @@ def check_six(dumped, num_key, val_keys):
     if m is None:
         return {"found": False, "complete": False,
                 "reason": "未找到长度为 7 的公开 `motor` 列表"}
-    slots, missing = {}, []
+    slots, missing, zeros = {}, [], []
     for i in range(1, 7):
         e = m[i]
         num = e.get(num_key)
-        has_val = any(isinstance(e.get(k), (int, float)) and e.get(k) != 0
+        nonzero = any(isinstance(e.get(k), (int, float)) and e.get(k) != 0
                       for k in val_keys)
-        slots[f"slot{i}"] = {"num": num, "has_value": has_val,
+        slots[f"slot{i}"] = {"num": num, "nonzero_values": nonzero,
                              **{k: e.get(k) for k in val_keys}}
         if num != i:
             missing.append(f"slot{i} 的 {num_key}={num}（应为 {i}）")
-        elif not has_val:
-            missing.append(f"slot{i} 编号对但**数值全为 0/缺失**")
-    return {"found": True, "complete": not missing, "num_key": num_key,
-            "placeholder_slot0": m[0].get(num_key),
-            "slots": slots, "missing": missing}
+        elif not nonzero:
+            # ⚠ **数值为零 ≠ 没有回复**：编号对上就说明这一槽有回复。
+            #   零值可能是真实限值、也可能是未配置 ⇒ 记「已回复，数值含义待核实」，
+            #   **不据此判 no_reply**。
+            zeros.append(f"slot{i}")
+    return {"found": True, "numbering_complete": not missing,
+            "complete": not missing,               # 完整性 = **仅看编号**
+            "num_key": num_key, "placeholder_slot0": m[0].get(num_key),
+            "slots": slots, "missing": missing,
+            "zero_value_slots": zeros,
+            "value_semantics_unverified": bool(zeros),
+            "zero_note": "编号成立即视为**已回复**；零值只记「数值含义待核实」，"
+                         "**不判 no_reply**"}
 
 
 def classify(name, val, prev_ts=None):
@@ -425,16 +439,155 @@ def guard_selftest() -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════
-def main() -> int:
+#  假 SDK —— **端到端主流程回归**（不导入 piper_sdk、不碰 CAN）
+# ══════════════════════════════════════════════════════════════════════
+class _Slot(dict):
+    __getattr__ = dict.get
+
+
+class FakeArm:
+    """三种场景：`full`（六关节齐全）/ `partial`（只 j1 回复）/ `silent`（全无回复）。
+
+    结构**对齐实物**：`motor` 长度 7、`motor[0]` 占位、加速度用 `joint_motor_num`。
+    """
+
+    def __init__(self, mode="full"):
+        self.mode = mode
+        self.t = 100.0
+        self.queried = False
+
+    def _tick(self):
+        self.t += 0.05
+        return self.t
+
+    def ConnectPort(self, **kw):
+        self.connect_kw = kw
+        return True
+
+    def DisconnectPort(self, **kw):
+        return True
+
+    def get_connect_status(self):
+        return True
+
+    def _nums(self):
+        if self.mode == "silent" or not self.queried:
+            return set()
+        return {1} if self.mode == "partial" else set(range(1, 7))
+
+    def _agg(self, num_key, val_keys, val):
+        on = self._nums()
+        m = [_Slot({num_key: 0, **{k: 0 for k in val_keys}})]
+        for i in range(1, 7):
+            hit = i in on
+            m.append(_Slot({num_key: i if hit else 0,
+                            **{k: (val if hit else 0) for k in val_keys}}))
+        ts = self._tick() if on else 0.0
+        return _Slot({"time_stamp": ts, "all": _Slot({"motor": m})})
+
+    def GetAllMotorAngleLimitMaxSpd(self):
+        return self._agg("motor_num", ("max_angle_limit", "min_angle_limit",
+                                       "max_joint_spd"), 90000)
+
+    def GetAllMotorMaxAccLimit(self):
+        return self._agg("joint_motor_num", ("max_joint_acc",), 500)
+
+    def GetPiperFirmwareVersion(self):
+        return "V1.6-2" if (self.queried and self.mode != "silent") else FW_FAIL
+
+    def GetArmStatus(self):                      # 持续更新的状态流
+        return _Slot({"time_stamp": self._tick(), "Hz": 20.0, "ctrl_mode": 1})
+
+    def GetArmJointMsgs(self):                   # 关节角**不变** ⇒ 应判静止
+        return _Slot({"time_stamp": self._tick(), "Hz": 200.0,
+                      "joint_state": _Slot({f"joint_{i}": 1000 * i for i in range(1, 7)})})
+
+    def SearchAllMotorMaxAngleSpd(self):
+        self.queried = True
+
+    def SearchAllMotorMaxAccLimit(self):
+        self.queried = True
+
+    def SearchPiperFirmwareVersion(self):
+        self.queried = True
+
+    def GetSDKJointLimitParam(self, joint_name):
+        assert joint_name in JOINTS, f"必须传 j1..j6，得到 {joint_name!r}"
+        return _Slot({"joint": joint_name, "min": -1.0, "max": 1.0})
+
+    def __getattr__(self, n):                    # 其余读接口给个平凡返回
+        if n.startswith("Get") or n in ("isOk",):
+            return lambda *a, **k: _Slot({"time_stamp": self._tick(), "name": n})
+        raise AttributeError(n)
+
+
+def e2e_selftest() -> bool:
+    """**主流程端到端**回归 —— 这正是 24 项自测没覆盖的接线层。"""
+    import tempfile
+    print("\n" + "=" * 78 + "\n主流程端到端回归（假 SDK，**不碰 CAN**）\n" + "=" * 78)
+    ok = {}
+    cases = [("full", True, True), ("partial", True, False), ("silent", False, False)]
+    for mode, q, expect_complete in cases:
+        with tempfile.TemporaryDirectory() as td:
+            argv = ["--i-confirm-arm-is-idle", "--fake-sdk", mode,
+                    "--outdir", td, "--settle", "0.01", "--skip-guard"]
+            if q:
+                argv.append("--send-query-frames")
+            rc = main(argv)
+            files = list(Path(td).glob("*.json"))
+            rec = json.loads(files[0].read_text()) if files else {}
+            prog = rec.get("program_errors", [])
+            reads = rec.get("reads", {})
+            nerr = sum(1 for v in reads.values() if v.get("status") == "error")
+            idle = rec.get("idle_check", {}).get("confirmed_idle")
+            comp = (rec.get("query_evidence", {}).get("responses", {})
+                    .get("GetAllMotorAngleLimitMaxSpd", {})
+                    .get("completeness", {}).get("numbering_complete"))
+            k = f"[{mode}]"
+            ok[f"{k} 无程序性故障"] = not prog
+            ok[f"{k} 退出码 0"] = rc == 0
+            ok[f"{k} 读取项无 error"] = nerr == 0
+            ok[f"{k} 落盘 1 个文件"] = len(files) == 1
+            ok[f"{k} 静止确认成立"] = idle is True
+            ok[f"{k} 六关节编号完整={expect_complete}"] = bool(comp) == expect_complete
+            print(f"  {mode:8} rc={rc} · 程序性故障 {len(prog)} · error 读取 {nerr} · "
+                  f"静止确认 {idle} · 六关节完整 {comp}")
+            for kk, v in list(ok.items())[-6:]:
+                if not v:
+                    print(f"     **✗ {kk}**")
+    # 反向用例：程序性故障必须以非零退出码暴露
+    with tempfile.TemporaryDirectory() as td:
+        rc = main(["--i-confirm-arm-is-idle", "--fake-sdk", "full", "--outdir", td,
+                   "--settle", "0.01", "--skip-guard", "--inject-program-error"])
+        ok["[注入] 程序性故障 ⇒ 退出码 5"] = rc == 5
+        print(f"  注入程序性故障：rc={rc}（应为 5）")
+    bad = [k for k, v in ok.items() if not v]
+    print(f"\n  ⇒ 端到端 {sum(ok.values())}/{len(ok)} 通过" + (f"   **✗ {bad}**" if bad else ""))
+    print("  ⚠ `silent` 场景下读不到限值属**被动 no_reply**，"
+          "**不等同程序失败** ⇒ 退出码仍为 0。")
+    return not bad
+
+
+# ══════════════════════════════════════════════════════════════════════
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--i-confirm-arm-is-idle", action="store_true")
     ap.add_argument("--send-query-frames", action="store_true")
     ap.add_argument("--can", default="can0")
     ap.add_argument("--settle", type=float, default=1.5)
-    a = ap.parse_args()
+    ap.add_argument("--fake-sdk", choices=("full", "partial", "silent"),
+                    help="**回归测试用**：不导入 piper_sdk，用假接口跑完整主流程")
+    ap.add_argument("--outdir", help="覆盖落盘目录（回归测试用）")
+    ap.add_argument("--self-test-e2e", action="store_true",
+                    help="用假 SDK 跑**主流程端到端**回归（不碰 CAN）")
+    ap.add_argument("--skip-guard", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--inject-program-error", action="store_true", help=argparse.SUPPRESS)
+    a = ap.parse_args(argv)
 
-    if not guard_selftest():
+    if a.self_test_e2e:
+        return 0 if (guard_selftest() and e2e_selftest()) else 1
+    if not a.skip_guard and not guard_selftest():
         print("\n**✗ 自检未过 —— 不连接设备**")
         return 1
     if a.dry_run:
@@ -446,23 +599,30 @@ def main() -> int:
               "**不要为这一步切换电机状态**。")
         return 2
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out = OUTDIR / f"readonly_{stamp}{'_q' if a.send_query_frames else ''}.json"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    outdir = Path(a.outdir) if a.outdir else OUTDIR
+    out = outdir / f"readonly_{stamp}{'_q' if a.send_query_frames else ''}.json"
     rec = {"stage": "R (read-only)", "utc": datetime.now(timezone.utc).isoformat(),
            "host": platform.node(), "can_iface": a.can,
            "query_frames_requested": bool(a.send_query_frames),
            "can_link": can_state(a.can), "steps_done": [], "reads": {}}
 
     def save():
-        OUTDIR.mkdir(parents=True, exist_ok=True)
+        outdir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(rec, indent=2, ensure_ascii=False, default=str))
 
     print("\n" + "=" * 78 + f"\nR 阶段读取（can={a.can}）\n" + "=" * 78)
     p = None
     try:
-        from piper_sdk import C_PiperInterface_V2
         allow = ALLOW_READ | (ALLOW_QUERY if a.send_query_frames else set())
-        p = make_readonly(C_PiperInterface_V2(a.can), allow)
+        if a.fake_sdk:
+            iface = FakeArm(a.fake_sdk)
+            rec["FAKE_SDK"] = a.fake_sdk
+            print(f"  ⚠⚠ **假 SDK 回归模式 `{a.fake_sdk}` —— 未导入 piper_sdk、未碰 CAN**")
+        else:
+            from piper_sdk import C_PiperInterface_V2
+            iface = C_PiperInterface_V2(a.can)
+        p = make_readonly(iface, allow)
         p.connect_readonly()
         rec["steps_done"].append("connect_readonly(piper_init=False)")
         time.sleep(0.5)
@@ -487,6 +647,7 @@ def main() -> int:
             return out
 
         pre_r, pre_s = snap(RESPONSIVE), snap(STREAM)
+        pre_ts = {**pre_r, **pre_s}          # 主读取循环按接口名取「上一次时间戳」
         try:
             fw_pre = dump(p.GetPiperFirmwareVersion())
         except Exception as e:
@@ -577,29 +738,45 @@ def main() -> int:
             reads.append((f"sdk_joint_limit_{j}", "GetSDKJointLimitParam", (j,),
                           "SDK 侧软限（**不是固件侧**）"))
 
+        if a.inject_program_error:               # 回归用：制造一次接线错
+            reads.insert(0, ("__injected__", "GetNoSuchMethod_ForRegression", (), ""))
         for key, meth, args, note in reads:
             entry = {"method": meth, "args": list(args), "note": note}
             try:
+                if key == "__injected__":
+                    raise NameError("name 'pre' is not defined")   # 模拟本次的接线错
                 v = dump(getattr(p, meth)(*args))
                 entry["value"] = v
-                prev = pre.get(meth) if meth in pre else None
+                prev = pre_ts.get(meth)          # ← 合并后的快照（旧版引用已删的 `pre`）
                 st, why = classify(meth, v, prev_ts=prev)
                 entry["status"], entry["status_reason"] = st, why
                 if meth in AGGREGATE:          # **只有两个聚合接口**做六关节检查
                     nk, vk = AGGREGATE[meth]
                     comp = check_six(v, nk, vk)
                     entry["six_motor"] = comp
-                    if not comp.get("complete"):
+                    if not comp.get("numbering_complete"):
                         entry["status"] = "no_reply" if st == "valid" else st
                         entry["status_reason"] = (
-                            why + " ；**六关节不完整**：" +
+                            why + " ；**六关节编号不完整**：" +
                             "; ".join(comp.get("missing", []) or [comp.get("reason", "")]))
+                    elif comp.get("value_semantics_unverified"):
+                        # **不降级** —— 已回复，只是数值含义待核实
+                        entry["status_reason"] = (
+                            why + " ；六关节编号齐全，但 "
+                            + ",".join(comp["zero_value_slots"])
+                            + " **数值为零 ⇒ 已回复，数值含义待核实**")
                 mark = {"valid": "✓", "stale": "◐", "no_reply": "✗",
                         "error": "⚠", "unknown": "?"}[entry["status"]]
                 print(f"  {mark} {key:26} {entry['status']:9} {entry['status_reason']}")
             except Exception as e:
-                entry["status"], entry["status_reason"] = "error", f"{type(e).__name__}: {e}"
-                print(f"  ⚠ {key:26} error     {type(e).__name__}: {e}")
+                prog = isinstance(e, PROGRAM_ERRORS)
+                entry["status"] = "error"
+                entry["status_reason"] = f"{type(e).__name__}: {e}"
+                entry["programmatic"] = prog
+                if prog:
+                    rec.setdefault("program_errors", []).append(f"{key}: {type(e).__name__}: {e}")
+                print(f"  {'⛔' if prog else '⚠'} {key:26} error     "
+                      f"{type(e).__name__}: {e}{'  ← **程序性故障**' if prog else ''}")
             rec["reads"][key] = entry
 
         # 静止确认：**要求时间戳推进**，否则不算确认
@@ -623,8 +800,11 @@ def main() -> int:
         rec["steps_done"].append("reads + idle_check")
     except Exception as e:
         import traceback
-        rec["fatal"] = {"error": f"{type(e).__name__}: {e}",
+        prog = isinstance(e, PROGRAM_ERRORS)
+        rec["fatal"] = {"error": f"{type(e).__name__}: {e}", "programmatic": prog,
                         "traceback": traceback.format_exc()}
+        if prog:
+            rec.setdefault("program_errors", []).append(f"fatal: {type(e).__name__}: {e}")
         print(f"\n  ⚠ 异常：{type(e).__name__}: {e}（**已完成的步骤仍会落盘**）")
     finally:
         if p is not None:
@@ -651,15 +831,21 @@ def main() -> int:
         print(f"\n→ {out}")
 
     n_valid = sum(1 for v in rec["reads"].values() if v.get("status") == "valid")
+    prog_err = rec.get("program_errors", [])
     print("\n" + "=" * 78)
     print(f"有效反馈 {n_valid}/{len(rec['reads'])} 项 —— "
           f"**`status` 不是 `valid` 的项一律不得当作已读到的事实**")
+    if prog_err:
+        print(f"⛔ **{len(prog_err)} 项程序性故障**（接线/字段/签名错，不是设备没回）：")
+        for m_ in prog_err[:5]:
+            print(f"   ⛔ {m_}")
+        print("   ⇒ **退出码 5**。被动读取下预期的 `no_reply` 不算程序失败。")
     print("⚠ **读到数字不自动放行。** `applicability` 各项尚未填写；")
     print("   尤其是「限速/加速度约束的是**下发目标的变化**还是"
           "**控制器内部生成的轨迹**」。")
     print("   ③c 复放阻断**保持生效**；是否解除**另行决定**。")
     print("=" * 78)
-    return 0
+    return 5 if prog_err else 0
 
 
 if __name__ == "__main__":

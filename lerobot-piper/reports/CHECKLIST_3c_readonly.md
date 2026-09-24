@@ -130,11 +130,45 @@
 - **每次运行独立文件** `outputs/probe_3c/readonly/readonly_<UTC>[_q].json`，不覆盖
 - 连接/查询异常时**已完成步骤与异常一并落盘**（`steps_done` / `fatal`）
 
+### ⚠ 两层自测，缺一不可
+
+| | 覆盖 | 状态 |
+|---|---|---|
+| `--dry-run` | **代理与判定逻辑** | **24/24** |
+| `--self-test-e2e` | **主流程接线**（假 SDK，三场景 + 注入故障） | **19/19** |
+
+**为什么必须有第二层**：24 项判定逻辑自测全过，但**没覆盖主流程的接线** ——
+复审用假 SDK 跑主流程时发现 `prev = pre.get(meth)` 引用了已被拆掉的 `pre`，
+**22 项读取全变成 `NameError`，程序却仍返回退出码 0**。已修，并加了这层回归。
+
+三个假 SDK 场景（结构对齐实物：`motor` 长度 7 / `motor[0]` 占位 / 加速度用
+`joint_motor_num`）：
+
+| 场景 | 六关节完整 | 退出码 |
+|---|---|---|
+| `full` 六关节齐全 | ✓ | 0 |
+| `partial` 只 j1 回复 | ✗ | 0 |
+| `silent` 全无回复 | ✗ | **0**（被动 `no_reply`，**不等同程序失败**） |
+| 注入 `NameError` | — | **5** |
+
+### ⚠ 退出码：程序性故障与被动 no_reply **分开**
+
+- **程序性故障**（`NameError` / `AttributeError` / `TypeError` / `KeyError` /
+  `IndexError` / `ImportError`）⇒ 记入 `program_errors`，**退出码 5**
+- **被动 `no_reply`**（设备没回）⇒ 照实记录，**退出码 0**
+
+### ⚠ 数值为零 ≠ 没有回复
+
+编号与反馈证据成立、但限值为零时，记
+**「已回复，数值含义待核实」**（`value_semantics_unverified`），
+**不据此判 `no_reply`**。完整性**只看编号**（`numbering_complete`）。
+
 ### 三步执行
 
 ```
-# ① 离线自检（**不碰 CAN**）—— 审查用这个，已跑通 7/7
-python -u sim/readonly_check_3c.py --dry-run
+# ① 离线自检（**不碰 CAN**）—— 审查用这两个
+python -u sim/readonly_check_3c.py --dry-run        # 判定逻辑 24/24
+python -u sim/readonly_check_3c.py --self-test-e2e  # 主流程接线 19/19
 
 # ② 现场确认机械臂静止、无其他程序发指令后（**不要切换电机状态**）
 python -u sim/readonly_check_3c.py --i-confirm-arm-is-idle
