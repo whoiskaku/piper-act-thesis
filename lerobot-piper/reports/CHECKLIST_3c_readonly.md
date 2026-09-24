@@ -32,21 +32,64 @@
 **不走** `make_robot` / lerobot 的 robot 包装 —— 现有连接流程会**使能 + 标定归位**，
 断开流程也可能发送动作，**不能借它来「只读」**。本脚本直接用 `piper_sdk`。
 
-### 三层保护（**结构性，不是注释**）
+### ⚠ 准确表述：这是**护栏**，不是不可绕过的安全边界
 
-| | |
+2026-09-22 审查复现了两条绕过路径（**纯假对象，未导入 SDK、未碰 CAN**），**均已修**：
+
+| 绕过路径 | 修法 |
 |---|---|
-| **允许清单代理** | 在**属性访问层**拦截：不在清单里的方法名**取到的瞬间就抛** `ForbiddenCall`，调用方**没有机会**调到禁用方法；写属性一律拒绝 |
-| **`piper_init=False`** | `ConnectPort` 的默认 `piper_init=True` 会自动调 `PiperInit()`，**立刻发三条查询帧** ⇒ 本脚本关掉它，把「发帧」显式化、可拒绝 |
-| **两道确认** | `--i-confirm-arm-is-idle`（现场确认）+ `--send-query-frames`（同意发查询帧），**都不给就不连接设备** |
+| `p._inner.JointCtrl()` —— 内部对象存成属性，可取到后绕开代理 | 内部对象改存**闭包**，`p._inner` **不存在** |
+| `p.ConnectPort()` 不传参 ⇒ `piper_init` 默认 `True`，绕过查询开关 | `ConnectPort` **移出允许清单**，改由**参数固定**的 `connect_readonly()` 入口 |
 
-### ⚠ 查询也是往总线写帧
+但 Python 层面不存在真正不可绕过的边界 ⇒ **只能称「护栏」**。
 
-`Search*` 系列会发 CAN **查询**帧（如最大加速度查询 `0x472`）。
-它们**不是运动指令**，但**确实是总线写入** ⇒ 默认**不发**。
-要读**固件侧**的限速/加速度/固件版本才需要 `--send-query-frames`。
+| 三层 | |
+|---|---|
+| **允许清单代理** | `__getattribute__` 层拦截；不在清单里取到即抛 `ForbiddenCall`；写/删属性一律拒绝 |
+| **`connect_readonly()`** | **参数固定** `piper_init=False`；默认 `True` 会自动调 `PiperInit()` |
+| **两道确认** | `--i-confirm-arm-is-idle` + `--send-query-frames`，都不给就不连接设备 |
 
-`DisconnectPort()` **已读源码核实**：只置标志位、停读线程、`join`，**不发任何动作**。
+### ⚠ 查询也是往总线写帧 —— **共 13 帧，不是 3 帧**
+
+`PiperInit()` = `SearchAllMotorMaxAngleSpd`(**6**) + `SearchAllMotorMaxAccLimit`(**6**)
++ `SearchPiperFirmwareVersion`(**1**) = **13 帧**。
+它们**不是运动指令，但确实是总线写入** ⇒ 默认**不发**。
+要读**固件侧**（应答式）的限位/限速/加速度/固件版本才需要 `--send-query-frames`。
+
+### ⚠ `DisconnectPort()`：不发动作成立，但**不能声称线程已全部退出**
+
+源码核实：它只置标志、设停止事件、关 CAN 口，**不发任何动作**。但
+
+- SDK 建了 `__can_deal_th` 与 `__can_monitor_th` **两个**线程；
+- `can_monitor_th` 的 join **被注释掉**；
+- `can_deal_th` 的 join 守卫写的是 `hasattr(self, 'can_deal_th')`，
+  与名字改写后的真实属性 `_C_PiperInterface_V2__can_deal_th` **不匹配**
+  ⇒ **该 join 分支实际从不执行**。
+
+### ⚠ 反馈有效性：**「没抛异常」不等于「读到了」**
+
+每项读取都标 `status`：`valid` / `no_reply` / `stale` / `error` / `unknown`。
+
+- 固件读不到时返回 **`-0x4AF`** ⇒ 判 `no_reply`（不是成功）
+- `time_stamp` 全为 0 ⇒ `no_reply`；两次读取**未推进** ⇒ `stale`
+- 应答式的六电机数据**逐条查 `motor_num` 完整性**，缺项即降级
+- **连接标记为真不证明收到了设备反馈**
+- **静止确认必须「`time_stamp` 推进（证明在收流）**且**读数不变」**；
+  断流时两份相同缓存**不算**静止确认
+- `query_frames_sent_evidence` = **查询前后 `time_stamp` 是否推进**，不是开关值
+
+### ⚠ 两处接口订正
+
+- `GetArmModeCtrl` 返回的是**监听到的 0x151 控制命令缓存**，
+  **不是设备当前模式反馈** ⇒ 当前模式看 **`GetArmStatus`（CAN 0x2A1）**。
+- `GetSDKJointLimitParam(joint_name)` **必须传关节名** ⇒ 逐个读 `j1…j6`。
+
+### 记录
+
+- `dump()` **递归**展开 list/dict/tuple（否则六电机列表被压成字符串）
+- CAN 接口状态按 `--can` 记录（不再固定 `can0`）
+- **每次运行独立文件** `outputs/probe_3c/readonly/readonly_<UTC>[_q].json`，不覆盖
+- 连接/查询异常时**已完成步骤与异常一并落盘**（`steps_done` / `fatal`）
 
 ### 三步执行
 
@@ -61,9 +104,12 @@ python -u sim/readonly_check_3c.py --i-confirm-arm-is-idle
 python -u sim/readonly_check_3c.py --i-confirm-arm-is-idle --send-query-frames
 ```
 
-离线自检 7 项（全过）：允许清单可用 · **19 个使能/动作/夹爪/配置方法全被拦截** ·
-查询帧默认也拦 · 写属性被拒 · 显式开启后查询帧才可用 ·
-**开了查询帧后动作方法仍被拦** · 未导入 lerobot robot 包装。
+离线自检 **16 项全过**：允许清单 · 19 个禁用方法全拦 · **两条绕过路径已堵**
+（`p._inner` 不存在 / `connect_readonly()` 固定 `piper_init=False`）· 写删属性被拒 ·
+查询帧需显式开启且开启后动作仍被拦 · **`-0x4AF` / 全零 / 未推进时间戳的判定** ·
+`dump()` 递归 · 六电机完整性 · 未导入 lerobot robot 包装。
+
+⚠ **自检只覆盖代理与判定逻辑**；真实接口的反馈内容仍须上机后按 `status` 字段逐项核对。
 
 ---
 
