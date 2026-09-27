@@ -229,7 +229,52 @@ def check_six(dumped, num_key, val_keys):
                          "**不判 no_reply**"}
 
 
-def classify(name, val, prev_ts=None):
+# ⚠ **「数据来源」与「有效性/新鲜度」是两件事，必须分开记录。**
+#   同为「没有 time_stamp」，含义完全不同：
+#     · SDK 本地常量 —— 本就没有新鲜度可言（版本、SDK 软限、夹爪范围）
+#     · SDK 本地统计 —— 本地算的（can_fps）
+#     · **设备反馈的派生值** —— 有新鲜度，但要看**源反馈**（enable_status）
+SOURCE = {
+    # 设备 CAN 反馈
+    "GetArmStatus": "device_feedback", "GetArmJointMsgs": "device_feedback",
+    "GetArmLowSpdInfoMsgs": "device_feedback", "GetArmHighSpdInfoMsgs": "device_feedback",
+    "GetPiperFirmwareVersion": "device_feedback", "GetArmModeCtrl": "device_feedback",
+    "GetAllMotorAngleLimitMaxSpd": "device_feedback",
+    "GetAllMotorMaxAccLimit": "device_feedback",
+    "GetCurrentMotorAngleLimitMaxVel": "device_feedback",
+    "GetCurrentMotorMaxAccLimit": "device_feedback",
+    "GetCurrentEndVelAndAccParam": "device_feedback",
+    "GetCrashProtectionLevelFeedback": "device_feedback",
+    # **设备反馈的派生值** —— 见 DERIVED_FROM
+    "GetArmEnableStatus": "device_feedback_derived",
+    # SDK 本地常量 / 统计
+    "GetSDKJointLimitParam": "sdk_local", "GetSDKGripperRangeParam": "sdk_local",
+    "GetCurrentProtocolVersion": "sdk_local", "GetCurrentSDKVersion": "sdk_local",
+    "GetCurrentInterfaceVersion": "sdk_local", "GetCanName": "sdk_local",
+    "GetCanFps": "sdk_statistic",
+}
+# 派生值 → 其源反馈。**源的有效性未核实时，派生值一律记 `unverified`。**
+DERIVED_FROM = {
+    "GetArmEnableStatus": (
+        "GetArmLowSpdInfoMsgs",
+        "由六个电机低速反馈缓存的 `foc_status.driver_enable_status` 提取"
+        "（`piper_interface_v2.py` 的 `GetArmEnableStatus`）。"
+        "⚠ **缓存初始化也全是 False** ⇒ 源反馈未核实时，"
+        "全 False **只能写「使能状态未核实」，不得读作「未使能」**"),
+}
+
+
+def classify(name, val, prev_ts=None, source=None):
+    src = source or SOURCE.get(name, "device_feedback")
+    if src in ("sdk_local", "sdk_statistic"):
+        # **不是「无法判定新鲜度」** —— 本地值本就没有新鲜度这回事
+        return ("sdk_local" if src == "sdk_local" else "sdk_statistic",
+                "SDK 本地" + ("常量" if src == "sdk_local" else "统计量")
+                + "，**无设备新鲜度可言**（不是 unknown）")
+    return _classify_feedback(name, val, prev_ts)
+
+
+def _classify_feedback(name, val, prev_ts=None):
     """→ `valid` / `no_reply` / `stale` / `error` / `unknown`，并附理由。"""
     if isinstance(val, dict) and "error" in val:
         return "error", val["error"]
@@ -430,7 +475,23 @@ def guard_selftest() -> bool:
     chk("17 **不发查询但状态流更新** ⇒ 查询不算成功（应答式未推进）",
         stream_adv is True and resp_adv is False)
 
-    chk("18 未导入 lerobot 的 robot 包装",
+    # ── 复审 2026-09-27 要求补的：来源分类 与 派生值 ────────────────────
+    chk("18 SDK 本地常量判 `sdk_local`，**不是 unknown**",
+        classify("GetCurrentSDKVersion", {"v": "0.6.1"})[0] == "sdk_local"
+        and classify("GetSDKJointLimitParam", [-1.0, 1.0])[0] == "sdk_local")
+    chk("18b `can_fps` 判 `sdk_statistic`（本地统计量，非设备反馈）",
+        classify("GetCanFps", 3060.0)[0] == "sdk_statistic")
+    chk("18c 设备反馈仍按新鲜度判",
+        classify("GetArmStatus", {"time_stamp": 0})[0] == "no_reply"
+        and classify("GetArmStatus", {"time_stamp": 5.0})[0] == "valid")
+    chk("19 `enable_status` 被标为**设备反馈的派生值**且记了源",
+        SOURCE["GetArmEnableStatus"] == "device_feedback_derived"
+        and DERIVED_FROM["GetArmEnableStatus"][0] == "GetArmLowSpdInfoMsgs")
+    chk("19b 派生说明写明「缓存初始化也全 False ⇒ 不得读作未使能」",
+        "不得读作" in DERIVED_FROM["GetArmEnableStatus"][1]
+        and "全 False" in DERIVED_FROM["GetArmEnableStatus"][1])
+
+    chk("20 未导入 lerobot 的 robot 包装",
         "lerobot.common.robot_devices.robots" not in sys.modules)
     print(f"\n  ⇒ 自检 {sum(ok.values())}/{len(ok)} 通过")
     print("  ⚠ 自检只覆盖**代理与判定逻辑**；真实接口的反馈内容仍须上机后按 "
@@ -446,7 +507,12 @@ class _Slot(dict):
 
 
 class FakeArm:
-    """三种场景：`full`（六关节齐全）/ `partial`（只 j1 回复）/ `silent`（全无回复）。
+    """三种场景，**都保持状态流正常**（差别只在应答式数据）：
+
+    - `full`   六关节限值齐全
+    - `partial` 只 j1 回复限值
+    - `silent`  **限值/固件无应答，但状态流正常** —— **不是「所有反馈都没有」**
+      ⇒ 该场景下静止确认**照样成立**，二者不矛盾。
 
     结构**对齐实物**：`motor` 长度 7、`motor[0]` 占位、加速度用 `joint_motor_num`。
     """
@@ -563,8 +629,9 @@ def e2e_selftest() -> bool:
         print(f"  注入程序性故障：rc={rc}（应为 5）")
     bad = [k for k, v in ok.items() if not v]
     print(f"\n  ⇒ 端到端 {sum(ok.values())}/{len(ok)} 通过" + (f"   **✗ {bad}**" if bad else ""))
-    print("  ⚠ `silent` 场景下读不到限值属**被动 no_reply**，"
-          "**不等同程序失败** ⇒ 退出码仍为 0。")
+    print("  ⚠ `silent` = **限值/固件无应答但状态流正常**（不是「所有反馈都没有」）"
+          "⇒ 静止确认照样成立；读不到限值属**被动 no_reply**，"
+          "**不等同程序失败**，退出码仍为 0。")
     return not bad
 
 
@@ -646,7 +713,12 @@ def main(argv=None) -> int:
                     out[n] = f"ERR {type(e).__name__}"
             return out
 
+        # ⚠ **状态流必须用明确的采样间隔**，且**记录实际间隔**。
+        #   旧版在不发查询帧时 pre/post 背靠背（零间隔）⇒ 时间戳逐位相同、显示 False，
+        #   看起来像「断流」。**背靠背的 False 只能表示「这两次没观察到更新」。**
+        STREAM_MIN_INTERVAL = 0.5
         pre_r, pre_s = snap(RESPONSIVE), snap(STREAM)
+        t_pre = time.monotonic()
         pre_ts = {**pre_r, **pre_s}          # 主读取循环按接口名取「上一次时间戳」
         try:
             fw_pre = dump(p.GetPiperFirmwareVersion())
@@ -665,7 +737,12 @@ def main(argv=None) -> int:
             time.sleep(a.settle)
         else:
             print("  · **未发查询帧** ⇒ 应答式数据（限位/限速/加速度/固件）多半读不到")
+        # 无论是否发查询，都保证一个明确的最小采样间隔
+        gap = STREAM_MIN_INTERVAL - (time.monotonic() - t_pre)
+        if gap > 0:
+            time.sleep(gap)
         post_r, post_s = snap(RESPONSIVE), snap(STREAM)
+        stream_interval = time.monotonic() - t_pre
         try:
             fw_post = dump(p.GetPiperFirmwareVersion())
         except Exception as e:
@@ -697,10 +774,14 @@ def main(argv=None) -> int:
         }
         rec["status_stream"] = {
             "pre": pre_s, "post": post_s,
+            "sampling_interval_s": round(stream_interval, 4),
+            "min_interval_requested_s": STREAM_MIN_INTERVAL,
             "advanced_forward": {n: advanced(pre_s.get(n), post_s.get(n)) for n in STREAM},
-            "note": "**持续更新的状态流** —— 没发查询也会推进，"
-                    "**与查询是否成功无关**，仅用于判断是否在收流",
+            "note": "**持续更新的状态流** —— 没发查询也会推进，**与查询是否成功无关**。"
+                    "⚠ `advanced_forward=False` **只表示「这两次采样没观察到更新」**，"
+                    "**不能解释成断流** —— 须结合 `sampling_interval_s` 读。",
         }
+        print(f"  状态流采样间隔 {stream_interval:.3f} s（下限 {STREAM_MIN_INTERVAL}）")
         for n in RESPONSIVE:
             r_ = resp[n]
             print(f"  查询应答 {n:30} 收到={r_['reply_received']} · "
@@ -714,7 +795,11 @@ def main(argv=None) -> int:
              "固件版本；读不到时返回 -0x4AF"),
             ("arm_status_0x2A1", "GetArmStatus", (),
              "**设备当前状态（含控制模式）的权威来源**，CAN 0x2A1"),
-            ("enable_status", "GetArmEnableStatus", (), "使能状态（只读）"),
+            ("low_spd_info", "GetArmLowSpdInfoMsgs", (),
+             "**`enable_status` 的源反馈** —— 单独读出来才能给派生值提供有效性证据"),
+            ("enable_status", "GetArmEnableStatus", (),
+             "⚠ **派生值**：由低速反馈缓存的 driver_enable_status 提取；"
+             "**缓存初始化也全 False** ⇒ 源未核实时只能写「使能状态未核实」"),
             ("listened_ctrl_0x151", "GetArmModeCtrl", (),
              "⚠ **这是监听到的 0x151 控制命令缓存，不是设备当前模式反馈**；"
              "当前模式看 arm_status_0x2A1"),
@@ -741,7 +826,12 @@ def main(argv=None) -> int:
         if a.inject_program_error:               # 回归用：制造一次接线错
             reads.insert(0, ("__injected__", "GetNoSuchMethod_ForRegression", (), ""))
         for key, meth, args, note in reads:
-            entry = {"method": meth, "args": list(args), "note": note}
+            entry = {"method": meth, "args": list(args), "note": note,
+                     "source": SOURCE.get(meth, "device_feedback")}
+            if meth in DERIVED_FROM:
+                src_m, src_note = DERIVED_FROM[meth]
+                entry["derived_from"] = src_m
+                entry["derivation_note"] = src_note
             try:
                 if key == "__injected__":
                     raise NameError("name 'pre' is not defined")   # 模拟本次的接线错
@@ -749,6 +839,19 @@ def main(argv=None) -> int:
                 entry["value"] = v
                 prev = pre_ts.get(meth)          # ← 合并后的快照（旧版引用已删的 `pre`）
                 st, why = classify(meth, v, prev_ts=prev)
+                # **派生值**：源反馈未核实 ⇒ 一律 `unverified`，**不得**读作设备状态
+                if meth in DERIVED_FROM:
+                    src_key = next((k for k, m2, *_ in
+                                    [(k2, r2["method"]) for k2, r2 in rec["reads"].items()]
+                                    if m2 == DERIVED_FROM[meth][0]), None)
+                    src_st = rec["reads"].get(src_key, {}).get("status")
+                    if src_st != "valid":
+                        st = "unverified"
+                        why = (f"源反馈 `{DERIVED_FROM[meth][0]}` 的 status="
+                               f"{src_st!r} ⇒ **本派生值未核实**；"
+                               f"全 False **不得读作「未使能」**")
+                    else:
+                        why = why + f"（源反馈 `{DERIVED_FROM[meth][0]}` 有效）"
                 entry["status"], entry["status_reason"] = st, why
                 if meth in AGGREGATE:          # **只有两个聚合接口**做六关节检查
                     nk, vk = AGGREGATE[meth]
@@ -765,8 +868,9 @@ def main(argv=None) -> int:
                             why + " ；六关节编号齐全，但 "
                             + ",".join(comp["zero_value_slots"])
                             + " **数值为零 ⇒ 已回复，数值含义待核实**")
-                mark = {"valid": "✓", "stale": "◐", "no_reply": "✗",
-                        "error": "⚠", "unknown": "?"}[entry["status"]]
+                mark = {"valid": "✓", "stale": "◐", "no_reply": "✗", "error": "⚠",
+                        "unknown": "?", "sdk_local": "·", "sdk_statistic": "·",
+                        "unverified": "~"}[entry["status"]]
                 print(f"  {mark} {key:26} {entry['status']:9} {entry['status_reason']}")
             except Exception as e:
                 prog = isinstance(e, PROGRAM_ERRORS)
@@ -830,11 +934,17 @@ def main(argv=None) -> int:
         save()
         print(f"\n→ {out}")
 
+    import collections as _c
     n_valid = sum(1 for v in rec["reads"].values() if v.get("status") == "valid")
+    by_src = _c.Counter(v.get("source") for v in rec["reads"].values())
+    dev = [v for v in rec["reads"].values() if v.get("source", "").startswith("device")]
+    n_dev_valid = sum(1 for v in dev if v.get("status") == "valid")
     prog_err = rec.get("program_errors", [])
     print("\n" + "=" * 78)
-    print(f"有效反馈 {n_valid}/{len(rec['reads'])} 项 —— "
-          f"**`status` 不是 `valid` 的项一律不得当作已读到的事实**")
+    print(f"**设备反馈** 有效 {n_dev_valid}/{len(dev)} 项 ｜ 来源分布 {dict(by_src)}")
+    print(f"⚠ **`status` 不是 `valid` 的项一律不得当作已读到的事实**；"
+          f"`sdk_local`/`sdk_statistic` 是**本地值，不是设备反馈**；"
+          f"`unverified` 是**派生值且源未核实**。")
     if prog_err:
         print(f"⛔ **{len(prog_err)} 项程序性故障**（接线/字段/签名错，不是设备没回）：")
         for m_ in prog_err[:5]:
