@@ -491,6 +491,9 @@ def guard_selftest() -> bool:
         "不得读作" in DERIVED_FROM["GetArmEnableStatus"][1]
         and "全 False" in DERIVED_FROM["GetArmEnableStatus"][1])
 
+    chk("19c 源有效+六机齐全+含真实物理量 ⇒ 派生值应判 valid（旧版仍留 unknown 是 bug）",
+        True)  # 逻辑在主流程，由 e2e 的 full 场景断言 enable_status=valid
+
     chk("20 未导入 lerobot 的 robot 包装",
         "lerobot.common.robot_devices.robots" not in sys.modules)
     print(f"\n  ⇒ 自检 {sum(ok.values())}/{len(ok)} 通过")
@@ -577,6 +580,16 @@ class FakeArm:
     def SearchPiperFirmwareVersion(self):
         self.queried = True
 
+    def GetArmLowSpdInfoMsgs(self):
+        """六电机低速反馈 —— 带真实物理量（电压/温度），非缓存默认。"""
+        d = {"time_stamp": self._tick(), "Hz": 40.0}
+        for i in range(1, 7):
+            d[f"motor_{i}"] = _Slot({
+                "can_id": 608 + i, "vol": 230, "foc_temp": 35, "motor_temp": 30,
+                "_foc_status_code": 0,
+                "foc_status": _Slot({"driver_enable_status": False})})
+        return _Slot(d)
+
     def GetSDKJointLimitParam(self, joint_name):
         assert joint_name in JOINTS, f"必须传 j1..j6，得到 {joint_name!r}"
         return _Slot({"joint": joint_name, "min": -1.0, "max": 1.0})
@@ -616,6 +629,10 @@ def e2e_selftest() -> bool:
             ok[f"{k} 落盘 1 个文件"] = len(files) == 1
             ok[f"{k} 静止确认成立"] = idle is True
             ok[f"{k} 六关节编号完整={expect_complete}"] = bool(comp) == expect_complete
+            en = reads.get("enable_status", {})
+            ok[f"{k} enable_status 源有效⇒判 valid（非 unknown）"] = (
+                en.get("status") == "valid" and en.get("source_motor_keys")
+                and len(en["source_motor_keys"]) == 6)
             print(f"  {mode:8} rc={rc} · 程序性故障 {len(prog)} · error 读取 {nerr} · "
                   f"静止确认 {idle} · 六关节完整 {comp}")
             for kk, v in list(ok.items())[-6:]:
@@ -841,17 +858,33 @@ def main(argv=None) -> int:
                 st, why = classify(meth, v, prev_ts=prev)
                 # **派生值**：源反馈未核实 ⇒ 一律 `unverified`，**不得**读作设备状态
                 if meth in DERIVED_FROM:
-                    src_key = next((k for k, m2, *_ in
-                                    [(k2, r2["method"]) for k2, r2 in rec["reads"].items()]
-                                    if m2 == DERIVED_FROM[meth][0]), None)
-                    src_st = rec["reads"].get(src_key, {}).get("status")
-                    if src_st != "valid":
+                    src_m = DERIVED_FROM[meth][0]
+                    src = next((r2 for r2 in rec["reads"].values()
+                                if r2.get("method") == src_m), {})
+                    src_st = src.get("status")
+                    # ⚠ 源有效**还不够** —— 还要源里六个电机都在，且内容不是缓存默认的全零
+                    sv = src.get("value") or {}
+                    mots = [k for k in sv if k.startswith("motor_")] if isinstance(sv, dict) else []
+                    nondefault = any(
+                        isinstance(sv.get(k), dict)
+                        and any(isinstance(sv[k].get(f), (int, float)) and sv[k].get(f)
+                                for f in ("vol", "foc_temp", "motor_temp"))
+                        for k in mots)
+                    entry["source_status"] = src_st
+                    entry["source_motor_keys"] = sorted(mots)
+                    entry["source_nondefault_content"] = bool(nondefault)
+                    if src_st != "valid" or len(mots) != 6 or not nondefault:
                         st = "unverified"
-                        why = (f"源反馈 `{DERIVED_FROM[meth][0]}` 的 status="
-                               f"{src_st!r} ⇒ **本派生值未核实**；"
+                        why = (f"源反馈 `{src_m}` status={src_st!r} · 电机项 {len(mots)}/6 · "
+                               f"非默认内容={nondefault} ⇒ **本派生值未核实**；"
                                f"全 False **不得读作「未使能」**")
                     else:
-                        why = why + f"（源反馈 `{DERIVED_FROM[meth][0]}` 有效）"
+                        # 源在收流、六机齐全、含真实物理量（电压/温度）⇒ 这些位是**设备自报**
+                        st = "valid"
+                        why = (f"**派生自设备反馈**：源 `{src_m}` 有效（六电机齐全，"
+                               f"含真实电压/温度 ⇒ 非缓存默认）⇒ 这些位是**设备自报**的值。"
+                               f"⚠ 仍只表示「驱动器自报的使能位」，"
+                               f"其厂商语义待核实")
                 entry["status"], entry["status_reason"] = st, why
                 if meth in AGGREGATE:          # **只有两个聚合接口**做六关节检查
                     nk, vk = AGGREGATE[meth]
