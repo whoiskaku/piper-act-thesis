@@ -94,9 +94,10 @@ def err_energy(resid, K):
 class FAbs:
     """因果空洞卷积（**左填充**）4 层 k=5 d=1/2/4/8 64ch → 1×1 → 3。输出头零初始化。"""
 
-    def __init__(self, dev):
+    def __init__(self, dev, in_ch=21):
+        # `in_ch` 默认 21 ⇒ **阶段 A 行为逐位不变**；27 供 `train_finc_ab4` 的 `F_inc` 复用主干
         import torch, torch.nn as nn
-        layers, c = [], 21
+        layers, c = [], in_ch
         for d in (1, 2, 4, 8):
             layers += [nn.ConstantPad1d(((5 - 1) * d, 0), 0.0),      # **左填充 ⇒ 因果**
                        nn.Conv1d(c, 64, 5, dilation=d), nn.GELU()]

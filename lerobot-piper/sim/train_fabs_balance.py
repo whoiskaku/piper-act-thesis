@@ -83,8 +83,12 @@ def norm_stats(tr):
     return mu, sd
 
 
-def run_fold(tr, te, K, dev, arm, seed, steps=A.STEPS, log=None):
-    """训一折。**固定取第 `steps` 步权重；留出只在最后评分一次。**"""
+def run_fold(tr, te, K, dev, arm, seed, steps=A.STEPS, log=None, return_model=False):
+    """训一折。**固定取第 `steps` 步权重；留出只在最后评分一次。**
+
+    `return_model=True` 时额外回传 `(model, mu, sd)` 供 `train_finc_ab4` 恢复名义分支；
+    **默认 False ⇒ 本脚本既有行为逐位不变**（由该处的逐集 `num`/`den` 完整性检查兜底）。
+    """
     import torch
     m = _build(seed, dev)                     # ① 初始权重：只由 seed 决定
     draw = make_sampler(tr, arm, seed)        # ② 唯一的臂间差异
@@ -117,8 +121,9 @@ def run_fold(tr, te, K, dev, arm, seed, steps=A.STEPS, log=None):
             a_, _ = A.err_energy(e.y - p, K); b_, _ = A.err_energy(e.y, K)
             num += a_; den += b_
             per.append({"ep": e.path, "num": a_, "den": b_})
-    return {"redu": 1.0 - num / den, "num": num, "den": den,
-            "episodes": per, "sec": time.time() - t0}
+    out = {"redu": 1.0 - num / den, "num": num, "den": den,
+           "episodes": per, "sec": time.time() - t0}
+    return (out, m, mu, sd) if return_model else out
 
 
 # ── 判据（预注册 §3）──────────────────────────────────────────────────────
