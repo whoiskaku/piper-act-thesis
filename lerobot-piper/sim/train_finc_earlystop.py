@@ -96,7 +96,8 @@ def train_with_ckpts(tr, base_tr, K, dev, seed, ckpts, evals=None, steps=A.STEPS
             scores[s] = {}
             for name, E, bs in evals:
                 pf = F.finc_predict(net, stats, E, dev)
-                scores[s][name] = [F.Eerr(np.asarray(e.y, np.float64) - (bb + f), K)[0]
+                # **保留 (E, T_e) 两项**（预注册 §4 要求逐集评分带有效帧数）
+                scores[s][name] = [F.Eerr(np.asarray(e.y, np.float64) - (bb + f), K)
                                    for e, bb, f in zip(E, bs, pf)]
 
     t0 = time.time()
@@ -121,11 +122,34 @@ def train_with_ckpts(tr, base_tr, K, dev, seed, ckpts, evals=None, steps=A.STEPS
 
 
 def save_ckpt(path, sd, stats, meta):
+    """落盘权重 + **对应折的归一化统计** + 元数据，返回文件 sha256（预注册 §4）。"""
     import torch
     mu_u, sd_u, mu_d, sd_d = stats
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": sd, "mu_u": mu_u, "sd_u": sd_u, "mu_d": mu_d, "sd_d": sd_d,
                 **meta}, path)
+    return sha(path)
+
+
+def budget_state(elapsed_h, n_done, n_total):
+    """预注册 §5：**超预算或未跑满 ⇒ 未完成**，且**不得**输出 `step*`。
+
+    预算是**总计**，**包含**留一验证、最终训练、评分与保存 ⇒ 最终阶段同样适用。
+    """
+    over = bool(elapsed_h > BUDGET_H)
+    full = bool(n_done == n_total)
+    return {"over_budget": over, "complete": bool(full and not over),
+            "may_select": bool(full and not over)}
+
+
+def compute_gates(p2, gate_d=None):
+    """推进三条 —— **只施加于 (c)@`step*`**；参照臂 `p2["ref"]` **不参与**。"""
+    gate_d = F.GATE_D if gate_d is None else gate_d
+    st = p2["star"]                                    # ← 只读 star，绝不读 ref
+    gb = bool(all(v > 0 for v in st["d_b"].values()) and st["dbar_b"] >= gate_d)
+    gp = bool(all(v > 0 for v in st["d_bp"].values()) and st["dbar_bp"] >= gate_d)
+    ga = bool(st["mean_E_c"] < p2["mean_E_a"])
+    return {"vs_b": gb, "vs_bp": gp, "vs_a": ga, "advance": bool(gb and gp and ga)}
 
 
 # ── 自测 ─────────────────────────────────────────────────────────────────
@@ -203,14 +227,17 @@ def self_test(P1, P2, P3, K, dev, S1, H, base):
         F.aggregate.__module__ == "train_finc_ab4" and F.dbar.__module__ == "train_finc_ab4"
         and F.GATE_D == 0.05)
 
-    # ⑨ 预算守卫：超预算 ⇒ 未完成，**不得**用已完成的折选步数
-    def guard(elapsed_h, done, total):
-        if elapsed_h > BUDGET_H:
-            return {"complete": False, "step_star": None}
-        return {"complete": done == total, "step_star": 0 if done == total else None}
-    chk("9 **超预算 ⇒ 未完成且不输出 step\\***",
-        guard(1.5, 12, 24)["step_star"] is None and not guard(1.5, 12, 24)["complete"])
-    chk("9b 未跑满 24 折也不输出 step*", guard(0.5, 12, 24)["step_star"] is None)
+    # ⑨ 预算守卫 —— 测的是 main() 真正调用的 `budget_state`，不是桩函数
+    chk("9 **超预算 ⇒ 未完成且不得选步数**（跑满也一样）",
+        budget_state(BUDGET_H + 1e-9, 24, 24) == {"over_budget": True, "complete": False,
+                                                  "may_select": False})
+    chk("9b 未跑满 ⇒ 未完成且不得选步数", not budget_state(0.5, 12, 24)["may_select"]
+        and not budget_state(0.5, 12, 24)["complete"])
+    chk("9c 预算内且跑满 ⇒ 完成、可选步数",
+        budget_state(BUDGET_H, 24, 24) == {"over_budget": False, "complete": True,
+                                           "may_select": True})
+    chk("9d **`budget_state` 确实被 main 用于最终阶段**（不止留一阶段）",
+        inspect.getsource(main).count("budget_state(") >= 2)
 
     # ⑩ 逐帧预测 → 逐集评分的 round-trip
     e = P1[0]; p = base["P1"][0]
@@ -219,16 +246,55 @@ def self_test(P1, P2, P3, K, dev, S1, H, base):
     e2 = float((F.Pfilt(arr, K) ** 2).sum()) / (3 * len(F.Pfilt(arr, K)))
     chk("10 **逐帧预测可重算出逐集评分**", abs(e1 - e2) / e1 < 1e-12)
 
-    # ⑪ 门槛只施加于 step*，参照臂不参与
-    chk("11 **参照臂 (c₃₀₀₀) 不参与门槛**（源码中门槛只引用 star 键）",
-        "'star'" in inspect.getsource(main) and "gates" in inspect.getsource(main))
-    chk("11b 参照值表 = 上一轮的 P2 redu", REF_P2_REDU == {0: 0.0098, 1: 0.0205, 2: 0.0516})
+    # ⑪ 门槛只施加于 step* —— **行为测试**（把 star/ref 构造成相反结论，看门槛跟谁走）
+    def mkp2(star_good, ref_good):
+        def arm(g):
+            d = {2000: 0.10, 2001: 0.10, 2002: 0.10} if g else {2000: -0.4, 2001: -0.4, 2002: -0.4}
+            return {"d_b": d, "dbar_b": 0.10 if g else -0.4,
+                    "d_bp": d, "dbar_bp": 0.10 if g else -0.4,
+                    "mean_E_c": 0.01 if g else 0.09}
+        return {"mean_E_a": 0.05, "star": arm(star_good), "ref": arm(ref_good)}
+    chk("11 **参照臂好而 step\\* 差 ⇒ 门槛必须<u>不</u>通过**（行为测试，非文本检查）",
+        compute_gates(mkp2(False, True))["advance"] is False)
+    chk("11b **step\\* 好而参照臂差 ⇒ 门槛必须通过**（⇒ 判据确实跟着 star 走）",
+        compute_gates(mkp2(True, False))["advance"] is True)
+    chk("11c 三条各自独立生效",
+        compute_gates(mkp2(True, True))["advance"] is True
+        and compute_gates(mkp2(False, False))["advance"] is False
+        and compute_gates({"mean_E_a": 0.005, "star": mkp2(True, True)["star"],
+                           "ref": mkp2(True, True)["ref"]})["vs_a"] is False)
+    body = inspect.getsource(compute_gates).split('"""')[-1]     # 去掉 docstring 只看代码
+    chk("11d **`compute_gates` 的代码体不出现 ref/3000**",
+        '"ref"' not in body and "'ref'" not in body and "3000" not in body)
+    chk("11e 参照值表 = 上一轮的 P2 redu", REF_P2_REDU == {0: 0.0098, 1: 0.0205, 2: 0.0516})
 
     # ⑫ 留一检查点份数
     chk("12 **留一检查点份数 = 8 折 × 3 种子 × 8 检查点 = 192**",
         len(P1) * len(TRAIN_SEEDS) * len(CKPTS) == 192,
         f"{len(P1)}×{len(TRAIN_SEEDS)}×{len(CKPTS)} = {len(P1)*len(TRAIN_SEEDS)*len(CKPTS)}"
         f" · 约 {192*70531*4/2**20:.1f} MiB")
+
+    # ⑬ 浮点路径对称性：**F_inc ≡ 0 ⇒ 条件 3 必须<u>不</u>成立**（预注册 §3.2）
+    rep = lambda lst: {k: lst for k in TRAIN_SEEDS}
+    lst_a = [F.Eerr(np.asarray(e.y, np.float64) - p, K)[0] for e, p in zip(P2, base["P2"])]
+    Ea_ = F.aggregate(P2, rep(lst_a))
+    Ec0_ = F.aggregate(P2, rep(list(lst_a)))                 # F_inc≡0 ⇒ 与 (a) 同值
+    chk("13 **(a) 与 (c) 走同一聚合路径 ⇒ 逐探针种子逐位相等**",
+        all(Ea_[s] == Ec0_[s] for s in Ea_),
+        f"max|Δ| = {max(abs(Ea_[s]-Ec0_[s]) for s in Ea_):.3e}")
+    fake = {"mean_E_a": float(np.mean([Ea_[s] for s in sorted(Ea_)])),
+            "star": {"d_b": {s: -0.4 for s in Ea_}, "dbar_b": -0.4,
+                     "d_bp": {s: -0.4 for s in Ea_}, "dbar_bp": -0.4,
+                     "mean_E_c": float(np.mean([Ec0_[s] for s in sorted(Ec0_)]))},
+            "ref": {}}
+    chk("13b ⇒ **`F_inc ≡ 0` 时条件 3（严格低于 (a)）不成立**",
+        compute_gates(fake)["vs_a"] is False,
+        f"mean_E_c − mean_E_a = {fake['star']['mean_E_c']-fake['mean_E_a']:.3e}")
+    bad = F.aggregate(P2, {0: lst_a})                        # 旧的单键路径（反例）
+    chk("13c 旧单键路径确实会引入伪差（⇒ 上一条不是恒真）",
+        any(bad[s] != Ec0_[s] for s in bad) or
+        float(np.mean([bad[s] for s in sorted(bad)])) != fake["star"]["mean_E_c"],
+        f"单键 vs 三键 max|Δ| = {max(abs(bad[s]-Ec0_[s]) for s in bad):.3e}")
     print(f"\n  ⇒ 自测 {sum(ok.values())}/{len(ok)} 通过")
     return all(ok.values())
 
@@ -273,7 +339,7 @@ def main() -> int:
     print("\n" + "=" * 78 + f"\n② P1 留一选训练时长（8 折 × {len(TRAIN_SEEDS)} 种子 = "
           f"{8*len(TRAIN_SEEDS)} 次训练；检查点 {CKPTS}）\n" + "=" * 78)
     seeds_p1 = sorted(int(e.seed) for e in P1)
-    table, over = [], False
+    table, over, loo_sha = [], False, {}
     for fi, sv in enumerate(seeds_p1):
         tr = [e for e in P1 if int(e.seed) != sv]
         va = [e for e in P1 if int(e.seed) == sv]
@@ -283,26 +349,31 @@ def main() -> int:
             _, stats, snaps, scores, _, sec = train_with_ckpts(
                 tr, btr, K, dev, k, CKPTS, evals=[("val", va, bva)])
             for s in CKPTS:
-                save_ckpt(OUT / "loo" / f"fold{sv}_seed{k}_step{s}.pt", snaps[s], stats,
-                          {"fold_holdout_probe_seed": sv, "train_seed": k, "step": s,
-                           "n_train": len(tr)})
-                table.append({"fold": sv, "train_seed": k, "step": s,
-                              "E_val": float(scores[s]["val"][0])})
+                fn = f"fold{sv}_seed{k}_step{s}.pt"
+                loo_sha[fn] = save_ckpt(OUT / "loo" / fn, snaps[s], stats,
+                                        {"fold_holdout_probe_seed": sv, "train_seed": k,
+                                         "step": s, "n_train": len(tr)})
+                E_, T_ = scores[s]["val"][0]
+                table.append({"fold": sv, "train_seed": k, "step": s, "ep": va[0].path,
+                              "E_val": float(E_), "T_val": int(T_)})
             print(f"  折 {fi+1}/8（留出探针种子 {sv}）· 训练种子 {k} · "
-                  f"E@0 {scores[0]['val'][0]:.6g} → E@3000 {scores[3000]['val'][0]:.6g}"
+                  f"E@0 {scores[0]['val'][0][0]:.6g} → E@3000 {scores[3000]['val'][0][0]:.6g}"
                   f"   [{sec:.0f}s]")
-            if (time.time() - t_all) / 3600 > BUDGET_H:
+            if budget_state((time.time() - t_all) / 3600, 0, 1)["over_budget"]:
                 over = True; break
         if over:
             break
 
     n_done = len({(r["fold"], r["train_seed"]) for r in table})
-    if over or n_done != 8 * len(TRAIN_SEEDS):
-        print(f"\n  ⛔ **超预算或未跑满（完成 {n_done}/{8*len(TRAIN_SEEDS)} 折×种子）"
+    n_total = 8 * len(TRAIN_SEEDS)
+    bs = budget_state((time.time() - t_all) / 3600, n_done, n_total)
+    if not bs["may_select"]:
+        print(f"\n  ⛔ **超预算或未跑满（完成 {n_done}/{n_total} 折×种子）"
               f"⇒ 记为未完成，不输出 step\\***")
         (OUT / "finc_earlystop_v1.json").write_text(json.dumps(
-            {"complete": False, "reason": "超预算或未跑满", "n_done": n_done,
-             "loo_table": table, "gpu_hours": (time.time() - t_all) / 3600},
+            {**bs, "reason": "超预算或未跑满", "n_done": n_done, "n_total": n_total,
+             "loo_table": table, "loo_ckpt_sha256": loo_sha,
+             "gpu_hours": (time.time() - t_all) / 3600},
             indent=2, ensure_ascii=False))
         return 5
 
@@ -314,7 +385,8 @@ def main() -> int:
     print(f"\n  ⇒ **step\\* = {star}**" + (f"（并列 {sorted(tied)}，取最早者）"
                                            if len(tied) > 1 else ""))
 
-    result = {"complete": True, "V": V, "step_star": star, "tied": sorted(tied),
+    result = {**bs, "V": V, "step_star": star, "tied": sorted(tied),
+              "n_done": n_done, "n_total": n_total, "loo_ckpt_sha256": loo_sha,
               "beta": beta, "loo_table": table, "ckpts": list(CKPTS),
               "train_seeds": list(TRAIN_SEEDS), "budget_h": BUDGET_H,
               "nominal_ckpt_sha256": sha(NOMINAL_CKPT),
@@ -329,7 +401,31 @@ def main() -> int:
         print("     ⚠ 按构造必然失败的**只有条件 3**（(c)=(a)，不满足严格低于 (a)）；")
         print("     **条件 1、2 取决于 H 与 βH 的实际评分，不能称数学上必然失败。**")
         result["stopped"] = "step*=0：内部验证不支持加入该增量分支"
-        result["gpu_hours"] = (time.time() - t_all) / 3600
+        h0 = (time.time() - t_all) / 3600
+        result["gpu_hours"] = h0
+        result.update(budget_state(h0, n_done, n_total))
+        # (c)@0 ≡ (a) 逐位 ⇒ 仍落盘 (a)/(b)/(b′) 的逐集评分与逐帧预测，供核对条件 1、2
+        for t, E in TIERS:
+            raw = {"a": [F.Eerr(np.asarray(e.y, np.float64) - p, K) for e, p in zip(E, base[t])],
+                   "b": [F.Eerr(np.asarray(e.y, np.float64) - (p + h), K)
+                         for e, p, h in zip(E, base[t], hconv[t])],
+                   "bp": [F.Eerr(np.asarray(e.y, np.float64) - (p + beta * h), K)
+                          for e, p, h in zip(E, base[t], hconv[t])]}
+            result.setdefault("per_episode", {})[t] = {
+                "eps": [e.path for e in E], "probe_seed": [int(e.seed) for e in E],
+                "T_e": [int(x[1]) for x in raw["a"]],
+                "E": {kk: [float(x[0]) for x in vv] for kk, vv in raw.items()},
+                "note": "(c)@0 ≡ (a) 逐位（F_inc 恒为 0）"}
+        np.savez_compressed(OUT / "predictions.npz", **{
+            f"{t}__{kk}__{i}": np.asarray(v[i], np.float64)
+            for t, E in TIERS
+            for kk, v in (("gap", [np.asarray(e.y, np.float64) for e in E]),
+                          ("a", base[t]),
+                          ("b", [p + h for p, h in zip(base[t], hconv[t])]),
+                          ("bp", [p + beta * h for p, h in zip(base[t], hconv[t])]))
+            for i in range(len(v))})
+        (OUT / "episodes.json").write_text(json.dumps(
+            {t: [e.path for e in E] for t, E in TIERS}, indent=2, ensure_ascii=False))
         (OUT / "finc_earlystop_v1.json").write_text(
             json.dumps(result, indent=2, ensure_ascii=False, default=float))
         print(f"\n  用时 {result['gpu_hours']:.3f} GPU·小时（预算 {BUDGET_H}）")
@@ -340,13 +436,17 @@ def main() -> int:
     print("\n" + "=" * 78 + f"\n③ 最终重训（全 {len(P1)} 集 P1，训到 3000，"
           f"存第 {star} 步与第 3000 步）\n" + "=" * 78)
     finc_pred = {t: {"star": {}, "ref": {}} for t, _ in TIERS}
-    p1_uniform, ref_ok = {}, {}
+    p1_uniform, ref_ok, ref_redu, final_sha, loss_hist = {}, {}, {}, {}, {}
     for k in TRAIN_SEEDS:
         net, stats, snaps, _, hist, sec = train_with_ckpts(
             P1, base["P1"], K, dev, k, (star, 3000), log=lambda m: print(m))
+        loss_hist[k] = hist
         for tag, s in (("star", star), ("ref", 3000)):
-            save_ckpt(OUT / "final" / f"seed{k}_step{s}.pt", snaps[s], stats,
-                      {"train_seed": k, "step": s, "role": tag, "n_train": len(P1)})
+            # 文件名含 role ⇒ **`star == 3000` 时不会相撞**
+            fn = f"seed{k}_{tag}_step{s}.pt"
+            final_sha[fn] = save_ckpt(OUT / "final" / fn, snaps[s], stats,
+                                      {"train_seed": k, "step": s, "role": tag,
+                                       "n_train": len(P1)})
             net.m.net.load_state_dict({kk: vv.to(dev) for kk, vv in snaps[s].items()})
             for t, E in TIERS:
                 finc_pred[t][tag][k] = F.finc_predict(net, stats, E, dev)
@@ -357,29 +457,51 @@ def main() -> int:
             d_, _ = A.err_energy(np.asarray(e.y, np.float64), K)
             num += n_; den += d_
         r3k = 1.0 - num / den
+        ref_redu[k] = float(r3k)
         ref_ok[k] = bool(abs(r3k - REF_P2_REDU[k]) < 5e-4)
-        # 最终模型在**全 P1** 的统一评分（补上一轮缺的精确训练/验证比）
-        p1_uniform[k] = {
-            tag: float(np.mean([F.Eerr(np.asarray(e.y, np.float64) - (b_ + f_), K)[0]
-                                for e, b_, f_ in zip(P1, base["P1"], finc_pred["P1"][tag][k])]))
-            for tag in ("star", "ref")}
+        # 最终模型在**全 P1** 的统一评分（补上一轮缺的精确训练/验证比），带逐集 (E, T_e)
+        p1_uniform[k] = {}
+        for tag in ("star", "ref"):
+            per = [F.Eerr(np.asarray(e.y, np.float64) - (b_ + f_), K)
+                   for e, b_, f_ in zip(P1, base["P1"], finc_pred["P1"][tag][k])]
+            p1_uniform[k][tag] = {"mean_E": float(np.mean([x[0] for x in per])),
+                                  "per_ep_E": [float(x[0]) for x in per],
+                                  "per_ep_T": [int(x[1]) for x in per]}
         print(f"  种子 {k}: (c₃₀₀₀) 在 P2 的 redu = {r3k*100:+.2f}% "
               f"(上一轮 {REF_P2_REDU[k]*100:+.2f}%) {'✓ 复现' if ref_ok[k] else '**✗ 不符**'}"
               f"   [{sec:.0f}s]")
 
     # ── 评分与判据 ───────────────────────────────────────────────────
-    E_of = lambda E, preds: [F.Eerr(np.asarray(e.y, np.float64) - p, K)[0]
-                             for e, p in zip(E, preds)]
+    def per_ep(E, preds):
+        """逐集 `(E, T_e)` —— **两项都保留**（预注册 §4「`E` 与有效帧数」）。"""
+        return [F.Eerr(np.asarray(e.y, np.float64) - p, K) for e, p in zip(E, preds)]
+
+    E_of = lambda E, preds: [x[0] for x in per_ep(E, preds)]
     res, preds_dump = {}, {}
     for t, E in TIERS:
-        Ea = F.aggregate(E, {0: E_of(E, base[t])})
-        Eb = F.aggregate(E, {0: E_of(E, [p + h for p, h in zip(base[t], hconv[t])])})
-        Eb2 = F.aggregate(E, {0: E_of(E, [p + beta * h for p, h in zip(base[t], hconv[t])])})
-        row = {"E_a": Ea, "E_b": Eb, "E_bp": Eb2,
-               "mean_E_a": float(np.mean(list(Ea.values())))}
+        raw = {"a": per_ep(E, base[t]),
+               "b": per_ep(E, [p + h for p, h in zip(base[t], hconv[t])]),
+               "bp": per_ep(E, [p + beta * h for p, h in zip(base[t], hconv[t])])}
         for tag in ("star", "ref"):
-            Ec = F.aggregate(E, {k: E_of(E, [p + f_ for p, f_ in zip(base[t], finc_pred[t][tag][k])])
-                                 for k in TRAIN_SEEDS})
+            for k in TRAIN_SEEDS:
+                raw[f"c_{tag}_s{k}"] = per_ep(
+                    E, [p + f_ for p, f_ in zip(base[t], finc_pred[t][tag][k])])
+        # ⚠ (a)/(b)/(b′) 不依赖训练种子，但**必须走与 (c) 完全相同的聚合路径**
+        #   （对 3 个键复制同一列表，语义等价）。否则 `mean([x,x,x]) ≠ x` 的浮点不对称
+        #   会在 `F_inc ≡ 0` 时把「(c) 严格低于 (a)」误判为成立 —— 与预注册 §3.2 冲突。
+        rep = lambda lst: {k: lst for k in TRAIN_SEEDS}
+        Ea = F.aggregate(E, rep([x[0] for x in raw["a"]]))
+        Eb = F.aggregate(E, rep([x[0] for x in raw["b"]]))
+        Eb2 = F.aggregate(E, rep([x[0] for x in raw["bp"]]))
+        row = {"E_a": Ea, "E_b": Eb, "E_bp": Eb2,
+               "mean_E_a": float(np.mean(list(Ea.values()))),
+               # ⚠ **逐集**评分（聚合前）+ 有效帧数 + 该集的探针种子
+               "per_episode": {"eps": [e.path for e in E],
+                               "probe_seed": [int(e.seed) for e in E],
+                               "T_e": [int(x[1]) for x in raw["a"]],
+                               "E": {kk: [float(x[0]) for x in vv] for kk, vv in raw.items()}}}
+        for tag in ("star", "ref"):
+            Ec = F.aggregate(E, {k: [x[0] for x in raw[f"c_{tag}_s{k}"]] for k in TRAIN_SEEDS})
             db, dbb = F.dbar(Eb, Ec); dp, dpb = F.dbar(Eb2, Ec)
             row[tag] = {"E_c": Ec, "d_b": db, "dbar_b": dbb, "d_bp": dp, "dbar_bp": dpb,
                         "mean_E_c": float(np.mean(list(Ec.values())))}
@@ -392,11 +514,10 @@ def main() -> int:
                             for tag in ("star", "ref") for k in TRAIN_SEEDS}}
 
     p2 = res["P2"]; st = p2["star"]
-    gate_b = all(v > 0 for v in st["d_b"].values()) and st["dbar_b"] >= F.GATE_D
-    gate_bp = all(v > 0 for v in st["d_bp"].values()) and st["dbar_bp"] >= F.GATE_D
-    gate_a = st["mean_E_c"] < p2["mean_E_a"]
-    advance = bool(gate_b and gate_bp and gate_a)
+    g = compute_gates(p2)                      # **只读 star；参照臂不参与**
+    gate_b, gate_bp, gate_a, advance = g["vs_b"], g["vs_bp"], g["vs_a"], g["advance"]
     hrs = (time.time() - t_all) / 3600
+    bs_final = budget_state(hrs, n_done, n_total)      # ⚠ 预算是**总计**，最终阶段同样适用
 
     print("\n" + "=" * 78 + f"\n判据（**只施加于 (c)@step\\*={star}**；3000 步只作固定参照）\n"
           + "=" * 78)
@@ -429,13 +550,16 @@ def main() -> int:
           f"{p2['ref']['dbar_b']*100:+.2f}% ｜ (c)@{star} = {st['dbar_b']*100:+.2f}%")
     print(f"    复现上一轮：{ref_ok}" +
           ("" if all(ref_ok.values()) else "   ⚠ **参照臂无效，须在结论中声明**"))
+    ea_p1 = float(np.mean(E_of(P1, base["P1"])))
     print("\n  最终模型在**全 P1** 的统一评分（补上一轮缺的精确训练/验证比）：")
-    print(f"    (a) 在 P1 = {np.mean(E_of(P1, base['P1'])):.6g}")
+    print(f"    (a) 在 P1 = {ea_p1:.6g}")
     for k in TRAIN_SEEDS:
-        print(f"    种子 {k}: (c)@{star} = {p1_uniform[k]['star']:.6g} · "
-              f"(c)@3000 = {p1_uniform[k]['ref']:.6g}")
-    print(f"\n  用时 {hrs:.3f} GPU·小时（预算 {BUDGET_H}）"
-          + ("" if hrs <= BUDGET_H else "   ⚠ **超预算 ⇒ 记为未完成**"))
+        s_, r_ = p1_uniform[k]["star"]["mean_E"], p1_uniform[k]["ref"]["mean_E"]
+        print(f"    种子 {k}: (c)@{star} = {s_:.6g} (= (a) 的 1/{ea_p1/s_:.1f}) · "
+              f"(c)@3000 = {r_:.6g} (= 1/{ea_p1/r_:.1f})")
+    print(f"\n  用时 {hrs:.3f} GPU·小时（预算 {BUDGET_H}，**总计含最终训练/评分/保存**）"
+          + ("" if not bs_final["over_budget"] else
+             "   ⚠ **超预算 ⇒ 记为未完成（complete=false）**"))
 
     np.savez_compressed(OUT / "predictions.npz",
                         **{f"{t}__{kk}__{i}": np.asarray(v[i], np.float64)
@@ -443,12 +567,14 @@ def main() -> int:
                            if kk != "eps" for i in range(len(v))})
     (OUT / "episodes.json").write_text(json.dumps(
         {t: preds_dump[t]["eps"] for t, _ in TIERS}, indent=2, ensure_ascii=False))
-    result.update({"results": res, "p1_uniform": p1_uniform,
-                   "E_a_P1_mean": float(np.mean(E_of(P1, base["P1"]))),
-                   "ref_reproduces_prev_round": ref_ok,
-                   "gates": {"vs_b": gate_b, "vs_bp": gate_bp, "vs_a": gate_a,
-                             "advance": advance, "applied_to": f"(c)@step*={star}"},
-                   "gpu_hours": hrs,
+    result.update({"results": res, "p1_uniform": p1_uniform, "E_a_P1_mean": ea_p1,
+                   "ref_reproduces_prev_round": ref_ok, "ref_P2_redu": ref_redu,
+                   "ref_P2_redu_prev_round": REF_P2_REDU,
+                   "final_ckpt_sha256": final_sha, "loo_ckpt_sha256": loo_sha,
+                   "final_loss_history": loss_hist,
+                   "gates": {**g, "applied_to": f"(c)@step*={star}",
+                             "reference_arm_excluded": "(c)@3000 不参与门槛"},
+                   "gpu_hours": hrs, **bs_final,     # ← **覆盖 complete：超预算即 false**
                    "scope": "**限定 ab4 工况的开发实验；不能视为全会话 G0 已通过；"
                             "不代表跨会话泛化或真机迁移；ab2 保留。**"})
     (OUT / "finc_earlystop_v1.json").write_text(
