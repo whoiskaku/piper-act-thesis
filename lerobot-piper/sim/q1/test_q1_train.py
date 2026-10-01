@@ -83,3 +83,26 @@ def test_split_fold_excludes_held_out_session():
 def test_config_hash_tracks_steps():
     assert TR.config_hash(3000) != TR.config_hash(2999)
     assert TR.config_hash(3000) == TR.config_hash(3000)
+
+
+@pytest.mark.parametrize("mid", ["1a", "1b"])
+@pytest.mark.parametrize("which", ["main", "mid"])
+def test_layered_scored_output_ignores_next_chunk(mid, which, syn):
+    """分层模型被计分的 ê 由传感器层分支构造（u_span / i_span）：改 t1 之后的指令或理想陀螺，
+    每个窗口（含末尾截断的 chunk、中段起点）都必须逐位不变。"""
+    import torch
+    tr, te, R, Wrs, C = syn
+    torch.manual_seed(0)
+    model, st = TR.build(mid, tr)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.05)
+    ws = W.chunk_windows(te) if which == "main" else W.mid_windows(te)
+    base = TR.predict_windows(mid, model, st, te, ws, R, Wrs, C)
+    for field, delta in (("cmd", 0.05), ("ideal", 0.5)):
+        for i, w in enumerate(ws):
+            e1 = copy.copy(te)
+            arr = getattr(te, field).copy()
+            arr[w.t1 + 1:] += delta
+            setattr(e1, field, arr)
+            assert np.array_equal(TR.predict_windows(mid, model, st, e1, ws, R, Wrs, C)[i], base[i]), (field, w)

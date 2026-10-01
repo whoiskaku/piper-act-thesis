@@ -110,30 +110,54 @@ def fit_sensor(tr, R) -> tuple[np.ndarray, np.ndarray]:
     return Wrs, np.stack([C[h] for h in range(len(C))])
 
 
+def sensor_all_file(out) -> Path:
+    return Path(out) / "fullfit" / "sensor_all.npz"
+
+
+def write_sensor(path: Path, tr, R, fold: str) -> dict:
+    Wrs, C = fit_sensor(tr, R)
+    man = {"fold": fold, "train_sessions": sorted({e.sess for e in tr}), "n_train": len(tr),
+           "Wrs_sha256": sha(Wrs), "C_sha256": sha(C), "code": TR.code_sha()}
+    atomic_npz(path, Wrs=Wrs, C=C, manifest=json.dumps(man))
+    return man
+
+
 def cmd_prepare(out, prereg=None) -> None:
-    """每折的传感器层（`r_s` + 1b 前瞻项），只用该折 4 个训练会话。"""
+    """每折的传感器层（`r_s` + 1b 前瞻项），只用该折 4 个训练会话；另写 pp2 图用的全数据版本
+    （在这里一次写好 ⇒ 并行的 fullfit 只读不写）。"""
     require_frozen(prereg)
     eps = D.load_bare()
     R, _ = D.calibration()
     for fold in FOLDS:
         tr, _ = TR.split_fold(eps, fold)
-        Wrs, C = fit_sensor(tr, R)
-        man = {"fold": fold, "train_sessions": sorted({e.sess for e in tr}), "n_train": len(tr),
-               "Wrs_sha256": sha(Wrs), "C_sha256": sha(C), "code": TR.code_sha()}
-        atomic_npz(sensor_file(out, fold), Wrs=Wrs, C=C, manifest=json.dumps(man))
+        man = write_sensor(sensor_file(out, fold), tr, R, fold)
         print(f"  传感器层 {fold}: 训练 {man['train_sessions']} ({len(tr)} 集)", flush=True)
+    write_sensor(sensor_all_file(out), eps, R, "all")
+    print(f"  全数据传感器层（只供 pp2 图）: {len(eps)} 集", flush=True)
+
+
+def _read_sensor(path: Path):
+    if not path.exists():
+        raise RuntimeError(f"缺 {path} —— 先跑 prepare")
+    z = np.load(path)
+    man = json.loads(str(z["manifest"]))
+    if sha(z["Wrs"]) != man["Wrs_sha256"] or sha(z["C"]) != man["C_sha256"]:
+        raise RuntimeError(f"{path}: 传感器层文件与清单哈希不符")
+    if man["code"] != TR.code_sha():
+        raise RuntimeError(f"{path}: 传感器层由另一版代码生成 —— 重跑 prepare")
+    return z["Wrs"], {h: z["C"][h] for h in range(len(z["C"]))}, man
 
 
 def load_sensor(out, fold: str):
-    z = np.load(sensor_file(out, fold))
-    man = json.loads(str(z["manifest"]))
+    Wrs, C, man = _read_sensor(sensor_file(out, fold))
     if man["fold"] != fold or fold in man["train_sessions"]:
         raise RuntimeError(f"{fold}: 留出会话进入了传感器层拟合 / 文件错配")
-    if sha(z["Wrs"]) != man["Wrs_sha256"] or sha(z["C"]) != man["C_sha256"]:
-        raise RuntimeError(f"{fold}: 传感器层文件与清单哈希不符")
-    if man["code"] != TR.code_sha():
-        raise RuntimeError(f"{fold}: 传感器层由另一版代码生成 —— 重跑 prepare")
-    return z["Wrs"], {h: z["C"][h] for h in range(len(z["C"]))}, man
+    return Wrs, C, man
+
+
+def load_sensor_all(out):
+    """pp2 图用的全数据传感器层（由 prepare 写）；缺失、损坏或代码版本不符即报错。"""
+    return _read_sensor(sensor_all_file(out))
 
 
 def job_json(out, model: str, fold: str, seed: int) -> Path:
@@ -241,19 +265,34 @@ def cmd_timing(steps: int) -> None:
 
 
 def cmd_fullfit(out, model: str, steps: int, prereg=None) -> None:
-    """**只供 pp2 波形图**：用全部 100 集训练（seed 0），不进任何判据。"""
+    """**只供 pp2 波形图**：用全部 100 集训练（seed 0），不进任何判据。
+    分层模型只读 prepare 写好的全数据传感器层（并行的 fullfit 不再各自拟合、争写同一文件）。"""
     require_frozen(prereg)
-    eps = D.load_bare()
-    R, _ = D.calibration()
-    fdir = Path(out) / "fullfit"
     if TR.MODELS[model][0] == "layered":
-        sp = fdir / "sensor_all.npz"
-        if not sp.exists():
-            Wrs, C = fit_sensor(eps, R)
-            atomic_npz(sp, Wrs=Wrs, C=C, code=np.asarray(TR.code_sha()))
+        load_sensor_all(out)
+    eps = D.load_bare()
     res = TR.train_one(model, eps, 0, steps, log=lambda m: print(m, flush=True))
-    atomic_torch(fdir / f"{model}.pt", {"model_id": model, "state_dict": res["model"].state_dict(),
-                                        "stats": res["stats"], "config_hash": TR.config_hash(steps)})
+    atomic_torch(Path(out) / "fullfit" / f"{model}.pt",
+                 {"model_id": model, "state_dict": res["model"].state_dict(), "stats": res["stats"],
+                  "steps": steps, "config_hash": TR.config_hash(steps), "code_sha": TR.code_sha()})
+
+
+def load_fullfit(out, model_id: str):
+    """pp2 图用的全数据模型：代码指纹与冻结步数必须与当前一致；分层模型同时载入全数据传感器层。"""
+    import torch
+    p = Path(out) / "fullfit" / f"{model_id}.pt"
+    if not p.exists():
+        raise RuntimeError(f"缺 {p} —— 先跑 fullfit")
+    ck = torch.load(p, weights_only=False)
+    if ck.get("code_sha") != TR.code_sha() or ck.get("config_hash") != TR.config_hash(TR.CONFIG["steps"]):
+        raise RuntimeError(f"{p}: 与当前代码或冻结步数不符 —— 重跑 fullfit")
+    model = TR.rebuild(model_id, ck["stats"])
+    model.load_state_dict(ck["state_dict"])
+    model.eval()
+    Wrs = C = None
+    if TR.MODELS[model_id][0] == "layered":
+        Wrs, C, _ = load_sensor_all(out)
+    return model, ck["stats"], Wrs, C
 
 
 def main(argv=None) -> int:

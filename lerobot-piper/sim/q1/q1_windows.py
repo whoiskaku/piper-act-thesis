@@ -14,7 +14,8 @@ import numpy as np
 import q1_data as D
 
 MID_OFFSET = 50               # 辅助报告的中段起点（默认值，可改）
-LEAD_BINS = ((3, 6), (7, 12), (13, 27), (28, 52), (53, 102))   # 3–6 = chunk 头 4 帧
+# 3–6 = chunk 头 4 帧；97–102 = 每个完整 chunk 的末 6 个计分帧（末端钳位的影响集中处，只报告）
+LEAD_BINS = ((3, 6), (7, 12), (13, 27), (28, 52), (53, 96), (97, 102))
 
 
 @dataclass(frozen=True)

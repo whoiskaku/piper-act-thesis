@@ -7,7 +7,7 @@ import q1_report as REP
 import q1_train as TR
 
 S = REP.SESS
-BINS = ("3-6", "7-12", "13-27", "28-52", "53-102")
+BINS = ("3-6", "7-12", "13-27", "28-52", "53-96", "97-102")
 
 
 def _rho(vals):
@@ -94,3 +94,8 @@ def test_load_runs_rejects_incomplete_or_inconsistent(tmp_path, damage):
         j1.write_text(json.dumps(j))
     with pytest.raises(RuntimeError):
         REP.load_runs(tmp_path)
+
+
+def test_code_sha_covers_the_report():
+    """判据（gate / seed_mean / verify）在 q1_report.py ⇒ 它也必须在冻结的代码指纹里。"""
+    assert "q1_report.py" in TR.CODE_FILES

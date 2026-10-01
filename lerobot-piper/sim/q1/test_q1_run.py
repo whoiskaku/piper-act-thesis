@@ -86,4 +86,57 @@ def test_prepare_and_job_end_to_end_on_synthetic(tmp_path, syn_data, model):
     assert j["pt_sha256"] == RUN.file_sha(base.with_suffix(".pt"))
     assert j["npz_sha256"] == RUN.file_sha(base.with_suffix(".npz"))
     r = j["episodes"][0]
-    assert 0 <= r["num"] and r["den"] > 0 and set(r["lead"]) == {"3-6", "7-12", "13-27", "28-52", "53-102"}
+    assert 0 <= r["num"] and r["den"] > 0 and set(r["lead"]) == {"3-6", "7-12", "13-27", "28-52", "53-96", "97-102"}
+
+
+def test_prepare_also_writes_the_all_data_sensor_layer(tmp_path, syn_data):
+    RUN.cmd_prepare(tmp_path, prereg=_prereg(tmp_path))
+    Wrs, C, man = RUN.load_sensor_all(tmp_path)
+    assert man["n_train"] == len(syn_data) and Wrs.shape == (593, 3) and sorted(C) == list(range(100))
+
+
+def test_fullfit_requires_a_current_all_data_sensor_layer(tmp_path, syn_data):
+    """并行的 fullfit 不得各自拟合并写同一个文件：分层模型只读 prepare 写好的、当前代码的版本。"""
+    pre = _prereg(tmp_path)
+    with pytest.raises(RuntimeError):
+        RUN.cmd_fullfit(tmp_path, "1a", 2, prereg=pre)             # 还没 prepare
+    RUN.cmd_prepare(tmp_path, prereg=pre)
+    z = dict(np.load(RUN.sensor_all_file(tmp_path)))
+    man = json.loads(str(z["manifest"]))
+    man["code"] = "0" * 64
+    z["manifest"] = json.dumps(man)
+    RUN.atomic_npz(RUN.sensor_all_file(tmp_path), **z)
+    with pytest.raises(RuntimeError):
+        RUN.cmd_fullfit(tmp_path, "1a", 2, prereg=pre)             # 旧代码生成的传感器层
+
+
+def test_load_fullfit_checks_code_and_frozen_steps(tmp_path, syn_data, monkeypatch):
+    pre = _prereg(tmp_path)
+    RUN.cmd_prepare(tmp_path, prereg=pre)
+    RUN.cmd_fullfit(tmp_path, "2a", 2, prereg=pre)
+    with pytest.raises(RuntimeError):
+        RUN.load_fullfit(tmp_path, "2a")                            # 2 步 ≠ 冻结的 3000 步
+    monkeypatch.setitem(TR.CONFIG, "steps", 2)
+    model, st, Wrs, C = RUN.load_fullfit(tmp_path, "2a")
+    assert Wrs is None and C is None and not model.training
+    ck = tmp_path / "fullfit" / "2a.pt"
+    import torch
+    d = torch.load(ck, weights_only=False)
+    d["code_sha"] = "0" * 64
+    torch.save(d, ck)
+    with pytest.raises(RuntimeError):
+        RUN.load_fullfit(tmp_path, "2a")                            # 旧代码训练的模型
+
+
+@pytest.mark.slow
+def test_refs_end_to_end_on_synthetic(tmp_path, syn_data):
+    """参照（G-2 同口径 / 旧口径 / AR）在合成数据上走通；产物格式满足汇总的核验（真实数据前先抓崩溃）。"""
+    RUN.cmd_refs(tmp_path, prereg=_prereg(tmp_path))
+    for name in ("g2", "g2_whole", "ar"):
+        for fold in RUN.FOLDS:
+            j = json.loads((tmp_path / "refs" / name / f"{RUN.tag(fold)}.json").read_text())
+            assert j["code_sha"] == TR.code_sha() and {r["sess"] for r in j["episodes"]} == {fold}
+            assert all(set(r["lead"]) == {"3-6", "7-12", "13-27", "28-52", "53-96", "97-102"}
+                       for r in j["episodes"])
+            if name == "ar":
+                assert fold not in j["train_sessions"] and len(j["train_sessions"]) == 4

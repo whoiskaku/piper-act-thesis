@@ -93,3 +93,14 @@ def test_lead_bins_partition_scored_frames():
     assert np.isclose(sum(v[1] for v in tab.values()), W.score(e.gap, 0 * e.gap, K)[1])
     lead = W.lead_of(e.n, ws)
     assert lead[0] == 3 and lead[99] == 102 and lead[100] == 3
+
+
+def test_last_six_scored_frames_of_full_chunks_have_their_own_bin():
+    """末端钳位的影响集中在每个完整 chunk 的末 6 个计分帧（前瞻 97–102）⇒ 单列一组，只报告。"""
+    e = T.synthetic_episode(0)
+    w = W.chunk_windows(e)[1]
+    lead = W.lead_of(e.n, W.chunk_windows(e))
+    assert (lead[w.t1 - 5:w.t1 + 1] == np.arange(97, 103)).all()
+    assert (97, 102) in W.LEAD_BINS and (53, 96) in W.LEAD_BINS
+    tab = W.lead_score(e.gap, np.zeros_like(e.gap), W.chunk_windows(e), W.kernel())
+    assert tab["97-102"][1] > 0

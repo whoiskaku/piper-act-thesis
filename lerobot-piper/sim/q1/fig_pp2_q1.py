@@ -98,8 +98,8 @@ def plot(rows, label: str, Ln: int, Lg: int, path: Path) -> None:
 
 def main(argv=None) -> int:
     gc.disable()
-    import torch
     import q1_g2ref as G
+    import q1_run as RUN
     import q1_train as TR
     from sim.step2_gap_baseline import bare_logs
     ap = argparse.ArgumentParser()
@@ -107,20 +107,13 @@ def main(argv=None) -> int:
     ap.add_argument("--model", required=True, choices=list(TR.MODELS))
     a = ap.parse_args(argv)
     R, b = D.calibration()
-    ck = torch.load(Path(a.out) / "fullfit" / f"{a.model}.pt", weights_only=False)
-    model = TR.rebuild(a.model, ck["stats"])
-    model.load_state_dict(ck["state_dict"])
-    model.eval()
-    Wrs = C = None
-    if TR.MODELS[a.model][0] == "layered":
-        z = np.load(Path(a.out) / "fullfit" / "sensor_all.npz")
-        Wrs, C = z["Wrs"], {h: z["C"][h] for h in range(len(z["C"]))}
+    model, st, Wrs, C = RUN.load_fullfit(a.out, a.model)      # 核对代码指纹与冻结步数
     g2 = G.load_g2()
     eps = [D.load_episode(p, "pp2/bare") for p in bare_logs()]
     raw = []
     for e in eps:
         ws = W.chunk_windows(e)
-        new = TR.predict_episode(a.model, model, ck["stats"], e, ws, R, Wrs, C)
+        new = TR.predict_episode(a.model, model, st, e, ws, R, Wrs, C)
         real, pn = imu_pair(e, new)
         _, pg = imu_pair(e, G.episode_ehat(g2, e, ws, R, b))
         raw.append((e.name, real, pn, pg))
