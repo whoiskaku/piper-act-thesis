@@ -23,7 +23,7 @@ MODELS = {"1a": ("layered", "a"), "1b": ("layered", "b"),
           "3a": ("tr", "a"), "3b": ("tr", "b")}
 CONFIG = {"steps": 3000, "lr": 1e-3, "clip": 1.0, "threads": 1, "device": "cpu"}
 CODE_FILES = ("q1_data.py", "q1_windows.py", "q1_losses.py", "q1_layered.py", "q1_e2e.py",
-              "q1_sensor.py", "q1_train.py", "q1_ar.py", "q1_g2ref.py")
+              "q1_sensor.py", "q1_train.py", "q1_ar.py", "q1_g2ref.py", "q1_run.py")
 
 
 def code_sha() -> str:
