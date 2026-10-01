@@ -19,6 +19,7 @@
 
 ⚠ **本计划授权的范围**：写代码与测试；Task 13 的 30 步耗时测量；预注册草稿。
 **正式训练与评分（Task 14）必须等用户冻结 `reports/PREREG_Q1_STAGE1.md`。** 零机时，不连接机械臂，不做阶段二及以后。
+**执行边界**（用户 2026-10-02）：Native 方式实施 Task 1–13，交付预注册草稿即停。
 
 ## Global Constraints
 
@@ -65,6 +66,19 @@
 - 环境：入口 `gc.disable()`，用 `python -u`（MuJoCo + scipy 的 GC 段错误会吞掉缓冲输出）。
 - 「改完 G 必出 pp2 波形图」：中位集 + 最难集、0.5–9 Hz、带口径。
 
+**用户审阅订正（2026-10-02，静态审阅后定）**
+- 端到端的 `q̂` 基线必须用**钳位后的可见指令**：`q̂` 进联合损失，同样不得读下一 chunk。`ê` 和 `q̂` 都要测「改 `t1` 之后的指令不变」。
+- 1b 的附加线性项**只用掩码后的残差数值**，去掉截距和单独的有效比例通道 ⇒ 没有有效残差时附加项**精确为零**（1a 没有对应项）。
+  - 同一原则也用于折内 AR 参照（无截距、无有效比例）。这是我按同理补的，列在预注册 §11，可撤回。
+- 传感器层要处理无效关节样本：无效值（存为 0）不得经中心差分、FIR、带通污染邻近有效帧。
+  - 拟合与目标只用支撑全有效的行；
+  - 推理时支撑内有效/无效混合即报错。
+- 正式入口（`prepare / job / refs / fullfit`）检查预注册已冻结、且 `code_sha` 与当前代码一致；`timing` 单独允许。
+- 汇总强制核验：六模型 × 五折 × 三种子，以及权重、预测文件、配置指纹完整一致。
+- `r_s` 用实测关节拟合，保留为首版；须注明两点，**不能把胜负单独归因于网络结构**：
+  - 训练用实测关节、推理用 q̂（训练—推理差异）；
+  - 分层方案与端到端方案的训练方法不同。
+
 **Git 与安全**
 - 在 `develop` 上开发与提交（CLAUDE.md）；提交信息**不加 `Co-Authored-By`**。
 - **只 `git add` 本计划新建的文件**；永远不用 `git add -A` / `git add .`。另一会话的未提交工作一律不碰、不提交：
@@ -74,16 +88,16 @@
 
 ## Review Focus
 
-1. **chunk 结构不符**（长度 > 100、起点不连续）：应立即报错，不能静默截断或被跳过。
-   → Task 1 `test_chunk_contract`（`DataContractError` 不会被 `load_bare` 吞掉）。
-2. **编码器中途掉线**（第 2 帧以后出现全零 state）：应判无效并掩码，绝不能当成 0 rad 读数。
-   → Task 1 `test_measured_joints_masks_head_and_dropout`；Task 2 `test_past_block_masks_mid_episode_dropout`。
-3. **留出会话经统计量或闭式拟合泄漏**（归一化、`r_s`、1b 前瞻项、AR 系数）：只能用训练折。
-   → Task 5 `test_fit_rs_uses_only_given_episodes_and_is_deterministic`；Task 7 `test_norm_stats_use_only_given_episodes`；Task 9 `test_split_fold_excludes_held_out_session`；Task 10 `test_load_sensor_rejects_leaky_manifest`、`test_prepare_and_job_end_to_end_on_synthetic`。
-4. **改了代码或步数后混用旧产物**：过期作业应重新排队，汇总应拒绝混合。
-   → Task 10 `test_list_jobs_skips_done_and_requeues_stale`；Task 11 `test_load_runs_rejects_mixed_hashes_and_missing_folds`。
-5. **线程数或环境导致不可复现**：固定单线程 + 确定性算法，同种子逐位相同，不同种子不同。
-   → Task 9 `test_train_is_bit_reproducible_and_predicts`。
+1. **下一 chunk 的信息经派生量泄漏**（例如 `q̂` 的指令基线、理想陀螺的尾部）。窗口内一切输入与输出都只能依赖 `u_{≤t1}` 和 `≤ t0` 的实测。
+   → Task 7 `test_no_leakage`（同时查 `ê` 与 `q̂`）；Task 9 `test_forward_windows_ignore_commands_after_t1`（训练用的前向，6 个模型）与 `test_prediction_ignores_measurements_after_origin`。
+2. **无效样本污染邻近有效帧**：编码器前 2 帧、中途掉线（存为 0）经中心差分、FIR、带通扩散；chunk 结构不符也属此类。应掩码、排除或报错，绝不能当成真实读数。
+   → Task 1 `test_measured_joints_masks_head_and_dropout`、`test_chunk_contract`；Task 2 `test_past_block_masks_mid_episode_dropout`、`test_band_clean_requires_full_support`；Task 5 `test_invalid_joint_values_never_enter_the_fit`、`test_window_support_must_not_mix_valid_and_invalid`；Task 8 `test_stored_value_at_invalid_frame_changes_nothing`。
+3. **附加项在没有有效历史时不为零**：给 b 版（或 AR）混入与历史无关的校正能力。
+   → Task 5 `test_cmap_term_is_exactly_zero_without_valid_history`；Task 4 `test_no_history_predicts_exactly_zero`。
+4. **留出会话经统计量或闭式拟合泄漏**：归一化、`r_s`、1b 前瞻项、AR 系数都只能用训练折。
+   → Task 5 `test_fit_rs_uses_only_given_episodes_and_is_deterministic`；Task 7 `test_norm_stats_use_only_given_episodes`；Task 9 `test_split_fold_excludes_held_out_session`；Task 10 `test_load_sensor_rejects_leaky_manifest`、`test_prepare_and_job_end_to_end_on_synthetic`；Task 11 `leaky_train` 用例。
+5. **未冻结就运行，或混用、缺失、篡改产物，或结果不可复现**。
+   → Task 10 `test_formal_commands_refuse_unless_frozen`、`test_list_jobs_skips_done_and_requeues_stale`、`test_code_sha_covers_the_run_entry`；Task 11 `test_load_runs_rejects_incomplete_or_inconsistent`（8 种损坏）；Task 9 `test_train_is_bit_reproducible_and_predicts`。
 
 ---
 
@@ -122,7 +136,8 @@
 - 测试命令：
   - 快速测试：`$PY -m pytest sim/q1 -q -m "not slow"`；
   - 集成测试：`$PY -m pytest sim/q1 -q -m slow`（读 100 集约 45 s，G-2 复现约 1 分钟）。
-- 本计划的代码已在暂存区镜像里逐模块跑通：快速测试 68 个、集成测试 4 个全部通过。镜像通过软链接指向真实的 `outputs/`、`lerobot/` 和既有 `sim/` 模块。
+- 本计划的代码已在暂存区镜像里跑通：快速测试 94 个、集成测试 4 个全部通过。镜像通过软链接指向真实的 `outputs/`、`lerobot/` 和既有 `sim/` 模块。
+  - 并且按任务顺序逐个重放过：每个任务在实现前测试失败，实现后通过；最终文件与镜像逐字节相同。
   - 照抄即可。若与仓库现状不符，先查原因再改；**不要为了让测试通过而放宽测试**。
 - 提交信息格式 `阶段一 Q1：<内容>`，**不加 `Co-Authored-By`**。
 
@@ -212,7 +227,7 @@ def test_load_bare_matches_fabs_loader(bare_eps, calib):
 - [ ] **Step 2: 运行，确认失败**
 
 Run: `$PY -m pytest sim/q1/test_q1_data.py -q`
-Expected: 收集时报 `ModuleNotFoundError: No module named 'q1_data'`
+Expected: 收集时报 `ImportError`（`ModuleNotFoundError: No module named 'q1_data'`）
 
 - [ ] **Step 3: 实现**
 
@@ -467,6 +482,7 @@ git commit -m "阶段一 Q1：数据层（100 集 → Q1Episode；chunk 与编�
   - 拼接与计分：
     - `stitch(n, windows, preds) -> (n,3)`
     - `overlay(base, windows, preds) -> (n,3)`
+    - `band_clean(ok) -> (len,) bool`（带通后干净 ⇔ 原始 ±20 帧全有效；首尾 20 帧为否）
     - `kernel() -> float32 (41,)`
     - `P(v, K)`
     - `score(gap, ehat, K) -> (num, den, f3)`
@@ -554,6 +570,13 @@ def test_mid_windows_and_overlay():
     assert [w.t0 for w in mws] == [50, 150, 250, 350, 450, 550]
     out = W.overlay(np.zeros((e.n, 3)), mws, [np.ones((w.n_scored, 3)) for w in mws])
     assert out[49].sum() == 0 and out[50].sum() == 3 and out[100].sum() == 0
+
+
+def test_band_clean_requires_full_support():
+    ok = np.ones(200, bool); ok[100] = False
+    bc = W.band_clean(ok)
+    assert not bc[:D.EDGE].any() and not bc[-D.EDGE:].any()
+    assert not bc[80:121].any() and bc[79] and bc[121]
 
 
 def test_lead_bins_partition_scored_frames():
@@ -684,6 +707,16 @@ def overlay(base, windows, preds) -> np.ndarray:
     return out
 
 
+def band_clean(ok) -> np.ndarray:
+    """带通（41 tap 居中）后第 k 帧「干净」⇔ 原始第 k−20 … k+20 帧全部有效；首尾 20 帧一律否。"""
+    ok = np.asarray(ok, bool)
+    bad = np.convolve((~ok).astype(np.float64), np.ones(2 * D.EDGE + 1), mode="same") > 0
+    out = ~bad
+    out[:D.EDGE] = False
+    out[len(out) - D.EDGE:] = False
+    return out
+
+
 def kernel() -> np.ndarray:
     """与 `train_fabs_g0.bp_kernel` 逐位相同（0.5–9 Hz、41 tap、float32）。"""
     from scipy.signal import firwin
@@ -727,7 +760,7 @@ def lead_score(gap, ehat, windows, K, bins=LEAD_BINS) -> dict:
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `$PY -m pytest sim/q1/test_q1_windows.py -q`
-Expected: `9 passed`
+Expected: `10 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -920,9 +953,9 @@ git commit -m "阶段一 Q1：G-2 冻结权重的同口径窗口重预测（旧�
 **Interfaces:**
 - Consumes: `q1_windows.chunk_windows / Window`；`Q1Episode.gap`
 - Produces:
-  - `N_FEAT = 62`
-  - `design_row(ep, t0) -> (62,)`
-  - `fit(eps, windows_of=chunk_windows) -> {h: (62,3)}`
+  - `N_FEAT = 60`（只有掩码后的历史数值；**无截距、无有效比例** ⇒ 没有有效历史时预测精确为 0）
+  - `design_row(ep, t0) -> (60,)`
+  - `fit(eps, windows_of=chunk_windows) -> {h: (60,3)}`
   - `window_ehat(coef, ep, w) -> (n_scored,3)`：缺前瞻时抛 `ValueError`
 
 - [ ] **Step 1: 写失败的测试** —— `sim/q1/test_q1_ar.py`
@@ -942,11 +975,15 @@ import q1_windows as W
 def test_design_row_uses_only_visible_history():
     e = T.synthetic_episode(0)
     x = AR.design_row(e, 100)
-    assert x.shape == (AR.N_FEAT,)
+    assert x.shape == (AR.N_FEAT,) == (3 * D.HIST,)               # 只有历史数值：无截距、无有效比例
     assert np.allclose(x[:3], e.gap[97]) and np.allclose(x[57:60], e.gap[78])
-    assert x[-2] == 1.0 and x[-1] == 1.0
-    x0 = AR.design_row(e, 0)
-    assert (x0[:-2] == 0).all() and x0[-2] == 0.0
+    assert (AR.design_row(e, 0) == 0).all()
+
+
+def test_no_history_predicts_exactly_zero():
+    eps = [T.synthetic_episode(s) for s in range(6)]
+    coef = AR.fit(eps[:5])
+    assert (AR.window_ehat(coef, eps[5], W.chunk_windows(eps[5])[0]) == 0).all()
 
 
 def test_prediction_ignores_gap_after_origin():
@@ -991,7 +1028,9 @@ Expected: `ModuleNotFoundError: No module named 'q1_ar'`
 
 目标 = gap `e_t`（t ∈ [t0, s1]）；输入 = 起点可得的最近 20 个**原始**实测 gap
 `e_{t0−3−l}`（l = 0…19；`e_{t0−3}` 只用到 `ω_{t0}`），三轴联合；每个前瞻一组系数；
-普通最小二乘、不调超参。历史不足（`t0−3−l < 0`）填 0，并加「有效比例」列。
+普通最小二乘、不调超参。历史不足（`t0−3−l < 0`）填 0。
+**无截距、无有效比例列**：没有有效历史时预测精确为 0；逐前瞻截距会学到 chunk 相位的平均
+模板，那不是「误差延续」（与 1b 附加项同一原则，用户 2026-10-02 订正 1b 时定）。
 不复用 `oracle_causal_feedback.py` 的权重与残差目标。
 """
 from __future__ import annotations
@@ -1001,16 +1040,16 @@ import numpy as np
 import q1_data as D
 import q1_windows as W
 
-N_FEAT = 3 * D.HIST + 2
+N_FEAT = 3 * D.HIST
 
 
 def design_row(ep, t0: int) -> np.ndarray:
-    """→ (N_FEAT,) = [e_{t0−3}, …, e_{t0−22}（各 3 轴）, 有效比例, 1]。"""
+    """→ (N_FEAT,) = [e_{t0−3}, …, e_{t0−22}]（各 3 轴；无效 = 0）。"""
     idx = t0 - D.ALIGN_L - np.arange(D.HIST)
     ok = idx >= 0
     h = np.zeros((D.HIST, 3))
     h[ok] = ep.gap[idx[ok]]
-    return np.concatenate([h.ravel(), [ok.mean(), 1.0]])
+    return h.ravel()
 
 
 def fit(eps, windows_of=W.chunk_windows) -> dict:
@@ -1038,13 +1077,13 @@ def window_ehat(coef: dict, ep, w: W.Window) -> np.ndarray:
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `$PY -m pytest sim/q1/test_q1_ar.py -q`
-Expected: `4 passed`
+Expected: `5 passed`
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add sim/q1/q1_ar.py sim/q1/test_q1_ar.py
-git commit -m "阶段一 Q1：折内拟合的线性 AR 参照（不训练神经网络）"
+git commit -m "阶段一 Q1：折内拟合的线性 AR 参照（不训练神经网络；无截距）"
 ```
 
 ---
@@ -1061,19 +1100,22 @@ git commit -m "阶段一 Q1：折内拟合的线性 AR 参照（不训练神经�
   - `train_rq.fir_design`（因果 FIR + 常数列）
   - `q1_windows.chunk_windows`
 - Produces:
-  - 常量：`NLAG=16, LAM=1e-4, N_FEAT=37, FIT_FROM, SPAN_WARM`
+  - 常量：`NLAG=16, LAM=1e-4, N_FEAT=37, STENCIL_BACK=17, STENCIL_FWD=2, SPAN_WARM=20, SUPPORT_BACK=14`
   - 基础：
     - `kin_body(q) -> (L,3)`
     - `features(u7, q, ideal, kin) -> (L,37)`
     - `fir(X) -> (L, 16·37+1)`
     - `bp(x)`
+  - 无效样本：
+    - `clean_rows(q_valid, w_valid) -> (T,) bool`（`q_{k−17…k+2}` 全有效且 `ω_k` 有效）
+    - `check_window_support(ep, t0)`（支撑 `t0−14…t0` 有效/无效混合 ⇒ `DataContractError`）
   - 闭式层：
     - `omega_span(q, u7, ideal, R, Wrs) -> (L,3)`（传感器系）
-    - `fit_rs(eps, R) -> Wrs (593,3)`
-  - 1b 前瞻项：
-    - `residual_history(ep, t0, R, Wrs) -> (62,)`
-    - `sensor_residual(ep, R, Wrs) -> (T,3)`
-    - `fit_cmap(eps, R, Wrs) -> {h: (62,3)}`
+    - `fit_rs(eps, R) -> Wrs (593,3)`（只用 `band_clean(clean_rows)` 的行）
+  - 1b 前瞻项（**无截距、无有效比例**）：
+    - `residual_history(ep, t0, R, Wrs) -> (60,)`（没有有效残差时全 0）
+    - `sensor_residual(ep, R, Wrs) -> (T,3)`（不干净的帧 = NaN）
+    - `fit_cmap(eps, R, Wrs) -> {h: (60,3)}`
 
 - [ ] **Step 1: 写失败的测试** —— `sim/q1/test_q1_sensor.py`
 
@@ -1122,7 +1164,52 @@ def test_residual_history_uses_only_data_up_to_origin():
     q = e.q.copy(); q[101:] += 0.05; e2.q = q
     ww = e.w.copy(); ww[101:] += 1.0; e2.w = ww
     assert np.array_equal(S.residual_history(e2, 100, R, Wrs), x)
-    assert x[-2] == 1.0 and S.residual_history(e, 0, R, Wrs)[-2] == 0.0
+    assert x.shape == (3 * D.HIST,) and (x != 0).all()
+    assert (S.residual_history(e, 0, R, Wrs) == 0).all()
+
+
+def test_cmap_term_is_exactly_zero_without_valid_history():
+    eps = [T.synthetic_episode(s) for s in range(4)]
+    R = np.eye(3)
+    Wrs = S.fit_rs(eps, R)
+    C = S.fit_cmap(eps, R, Wrs)
+    x0 = S.residual_history(eps[0], 0, R, Wrs)
+    assert all(C[h].shape == (3 * D.HIST, 3) and (x0 @ C[h] == 0).all() for h in C)
+
+
+def _dropout(e, k, value):
+    e.q_valid = e.q_valid.copy(); e.q_valid[k] = False
+    e.q = e.q.copy(); e.q[k] = value
+    return e
+
+
+def test_clean_rows_and_band_clean_cover_the_stencils():
+    e = _dropout(T.synthetic_episode(0), 300, 0.0)
+    ok = S.clean_rows(e.q_valid, e.w_valid)
+    assert not ok[:S.STENCIL_BACK + D.Q_VALID_FROM].any() and ok[S.STENCIL_BACK + D.Q_VALID_FROM]
+    assert not ok[298:318].any() and ok[297] and ok[318]           # k−17 ≤ 300 ≤ k+2
+    bc = W.band_clean(ok)
+    assert not bc[278:338].any() and bc[277] and bc[338]
+
+
+def test_invalid_joint_values_never_enter_the_fit():
+    """无效帧里存的数（0 或任意值）不得经中心差分 / FIR / 带通影响拟合与有效帧的残差。"""
+    R = np.eye(3)
+    a = [_dropout(T.synthetic_episode(s), 300, 0.0) for s in range(4)]
+    b = [_dropout(T.synthetic_episode(s), 300, 5.0) for s in range(4)]
+    Wa, Wb = S.fit_rs(a, R), S.fit_rs(b, R)
+    assert np.array_equal(Wa, Wb)
+    ya, yb = S.sensor_residual(a[0], R, Wa), S.sensor_residual(b[0], R, Wa)
+    assert np.array_equal(np.isnan(ya), np.isnan(yb)) and np.array_equal(ya[~np.isnan(ya)], yb[~np.isnan(yb)])
+    assert np.array_equal(S.residual_history(a[0], 310, R, Wa), S.residual_history(b[0], 310, R, Wa))
+
+
+def test_window_support_must_not_mix_valid_and_invalid():
+    e = T.synthetic_episode(0)
+    S.check_window_support(e, 0)                                   # t0 = 0：支撑全是填充 ⇒ 允许
+    S.check_window_support(e, 100)                                 # 全是有效实测 ⇒ 允许
+    with pytest.raises(D.DataContractError):
+        S.check_window_support(_dropout(e, 95, 0.0), 100)
 
 
 def test_fit_cmap_covers_all_leads():
@@ -1130,7 +1217,7 @@ def test_fit_cmap_covers_all_leads():
     R = np.eye(3)
     Wrs = S.fit_rs(eps, R)
     C = S.fit_cmap(eps, R, Wrs)
-    assert sorted(C) == list(range(100)) and C[0].shape == (3 * D.HIST + 2, 3)
+    assert sorted(C) == list(range(100)) and C[0].shape == (3 * D.HIST, 3)
 
 
 @pytest.mark.slow
@@ -1165,8 +1252,13 @@ Expected: `ModuleNotFoundError: No module named 'q1_sensor'`
 `r_s`：因果 FIR（nlag 16、相对岭 1e-4 —— 沿用 G-2 `r_s` 的选定值，不调参），
 特征 = G-2 `rs_features` 的 34 维 + 理想陀螺 3 维（§2.6 输入相同）= 37 维。
 **折内、用实测关节闭式拟合**：目标 = `ω_real − R·kin(q_real)`（与 G-2「目标用真关节」同理），
-特征也取自实测关节 ⇒ 不需要关节层的折外预测、无折内泄漏；代价 = 训练用实测、推理用 q̂。
+特征也取自实测关节 ⇒ 不需要关节层的折外预测、无折内泄漏。
+⚠ 代价 = **训练用实测关节、推理用 q̂**（训练—推理差异，首版保留，报告须注明）。
 拟合在评分频带（0.5–9 Hz）内做。**不复用 G-2 已拟合的 `r_s`。**
+
+无效关节样本（存为 0）：FIR 第 k 行用到 `q_{k−17 … k+2}`（16 个滞后 + 二阶中心差分），
+只有这段支撑全有效的行才进拟合/目标/历史；带通拟合再要求 ±20 帧全干净。
+1b 的附加项**无截距、无有效比例**：没有有效残差时精确为 0（用户 2026-10-02 订正）。
 """
 from __future__ import annotations
 
@@ -1178,8 +1270,10 @@ import q1_windows as W
 NLAG = 16
 LAM = 1e-4
 N_FEAT = 37
-FIT_FROM = D.Q_VALID_FROM + NLAG + 2
+STENCIL_BACK = NLAG + 1        # FIR 第 k 行 ← 特征 k−15…k ← q_{k−17…k+2}
+STENCIL_FWD = 2
 SPAN_WARM = NLAG + 4
+SUPPORT_BACK = STENCIL_BACK - D.ALIGN_L    # 首个计分输出（帧 t0+3）的支撑回到 t0−14
 
 
 def kin_body(q) -> np.ndarray:
@@ -1207,6 +1301,27 @@ def bp(x) -> np.ndarray:
     return np.stack([np.convolve(x[:, j], k, mode="same") for j in range(x.shape[1])], 1)
 
 
+def clean_rows(q_valid, w_valid) -> np.ndarray:
+    """原始行 k「干净」⇔ `q_{k−17 … k+2}` 全有效且 `ω_k` 有效（无效样本不经差分/FIR 进入该行）。"""
+    qv = np.asarray(q_valid, bool)
+    T = len(qv)
+    ok = np.zeros(T, bool)
+    for k in range(STENCIL_BACK, T - STENCIL_FWD):
+        ok[k] = bool(qv[k - STENCIL_BACK:k + STENCIL_FWD + 1].all() and w_valid[k])
+    return ok
+
+
+def check_window_support(ep, t0: int) -> None:
+    """1b 推理：首个计分输出的支撑（帧 t0−14 … t0，来自起点前的实测历史）要么全有效、要么全是填充。
+    混合 ⇒ 填充值会经差分/FIR 污染有效帧 ⇒ 按数据契约报错（本数据只有 t0 = 0 全填充）。"""
+    k = np.arange(t0 - SUPPORT_BACK, t0 + 1)
+    v = np.zeros(len(k), bool)
+    ok = k >= 0
+    v[ok] = ep.q_valid[k[ok]]
+    if v.any() and not v.all():
+        raise D.DataContractError(f"{ep.name} t0={t0}: 传感器层支撑内实测有效/无效混合")
+
+
 def omega_span(q, u7, ideal, R, Wrs) -> np.ndarray:
     """一段跨度上的 `ω̂`（传感器系）= R·kin(q) + r_s；FIR 在跨度起点零历史。"""
     kb = kin_body(q)
@@ -1214,16 +1329,14 @@ def omega_span(q, u7, ideal, R, Wrs) -> np.ndarray:
 
 
 def fit_rs(eps, R) -> np.ndarray:
-    """折内闭式拟合：带内岭回归，`λ = LAM·tr(G)/dim`（同 `train_rq.fit`）。"""
+    """折内闭式拟合：带内岭回归，`λ = LAM·tr(G)/dim`（同 `train_rq.fit`）；只用干净行。"""
     G = B = None
-    a = D.Q_VALID_FROM
     for e in eps:
-        q = e.q[a:]
-        kb = kin_body(q)
-        Dm = fir(features(e.cmd[a:e.T], q, e.ideal[a:e.T], kb))
-        Y = e.w[a:] - kb @ np.asarray(R).T
-        sl = slice(FIT_FROM - a, len(Y) - D.EDGE)
-        Db, Yb = bp(Dm)[sl], bp(Y)[sl]
+        kb = kin_body(e.q)
+        Dm = fir(features(e.cmd[:e.T], e.q, e.ideal[:e.T], kb))
+        Y = e.w - kb @ np.asarray(R).T
+        m = W.band_clean(clean_rows(e.q_valid, e.w_valid))
+        Db, Yb = bp(Dm)[m], bp(Y)[m]
         G = Db.T @ Db if G is None else G + Db.T @ Db
         B = Db.T @ Yb if B is None else B + Db.T @ Yb
     G = G + LAM * (np.trace(G) / G.shape[0]) * np.eye(G.shape[0])
@@ -1232,32 +1345,30 @@ def fit_rs(eps, R) -> np.ndarray:
 
 def residual_history(ep, t0: int, R, Wrs) -> np.ndarray:
     """1b：起点前 20 帧的实测传感器残差 `s_k = ω_k − (R·kin(q_k) + r_s)`，**只用 ≤ t0 的实测**
-    （跨度止于 t0 ⇒ 末帧单侧差分）。→ (3·HIST + 2,) = [s 展平, 有效比例, 1]。"""
+    （跨度止于 t0 ⇒ 末端单侧差分），且只保留支撑内实测全有效的样本，其余置 0。
+    → (3·HIST,)；没有有效样本时全为 0 ⇒ 1b 的附加项精确为 0。"""
     lo = t0 - D.HIST + 1
-    a = max(D.Q_VALID_FROM, lo - SPAN_WARM)
+    a = max(0, lo - SPAN_WARM)
     h = np.zeros((D.HIST, 3))
-    ok = np.zeros(D.HIST, bool)
-    if t0 - a + 1 > NLAG + 2:
+    if t0 - a + 1 > STENCIL_BACK + 1:
+        qv, wv = ep.q_valid[a:t0 + 1], ep.w_valid[a:t0 + 1]
         s = ep.w[a:t0 + 1] - omega_span(ep.q[a:t0 + 1], ep.cmd[a:t0 + 1], ep.ideal[a:t0 + 1], R, Wrs)
         for i, k in enumerate(range(lo, t0 + 1)):
-            if k >= a + NLAG and ep.q_valid[k] and ep.w_valid[k]:
-                h[i] = s[k - a]
-                ok[i] = True
-    return np.concatenate([h.ravel(), [ok.mean(), 1.0]])
+            j = k - a
+            if j >= STENCIL_BACK and wv[j] and qv[j - STENCIL_BACK:min(j + STENCIL_FWD, t0 - a) + 1].all():
+                h[i] = s[j]
+    return h.ravel()
 
 
 def sensor_residual(ep, R, Wrs) -> np.ndarray:
-    """拟合目标：整集实测关节上的传感器残差，帧 0…T−1（FIR 未热身与无效帧 = NaN）。"""
-    a = D.Q_VALID_FROM
-    out = np.full((ep.T, 3), np.nan)
-    om = omega_span(ep.q[a:], ep.cmd[a:ep.T], ep.ideal[a:ep.T], R, Wrs)
-    out[a + NLAG:] = (ep.w[a:] - om)[NLAG:]
-    out[~(ep.q_valid & ep.w_valid)] = np.nan
+    """拟合目标：整集实测关节上的传感器残差，帧 0…T−1（不干净的帧 = NaN）。"""
+    out = ep.w - omega_span(ep.q, ep.cmd[:ep.T], ep.ideal[:ep.T], R, Wrs)
+    out[~clean_rows(ep.q_valid, ep.w_valid)] = np.nan
     return out
 
 
 def fit_cmap(eps, R, Wrs, windows_of=W.chunk_windows) -> dict:
-    """1b 的逐前瞻线性项：`s_{t0+h+3} ≈ x(t0)·C_h`，只用训练折，普通最小二乘。"""
+    """1b 的逐前瞻线性项：`s_{t0+h+3} ≈ x(t0)·C_h`（无截距），只用训练折，普通最小二乘。"""
     rows: dict = {}
     for e in eps:
         y = sensor_residual(e, R, Wrs)
@@ -1276,7 +1387,7 @@ def fit_cmap(eps, R, Wrs, windows_of=W.chunk_windows) -> dict:
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `$PY -m pytest sim/q1/test_q1_sensor.py -q`
-Expected: `6 passed`
+Expected: `10 passed`
 
 slow 测试 `test_measured_joint_sensor_layer_explains_gap` 是实现自检：用了未来实测关节，**不是模型分数**。镜像里实测 redu 0.80，门槛 0.3 只为抓旋转、符号一类的粗错。
 
@@ -1284,7 +1395,7 @@ slow 测试 `test_measured_joint_sensor_layer_explains_gap` 是实现自检：�
 
 ```bash
 git add sim/q1/q1_sensor.py sim/q1/test_q1_sensor.py
-git commit -m "阶段一 Q1：分层模型传感器层（折内实测关节闭式拟合 r_s；1b 实测残差前瞻项）"
+git commit -m "阶段一 Q1：分层模型传感器层（折内实测关节闭式拟合 r_s；无效样本按支撑排除；1b 前瞻项无截距）"
 ```
 
 ---
@@ -1572,7 +1683,7 @@ git commit -m "阶段一 Q1：分层伺服关节层（逐关节 MLP；1a 开环 
   - `window_input(ep, w, st, measured) -> float32 (122, 13|24)`
   - `make_tcn(in_ch)`：参数 66 441（a）/ 69 961（b）
   - `make_transformer(in_ch)`：参数 76 361（a）/ 77 065（b）
-  - `decode(out, ep, windows, st) -> (每窗 ê, 每窗 q̂)`（torch）
+  - `decode(out, ep, windows, st) -> (每窗 ê, 每窗 q̂)`（torch）；`q̂` 的基线是**钳位后的可见指令**
 
 - [ ] **Step 1: 写失败的测试** —— `sim/q1/test_q1_e2e.py`
 
@@ -1625,7 +1736,9 @@ def test_zero_init_is_zero_prediction(name, mk):
     Ee, Qq = _pred(mk(E.CH_A), e, st, False)
     w = W.chunk_windows(e)[1]
     assert all((x == 0).all() for x in Ee)
-    assert np.allclose(Qq[1], e.cmd[np.arange(w.t0, w.s1 + 1) + D.ALIGN_L, :6], atol=1e-6)
+    u_vis = W.visible(e.cmd[:, :6], w.t1, w.s1 + D.ALIGN_L)[np.arange(w.t0, w.s1 + 1) + D.ALIGN_L]
+    assert np.allclose(Qq[1], u_vis, atol=1e-6)                 # q̂ 基线 = 钳位后的可见指令
+    assert np.allclose(Qq[1][-3:], e.cmd[w.t1, :6], atol=1e-6)  # 末 3 帧落在 t1 之后 ⇒ 等于 u_{t1}
 
 
 @pytest.mark.parametrize("name,mk", FAMS)
@@ -1637,17 +1750,19 @@ def test_no_leakage(name, mk, meas):
     w = W.chunk_windows(e)[2]
     torch.manual_seed(0)
     m = _jit(mk(E.CH_B if meas else E.CH_A))
-    base = _pred(m, e, st, meas)[0][2]
+    bE, bQ = (x[2] for x in _pred(m, e, st, meas))
     e1 = copy.copy(e)
     c = e.cmd.copy(); c[w.t1 + 1:] += 0.05; e1.cmd = c
     i_ = e.ideal.copy(); i_[w.t1 + 1:] += 0.5; e1.ideal = i_
-    assert np.array_equal(_pred(m, e1, st, meas)[0][2], base)
+    E1, Q1 = (x[2] for x in _pred(m, e1, st, meas))
+    assert np.array_equal(E1, bE) and np.array_equal(Q1, bQ)     # ê 与 q̂ 都不读下一 chunk
     e2 = copy.copy(e)
     q = e.q.copy(); q[w.t0 + 1:] += 0.05; e2.q = q
     ww = e.w.copy(); ww[w.t0 + 1:] += 0.5; e2.w = ww
-    assert np.array_equal(_pred(m, e2, st, meas)[0][2], base)
+    E2, Q2 = (x[2] for x in _pred(m, e2, st, meas))
+    assert np.array_equal(E2, bE) and np.array_equal(Q2, bQ)
     e3 = copy.copy(e); e3.q = e.q + 0.01; e3.w = e.w + 0.1
-    assert (not np.array_equal(_pred(m, e3, st, meas)[0][2], base)) == meas
+    assert (not np.array_equal(_pred(m, e3, st, meas)[0][2], bE)) == meas
 
 
 @pytest.mark.parametrize("name,mk", FAMS)
@@ -1781,7 +1896,10 @@ def make_transformer(in_ch: int):
 
 
 def decode(out, ep, windows, st: dict):
-    """网络输出 (B,L_SEQ,9) → 每窗 (ê (n_scored,3) torch, q̂ 帧 t0+3…s1+3 (n_scored,6) torch)。"""
+    """网络输出 (B,L_SEQ,9) → 每窗 (ê (n_scored,3) torch, q̂ 帧 t0+3…s1+3 (n_scored,6) torch)。
+
+    q̂ 的基线是**钳位后的可见指令**（帧 > t1 用 u_{t1}）—— q̂ 进联合损失，同样不得读下一 chunk。
+    """
     import torch
     s_e = torch.tensor(st["s_gap"], dtype=out.dtype, device=out.device)
     s_q = torch.tensor(st["s_eps"], dtype=out.dtype, device=out.device)
@@ -1789,7 +1907,8 @@ def decode(out, ep, windows, st: dict):
     for b, w in enumerate(windows):
         i = np.arange(w.n_scored) + 2 + D.HIST          # 帧 t+3 在序列中的位置
         E.append(out[b, i, 6:9] * s_e)
-        u = torch.tensor(ep.cmd[np.arange(w.t0, w.s1 + 1) + D.ALIGN_L, :6], dtype=out.dtype, device=out.device)
+        uv = W.visible(ep.cmd[:, :6], w.t1, w.s1 + D.ALIGN_L)[np.arange(w.t0, w.s1 + 1) + D.ALIGN_L]
+        u = torch.tensor(uv, dtype=out.dtype, device=out.device)
         Q.append(u + out[b, i, :6] * s_q)
     return E, Q
 ```
@@ -1803,7 +1922,7 @@ Expected: `11 passed`
 
 ```bash
 git add sim/q1/q1_e2e.py sim/q1/test_q1_e2e.py
-git commit -m "阶段一 Q1：端到端直接多步 TCN / 因果 Transformer（规模相近、零初始化输出头）"
+git commit -m "阶段一 Q1：端到端直接多步 TCN / 因果 Transformer（规模相近、零初始化输出头、q̂ 基线钳位）"
 ```
 
 ---
@@ -1822,7 +1941,7 @@ git commit -m "阶段一 Q1：端到端直接多步 TCN / 因果 Transformer（�
   - `loss_norms(eps) -> {"c_w", "s_eps", "s_qb"}`
   - `_bp(x, K)`（torch）
   - `omega_loss(ep, ehat (n,3), norms)`
-  - `joint_loss(ep, qhat (n,6), norms)`
+  - `joint_loss(ep, qhat (n,6), norms)`：带内项只取 ±20 帧支撑全有效的帧
 
 - [ ] **Step 1: 写失败的测试** —— `sim/q1/test_q1_losses.py`
 
@@ -1857,10 +1976,23 @@ def test_joint_loss_ignores_invalid_frames():
     e = T.synthetic_episode(0)
     e.q_valid = e.q_valid.copy(); e.q_valid[300] = False
     nm = LS.loss_norms([e])
-    q = torch.tensor(e.q[D.ALIGN_L:D.ALIGN_L + e.n])
+    q = torch.tensor(e.cmd[D.ALIGN_L:D.ALIGN_L + e.n, :6])
     base = LS.joint_loss(e, q.clone(), nm).item()
     q2 = q.clone(); q2[300 - D.ALIGN_L] += 10.0
     assert LS.joint_loss(e, q2, nm).item() == base
+
+
+def test_stored_value_at_invalid_frame_changes_nothing():
+    """无效帧里存的实测值不得经带通进入关节损失或其归一化尺度。"""
+    import copy
+    a = T.synthetic_episode(0)
+    a.q_valid = a.q_valid.copy(); a.q_valid[300] = False
+    a.q = a.q.copy(); a.q[300] = 0.0
+    b = copy.copy(a); b.q = a.q.copy(); b.q[300] = 5.0
+    na, nb = LS.loss_norms([a]), LS.loss_norms([b])
+    assert all(np.array_equal(na[k], nb[k]) for k in na)
+    qh = torch.tensor(a.cmd[D.ALIGN_L:D.ALIGN_L + a.n, :6])
+    assert LS.joint_loss(a, qh, na).item() == LS.joint_loss(b, qh, na).item()
 
 
 def test_losses_are_differentiable():
@@ -1904,8 +2036,9 @@ def loss_norms(eps) -> dict:
     for e in eps:
         k = np.where(e.q_valid)[0]
         E.append(e.cmd[k, :6] - e.q[k])
-        qb = np.stack([np.convolve(e.q[D.ALIGN_L:, j], Kq, mode="same") for j in range(6)], 1)
-        B.append(qb[D.EDGE:-D.EDGE])
+        qv = e.q_valid[D.ALIGN_L:]
+        qb = np.stack([np.convolve(e.q[D.ALIGN_L:, j] * qv, Kq, mode="same") for j in range(6)], 1)
+        B.append(qb[W.band_clean(qv)])                  # 只用 ±20 帧支撑全有效的帧
     return {"c_w": c_w, "s_eps": np.maximum(np.concatenate(E).std(0), 1e-6),
             "s_qb": np.maximum(np.concatenate(B).std(0), 1e-6)}
 
@@ -1929,22 +2062,28 @@ def omega_loss(ep, ehat, norms):
 
 
 def joint_loss(ep, qhat, norms):
-    """`qhat` (n,6) torch = 帧 3 … T−1（已拼接）→ 0.5·宽带 + 0.5·带内（3–9 Hz），各按自身尺度。"""
+    """`qhat` (n,6) torch = 帧 3 … T−1（已拼接）→ 0.5·宽带 + 0.5·带内（3–9 Hz），各按自身尺度。
+
+    无效帧不进宽带项；带内项只取 ±20 帧支撑全有效的帧（无效帧的值不经带通污染邻帧）。
+    """
     import torch
     q = torch.as_tensor(ep.q[D.ALIGN_L:D.ALIGN_L + ep.n], dtype=qhat.dtype, device=qhat.device)
-    m = torch.as_tensor(ep.q_valid[D.ALIGN_L:D.ALIGN_L + ep.n], dtype=qhat.dtype, device=qhat.device)
+    qv = ep.q_valid[D.ALIGN_L:D.ALIGN_L + ep.n]
+    m = torch.as_tensor(qv, dtype=qhat.dtype, device=qhat.device)
+    cm = torch.as_tensor(W.band_clean(qv)[D.EDGE:-D.EDGE], dtype=qhat.dtype, device=qhat.device)
     d = qhat - q
     s_e = torch.as_tensor(norms["s_eps"], dtype=qhat.dtype, device=qhat.device)
     s_b = torch.as_tensor(norms["s_qb"], dtype=qhat.dtype, device=qhat.device)
     broad = (((d / s_e) ** 2) * m[:, None]).sum() / (m.sum() * 6)
-    band = ((_bp(d * m[:, None], q_kernel()) / s_b) ** 2).mean()
+    bd = _bp(d * m[:, None], q_kernel()) / s_b
+    band = ((bd ** 2) * cm[:, None]).sum() / (cm.sum() * 6)
     return (1 - W_BAND) * broad + W_BAND * band
 ```
 
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `$PY -m pytest sim/q1/test_q1_losses.py -q`
-Expected: `4 passed`
+Expected: `5 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -1967,7 +2106,7 @@ git commit -m "阶段一 Q1：拼接后的 ω 损失与关节损失（与 P(·) 
   - 常量：
     - `MODELS = {"1a": ("layered","a"), …, "3b": ("tr","b")}`
     - `CONFIG = {"steps": 3000, "lr": 1e-3, "clip": 1.0, "threads": 1, "device": "cpu"}`
-    - `CODE_FILES`
+    - `CODE_FILES`：本任务为 9 个模块；Task 10 加入 `q1_run.py`（它此时还不存在）
   - 指纹：`code_sha() -> str`；`config_hash(steps) -> str`（16 位）
   - 折与建模：
     - `split_fold(eps, held) -> (tr, te)`
@@ -1976,7 +2115,7 @@ git commit -m "阶段一 Q1：拼接后的 ω 损失与关节损失（与 P(·) 
   - 训练与预测：
     - `forward_windows(...)`
     - `train_one(model_id, tr_eps, seed, steps=None, log=None) -> {"model", "stats", "norms", "loss", "sec"}`
-    - `predict_windows(model_id, model, st, ep, windows, R=None, Wrs=None, C=None) -> list[(n_scored,3)]`
+    - `predict_windows(model_id, model, st, ep, windows, R=None, Wrs=None, C=None) -> list[(n_scored,3)]`（1b 先 `check_window_support`）
     - `predict_episode(...) -> (n,3)`
   - `state_sha256(model) -> str`
 
@@ -2029,6 +2168,32 @@ def test_prediction_ignores_measurements_after_origin(mid, syn):
     ww = te.w.copy(); ww[w.t0 + 1:] += 0.5; e2.w = ww
     p2 = TR.predict_episode(mid, out["model"], out["stats"], e2, ws, R, Wrs, C)
     assert np.array_equal(p2[w.t0:w.s1 + 1], base[w.t0:w.s1 + 1])
+
+
+@pytest.mark.parametrize("mid", list(TR.MODELS))
+def test_forward_windows_ignore_commands_after_t1(mid, syn):
+    """训练用的前向（进联合损失的 q̂ 与 ê）也不得读下一 chunk 的指令/理想陀螺。"""
+    import torch
+    tr, te, R, Wrs, C = syn
+    torch.manual_seed(0)
+    model, st = TR.build(mid, tr)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.05)
+    ws = W.chunk_windows(te)
+    w = ws[2]
+
+    def fw(ep):
+        with torch.no_grad():
+            Ee, Qq, _ = TR.forward_windows(mid, model, st, ep, ws)
+        return (None if Ee is None else Ee[2].numpy()), Qq[2].numpy()
+
+    bE, bQ = fw(te)
+    e1 = copy.copy(te)
+    c = te.cmd.copy(); c[w.t1 + 1:] += 0.05; e1.cmd = c
+    i_ = te.ideal.copy(); i_[w.t1 + 1:] += 0.5; e1.ideal = i_
+    E1, Q1 = fw(e1)
+    assert np.array_equal(Q1, bQ) and (bE is None or np.array_equal(E1, bE))
 
 
 def test_split_fold_excludes_held_out_session():
@@ -2186,6 +2351,7 @@ def predict_windows(model_id, model, st, ep, windows, R=None, Wrs=None, C=None) 
         ts = np.arange(w.t0, w.s1 + 1)
         eh = om[ts + D.ALIGN_L - lo] - ep.ideal[ts]
         if mode == "b":
+            S.check_window_support(ep, w.t0)
             x = S.residual_history(ep, w.t0, R, Wrs)
             eh = eh + np.stack([x @ C[h] for h in range(w.n_scored)])
         preds.append(eh)
@@ -2207,7 +2373,7 @@ def state_sha256(model) -> str:
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `$PY -m pytest sim/q1/test_q1_train.py -q`
-Expected: `11 passed`，约 15 s。
+Expected: `17 passed`，约 15 s。
 
 - [ ] **Step 5: 提交**
 
@@ -2222,26 +2388,28 @@ git commit -m "阶段一 Q1：训练（固定步数取末步、单线程确定�
 
 **Files:**
 - Create: `sim/q1/q1_run.py`
+- Modify: `sim/q1/q1_train.py`（`CODE_FILES` 加入 `q1_run.py`）
 - Test: `sim/q1/test_q1_run.py`
 
 **Interfaces:**
 - Consumes: `q1_train`；`q1_sensor`；`q1_g2ref`；`q1_ar`；`q1_windows`
 - Produces:
-  - CLI 子命令：
-    - `timing [--steps 30]`
+  - CLI 子命令（正式入口另有 `--prereg`，缺省 `reports/PREREG_Q1_STAGE1.md`）：
+    - `timing [--steps 30]`（不经冻结闸门）
     - `prepare --out`
     - `list-jobs --out`
     - `job --out MODEL FOLD SEED`
     - `refs --out`
     - `fullfit --out MODEL`
+  - 冻结闸门：`PREREG`、`class NotFrozenError(RuntimeError)`、`require_frozen(prereg=None)`。状态行须以「**状态：已冻结」开头，且 `code_sha=<16 位>` 与当前代码一致；`main` 遇到它返回 2。
   - 产物布局（`OUT = outputs/q1_stage1`）：
     - `OUT/sensor/{fold}.npz`：`Wrs`、`C`、`manifest`（训练会话 + 哈希 + 代码指纹）
-    - `OUT/jobs/{model}/seed{k}/{fold}.json`：逐集 `num/den/f3/num_aux/lead` + `config_hash` + `state_sha256` + `train_sessions`
+    - `OUT/jobs/{model}/seed{k}/{fold}.json`：逐集 `num/den/f3/num_aux/lead`，以及 `config_hash`、`code_sha`、`state_sha256`、`pt_sha256`、`npz_sha256`、`train_sessions`
     - 同目录的 `.pt`（权重 + 统计量）、`.npz`（逐集拼接 ê）
     - `OUT/refs/{g2,g2_whole,ar}/{fold}.json`
     - `OUT/fullfit/{model}.pt`（+ `sensor_all.npz`）
   - 函数：
-    - 工具：`tag(fold)`、`sha(a)`、`atomic_json / atomic_npz / atomic_torch`
+    - 工具：`tag(fold)`、`sha(a)`、`file_sha(path)`、`atomic_json / atomic_npz / atomic_torch`
     - 计分：`episode_metrics(ep, main, aux, K)`
     - 传感器层：`sensor_file`、`fit_sensor`、`load_sensor`
     - 作业状态：`job_json`、`is_done`
@@ -2270,6 +2438,41 @@ def syn_data(monkeypatch):
     return eps
 
 
+def _prereg(tmp_path, status="**状态：已冻结（测试）**", sha=None):
+    p = tmp_path / "PREREG.md"
+    p.write_text(f"# 预注册\n\n{status}\n代码 code_sha={sha or TR.code_sha()[:16]}\n")
+    return p
+
+
+@pytest.mark.parametrize("case", ["missing", "draft", "stale_sha"])
+def test_formal_commands_refuse_unless_frozen(tmp_path, monkeypatch, case):
+    def boom(*a, **k):
+        raise AssertionError("闸门必须在读数据之前")
+    monkeypatch.setattr(D, "load_bare", boom)
+    pre = {"missing": tmp_path / "none.md",
+           "draft": _prereg(tmp_path, status="**状态：草稿（测试），待用户冻结。**"),
+           "stale_sha": _prereg(tmp_path, sha="0" * 16)}[case]
+    calls = [lambda: RUN.cmd_prepare(tmp_path, prereg=pre),
+             lambda: RUN.cmd_job(tmp_path, "2a", "ab2/A", 0, 2, prereg=pre),
+             lambda: RUN.cmd_refs(tmp_path, prereg=pre),
+             lambda: RUN.cmd_fullfit(tmp_path, "2a", 2, prereg=pre)]
+    for call in calls:
+        with pytest.raises(RUN.NotFrozenError):
+            call()
+    assert RUN.main(["prepare", "--out", str(tmp_path), "--prereg", str(pre)]) == 2
+
+
+def test_timing_needs_no_prereg(syn_data, monkeypatch, capsys):
+    monkeypatch.setattr(RUN, "PREREG", D.ROOT / "reports" / "does_not_exist.md")
+    RUN.cmd_timing(1)
+    assert "s/步" in capsys.readouterr().out
+
+
+def test_code_sha_covers_the_run_entry():
+    """`q1_run.py` 决定写什么进产物（逐集计分、哈希）⇒ 它也必须在代码指纹里。"""
+    assert "q1_run.py" in TR.CODE_FILES
+
+
 def test_list_jobs_skips_done_and_requeues_stale(tmp_path, capsys):
     ch = TR.config_hash(5)
     RUN.atomic_json(RUN.job_json(tmp_path, "1a", "ab5/A", 0), {"config_hash": ch})
@@ -2291,16 +2494,19 @@ def test_load_sensor_rejects_leaky_manifest(tmp_path):
 
 @pytest.mark.parametrize("model", ["1b", "2a"])
 def test_prepare_and_job_end_to_end_on_synthetic(tmp_path, syn_data, model):
-    RUN.cmd_prepare(tmp_path)
+    pre = _prereg(tmp_path)
+    RUN.cmd_prepare(tmp_path, prereg=pre)
     Wrs, C, man = RUN.load_sensor(tmp_path, "ab2/A")
     assert "ab2/A" not in man["train_sessions"] and len(man["train_sessions"]) == 4
-    RUN.cmd_job(tmp_path, model, "ab2/A", 0, steps=2)
-    j = json.loads(RUN.job_json(tmp_path, model, "ab2/A", 0).read_text())
+    RUN.cmd_job(tmp_path, model, "ab2/A", 0, steps=2, prereg=pre)
+    base = RUN.job_json(tmp_path, model, "ab2/A", 0)
+    j = json.loads(base.read_text())
     assert {r["sess"] for r in j["episodes"]} == {"ab2/A"} and "ab2/A" not in j["train_sessions"]
-    assert j["config_hash"] == TR.config_hash(2)
+    assert j["config_hash"] == TR.config_hash(2) and j["code_sha"] == TR.code_sha()
+    assert j["pt_sha256"] == RUN.file_sha(base.with_suffix(".pt"))
+    assert j["npz_sha256"] == RUN.file_sha(base.with_suffix(".npz"))
     r = j["episodes"][0]
     assert 0 <= r["num"] and r["den"] > 0 and set(r["lead"]) == {"3-6", "7-12", "13-27", "28-52", "53-102"}
-    assert RUN.job_json(tmp_path, model, "ab2/A", 0).with_suffix(".pt").exists()
 ```
 
 - [ ] **Step 2: 运行，确认失败**
@@ -2313,8 +2519,9 @@ Expected: `ModuleNotFoundError: No module named 'q1_run'`
 ```python
 """阶段一命令行入口。
 
-⚠ `prepare` / `job` / `refs` / `fullfit` 是**正式运行**，只在 `reports/PREREG_Q1_STAGE1.md`
-冻结后执行。`timing` 只测每步耗时（在 ab5/A 折的训练会话上训几十步，不预测留出、不存权重），
+⚠ `prepare` / `job` / `refs` / `fullfit` 是**正式运行**：入口先查 `reports/PREREG_Q1_STAGE1.md`
+—— 状态行须以「**状态：已冻结」开头，且记录的 `code_sha=` 与当前代码一致，否则拒绝运行。
+`timing` 不经过这道闸门：只测每步耗时（在 ab5/A 折的训练会话上训几十步，不预测留出、不存权重），
 用来填预注册的预算。
 
     python -u sim/q1/q1_run.py timing --steps 30
@@ -2330,6 +2537,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -2345,6 +2553,23 @@ import q1_windows as W         # noqa: E402
 SEEDS = (0, 1, 2)
 FOLDS = tuple(f"{s}/{a}" for s, a in D.SESSIONS)
 TIMING_FOLD = "ab5/A"
+PREREG = D.ROOT / "reports/PREREG_Q1_STAGE1.md"
+
+
+class NotFrozenError(RuntimeError):
+    """预注册不存在、未冻结，或冻结时的代码指纹与当前代码不符。"""
+
+
+def require_frozen(prereg=None) -> None:
+    p = Path(prereg) if prereg is not None else PREREG
+    if not p.exists():
+        raise NotFrozenError(f"拒绝运行：{p} 不存在 —— 正式运行须先冻结预注册")
+    text = p.read_text()
+    if not re.search(r"^\*\*状态：已冻结", text, re.M):
+        raise NotFrozenError(f"拒绝运行：{p.name} 尚未冻结（状态行须以「**状态：已冻结」开头）")
+    m = re.search(r"code_sha=([0-9a-f]{16})", text)
+    if not m or m.group(1) != TR.code_sha()[:16]:
+        raise NotFrozenError("拒绝运行：预注册记录的 code_sha 与当前代码不符 —— 代码改动后须重新冻结")
 
 
 def tag(fold: str) -> str:
@@ -2353,6 +2578,10 @@ def tag(fold: str) -> str:
 
 def sha(a) -> str:
     return hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest()
+
+
+def file_sha(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def _tmp(path: Path) -> Path:
@@ -2400,8 +2629,9 @@ def fit_sensor(tr, R) -> tuple[np.ndarray, np.ndarray]:
     return Wrs, np.stack([C[h] for h in range(len(C))])
 
 
-def cmd_prepare(out) -> None:
+def cmd_prepare(out, prereg=None) -> None:
     """每折的传感器层（`r_s` + 1b 前瞻项），只用该折 4 个训练会话。"""
+    require_frozen(prereg)
     eps = D.load_bare()
     R, _ = D.calibration()
     for fold in FOLDS:
@@ -2454,7 +2684,8 @@ def predict_main_aux(model_id, res, e, R, Wrs, C):
     return main, aux
 
 
-def cmd_job(out, model: str, fold: str, seed: int, steps: int) -> None:
+def cmd_job(out, model: str, fold: str, seed: int, steps: int, prereg=None) -> None:
+    require_frozen(prereg)
     eps = D.load_bare()
     R, _ = D.calibration()
     K = W.kernel()
@@ -2473,15 +2704,18 @@ def cmd_job(out, model: str, fold: str, seed: int, steps: int) -> None:
                                            "stats": res["stats"], "norms": res["norms"]})
     atomic_npz(base.with_suffix(".npz"), **preds)
     atomic_json(base, {"model": model, "fold": fold, "seed": seed, "steps": steps,
-                       "config_hash": TR.config_hash(steps),
+                       "config_hash": TR.config_hash(steps), "code_sha": TR.code_sha(),
                        "state_sha256": TR.state_sha256(res["model"]),
+                       "pt_sha256": file_sha(base.with_suffix(".pt")),
+                       "npz_sha256": file_sha(base.with_suffix(".npz")),
                        "train_sessions": sorted({e.sess for e in tr}), "sec": res["sec"],
                        "loss_tail": float(np.mean(res["loss"][-100:])), "episodes": rows})
     print(f"  完成 {model} {fold} seed{seed}  {res['sec']:.0f}s", flush=True)
 
 
-def cmd_refs(out) -> None:
+def cmd_refs(out, prereg=None) -> None:
     """G-2 同口径重预测、旧口径整集 G-2（只对照）、折内 AR 参照。"""
+    require_frozen(prereg)
     import q1_ar as AR
     import q1_g2ref as G
     eps = D.load_bare()
@@ -2505,6 +2739,7 @@ def cmd_refs(out) -> None:
         for name, r in rows.items():
             atomic_json(Path(out) / "refs" / name / f"{tag(fold)}.json",
                         {"model": name, "fold": fold, "seed": "-", "config_hash": ch,
+                         "code_sha": TR.code_sha(),
                          "train_sessions": sorted({e.sess for e in tr}) if name == "ar" else [],
                          "episodes": r})
         print(f"  参照 {fold} 完成", flush=True)
@@ -2524,8 +2759,9 @@ def cmd_timing(steps: int) -> None:
           f"（另加每个作业载入数据约 1 分钟）；最长单作业 ≈ {max(per.values()) * S_ / 60:.0f} 分钟")
 
 
-def cmd_fullfit(out, model: str, steps: int) -> None:
+def cmd_fullfit(out, model: str, steps: int, prereg=None) -> None:
     """**只供 pp2 波形图**：用全部 100 集训练（seed 0），不进任何判据。"""
+    require_frozen(prereg)
     eps = D.load_bare()
     R, _ = D.calibration()
     fdir = Path(out) / "fullfit"
@@ -2547,31 +2783,38 @@ def main(argv=None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--out", required=True)
         p.add_argument("--steps", type=int, default=TR.CONFIG["steps"])
+        p.add_argument("--prereg", default=None)
     p = sub.add_parser("job")
     p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=TR.CONFIG["steps"])
+    p.add_argument("--prereg", default=None)
     p.add_argument("model", choices=list(TR.MODELS))
     p.add_argument("fold", choices=FOLDS)
     p.add_argument("seed", type=int, choices=SEEDS)
     p = sub.add_parser("fullfit")
     p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=TR.CONFIG["steps"])
+    p.add_argument("--prereg", default=None)
     p.add_argument("model", choices=list(TR.MODELS))
     p = sub.add_parser("timing")
     p.add_argument("--steps", type=int, default=30)
     a = ap.parse_args(argv)
-    if a.cmd == "prepare":
-        cmd_prepare(a.out)
-    elif a.cmd == "list-jobs":
-        cmd_list_jobs(a.out, a.steps)
-    elif a.cmd == "job":
-        cmd_job(a.out, a.model, a.fold, a.seed, a.steps)
-    elif a.cmd == "refs":
-        cmd_refs(a.out)
-    elif a.cmd == "fullfit":
-        cmd_fullfit(a.out, a.model, a.steps)
-    else:
-        cmd_timing(a.steps)
+    try:
+        if a.cmd == "prepare":
+            cmd_prepare(a.out, a.prereg)
+        elif a.cmd == "list-jobs":
+            cmd_list_jobs(a.out, a.steps)
+        elif a.cmd == "job":
+            cmd_job(a.out, a.model, a.fold, a.seed, a.steps, a.prereg)
+        elif a.cmd == "refs":
+            cmd_refs(a.out, a.prereg)
+        elif a.cmd == "fullfit":
+            cmd_fullfit(a.out, a.model, a.steps, a.prereg)
+        else:
+            cmd_timing(a.steps)
+    except NotFrozenError as err:
+        print(err, flush=True)
+        return 2
     return 0
 
 
@@ -2581,16 +2824,30 @@ if __name__ == "__main__":
     os._exit(code)
 ```
 
+再把 `q1_run.py` 加进 `sim/q1/q1_train.py` 的代码指纹（它决定写进产物的计分与哈希），把：
+
+```python
+CODE_FILES = ("q1_data.py", "q1_windows.py", "q1_losses.py", "q1_layered.py", "q1_e2e.py",
+              "q1_sensor.py", "q1_train.py", "q1_ar.py", "q1_g2ref.py")
+```
+
+改为：
+
+```python
+CODE_FILES = ("q1_data.py", "q1_windows.py", "q1_losses.py", "q1_layered.py", "q1_e2e.py",
+              "q1_sensor.py", "q1_train.py", "q1_ar.py", "q1_g2ref.py", "q1_run.py")
+```
+
 - [ ] **Step 4: 运行，确认通过**
 
-Run: `$PY -m pytest sim/q1/test_q1_run.py -q`
-Expected: `4 passed`。端到端用例在合成数据上跑 `prepare` + `job`，约 20 s。
+Run: `$PY -m pytest sim/q1/test_q1_run.py sim/q1/test_q1_train.py -q`
+Expected: `26 passed`（run 9 + train 17）。端到端用例在合成数据上跑 `prepare` + `job`，约 40 s。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add sim/q1/q1_run.py sim/q1/test_q1_run.py
-git commit -m "阶段一 Q1：命令行与产物（可重入作业、原子写、留出会话不进拟合的清单检查）"
+git add sim/q1/q1_run.py sim/q1/test_q1_run.py sim/q1/q1_train.py
+git commit -m "阶段一 Q1：命令行与产物（冻结闸门、可重入作业、原子写、文件哈希、留出会话不进拟合的清单检查）"
 ```
 
 ---
@@ -2604,9 +2861,16 @@ git commit -m "阶段一 Q1：命令行与产物（可重入作业、原子写�
 **Interfaces:**
 - Consumes: Task 10 的 JSON 产物
 - Produces:
-  - 常量：`CANDIDATES`、`SESS`
+  - 常量：`CANDIDATES`、`REFS`、`SEEDS`、`SESS`、`N_EPISODES = 100`
+  - 完整性：`file_sha(path)`；`verify(raw) -> list[str]`，空列表 = 通过。检查以下各项：
+    - 6 模型 × 3 种子 × 5 折，加 3 个参照 × 5 折；
+    - `.pt` / `.npz` 存在，且哈希与记录一致；
+    - 候选的 `config_hash` 唯一；
+    - 全部 `code_sha` = 当前代码；
+    - 训练会话不含留出会话；
+    - 每份产物恰好覆盖同一组 100 集。
   - 载入与聚合：
-    - `load_runs(out) -> {model: {seed: [rows]}}`：混合指纹或缺折时抛 `RuntimeError`
+    - `load_runs(out) -> {model: {seed: [rows]}}`：先 `verify`，有问题即抛 `RuntimeError`（列出全部）
     - `rho_by_session(rows, key="num")`
     - `seed_mean(by_seed, key="num")`
   - 判据与报告：
@@ -2624,9 +2888,12 @@ import json
 
 import pytest
 
+import q1_data as D
 import q1_report as REP
+import q1_train as TR
 
 S = REP.SESS
+BINS = ("3-6", "7-12", "13-27", "28-52", "53-102")
 
 
 def _rho(vals):
@@ -2652,18 +2919,65 @@ def test_b_vs_a_sign():
     assert all(abs(v + 0.2) < 1e-12 for v in d.values())
 
 
-def _write(tmp, model, seed, fold, ch):
-    p = tmp / "jobs" / model / f"seed{seed}" / (fold.replace("/", "_") + ".json")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"model": model, "seed": seed, "fold": fold, "config_hash": ch,
-                             "episodes": [{"sess": fold, "num": 0.1, "den": 1.0}]}))
+def _episodes(fold):
+    return [{"name": f"{fold}_ep{i}", "sess": fold, "num": 0.4, "den": 1.0, "f3": 3, "num_aux": 0.5,
+             "lead": {b: [0.1, 0.2] for b in BINS}} for i in range(D.EXPECTED_COUNTS[fold])]
 
 
-def test_load_runs_rejects_mixed_hashes_and_missing_folds(tmp_path):
-    for f in S:
-        _write(tmp_path, "2a", 0, f, "h1")
-    assert set(REP.load_runs(tmp_path)["2a"]) == {"0"}
-    _write(tmp_path, "2a", 1, S[0], "h2")
+def _tree(tmp):
+    """完整产物树：6 模型 × 3 种子 × 5 折（含 .pt/.npz）+ 3 个参照 × 5 折。"""
+    code = TR.code_sha()
+    for m in REP.CANDIDATES:
+        for seed in REP.SEEDS:
+            for f in S:
+                base = tmp / "jobs" / m / f"seed{seed}" / f.replace("/", "_")
+                base.parent.mkdir(parents=True, exist_ok=True)
+                base.with_suffix(".pt").write_bytes(f"pt{m}{seed}{f}".encode())
+                base.with_suffix(".npz").write_bytes(f"npz{m}{seed}{f}".encode())
+                base.with_suffix(".json").write_text(json.dumps({
+                    "model": m, "seed": int(seed), "fold": f, "config_hash": "cfg", "code_sha": code,
+                    "train_sessions": [x for x in S if x != f],
+                    "pt_sha256": REP.file_sha(base.with_suffix(".pt")),
+                    "npz_sha256": REP.file_sha(base.with_suffix(".npz")), "episodes": _episodes(f)}))
+    for r in REP.REFS:
+        for f in S:
+            p = tmp / "refs" / r / (f.replace("/", "_") + ".json")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"model": r, "seed": "-", "fold": f, "config_hash": code[:16],
+                                     "code_sha": code, "episodes": _episodes(f)}))
+
+
+def test_load_runs_accepts_complete_tree(tmp_path):
+    _tree(tmp_path)
+    s = REP.summarize(REP.load_runs(tmp_path))
+    assert set(s["candidates"]) == set(REP.CANDIDATES) and set(s["b_vs_a"]) == {"1", "2", "3"}
+
+
+@pytest.mark.parametrize("damage", ["missing_npz", "tampered_pt", "mixed_config", "missing_seed",
+                                    "missing_episode", "stale_code", "missing_ref", "leaky_train"])
+def test_load_runs_rejects_incomplete_or_inconsistent(tmp_path, damage):
+    _tree(tmp_path)
+    j1 = tmp_path / "jobs" / "2b" / "seed1" / "ab6_A.json"
+    if damage == "missing_npz":
+        j1.with_suffix(".npz").unlink()
+    elif damage == "tampered_pt":
+        j1.with_suffix(".pt").write_bytes(b"changed")
+    elif damage == "missing_seed":
+        for p in (tmp_path / "jobs" / "3a" / "seed2").iterdir():
+            p.unlink()
+    elif damage == "missing_ref":
+        (tmp_path / "refs" / "ar" / "ab7_Apost.json").unlink()
+    else:
+        j = json.loads(j1.read_text())
+        if damage == "mixed_config":
+            j["config_hash"] = "other"
+        elif damage == "missing_episode":
+            j["episodes"] = j["episodes"][1:]
+        elif damage == "stale_code":
+            j["code_sha"] = "0" * 64
+        elif damage == "leaky_train":
+            j["train_sessions"] = list(S)
+        j1.write_text(json.dumps(j))
     with pytest.raises(RuntimeError):
         REP.load_runs(tmp_path)
 ```
@@ -2683,9 +2997,12 @@ Expected: `ModuleNotFoundError: No module named 'q1_report'`
 **推进判据**（每个候选单独判，不要求六个全过）：5 个留出会话都 `ρ_s ≤ ρ_s(G-2)`，
 且 5 会话等权平均 `mean ρ_s < mean ρ_s(G-2)`。G-2 = 同口径窗口重预测。
 ⚠ 开发筛查规则，不代表统计上已证明泛化。
+汇总前强制完整性检查：6 模型 × 3 种子 × 5 折 + 3 个参照 × 5 折；每个作业的权重与预测文件存在且
+哈希与记录一致；候选的 config_hash 唯一；全部产物的 code_sha = 当前代码；每份产物恰好覆盖同一组 100 集。
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -2696,28 +3013,73 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 import q1_data as D            # noqa: E402
+import q1_train as TR          # noqa: E402
 
 CANDIDATES = ("1a", "1b", "2a", "2b", "3a", "3b")
+REFS = ("g2", "g2_whole", "ar")
+SEEDS = ("0", "1", "2")
 SESS = tuple(f"{s}/{a}" for s, a in D.SESSIONS)
+N_EPISODES = sum(D.EXPECTED_COUNTS.values())
+
+
+def file_sha(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def verify(raw) -> list:
+    """完整性检查 → 问题列表（空 = 通过）。"""
+    P = []
+    code_now = TR.code_sha()
+    for m in CANDIDATES + REFS:
+        by_seed = raw.get(m, {})
+        want = SEEDS if m in CANDIDATES else ("-",)
+        if sorted(by_seed) != sorted(want):
+            P.append(f"{m}: 种子 {sorted(by_seed)}，应为 {list(want)}")
+        for s, js in by_seed.items():
+            if sorted(j["fold"] for j in js) != sorted(SESS):
+                P.append(f"{m} seed {s}: 折 {sorted(j['fold'] for j in js)} 不齐")
+            names = [r["name"] for j in js for r in j["episodes"]]
+            if len(names) != N_EPISODES or len(set(names)) != N_EPISODES:
+                P.append(f"{m} seed {s}: {len(set(names))} 个不同的集，应为 {N_EPISODES}")
+            for j in js:
+                if any(r["sess"] != j["fold"] for r in j["episodes"]):
+                    P.append(f"{j['_path']}: 含非留出会话的集")
+                if j.get("code_sha") != code_now:
+                    P.append(f"{j['_path']}: code_sha 与当前代码不一致")
+                if m not in CANDIDATES:
+                    continue
+                ts = j.get("train_sessions", [])
+                if j["fold"] in ts or len(ts) != len(SESS) - 1:
+                    P.append(f"{j['_path']}: 训练会话 {ts} 不对")
+                for key, suf in (("pt_sha256", ".pt"), ("npz_sha256", ".npz")):
+                    f = Path(j["_path"]).with_suffix(suf)
+                    if not f.exists():
+                        P.append(f"缺 {f}")
+                    elif file_sha(f) != j.get(key):
+                        P.append(f"{f}: 与记录的 {key} 不符")
+    cfg = {j["config_hash"] for m in CANDIDATES for js in raw.get(m, {}).values() for j in js}
+    if len(cfg) > 1:
+        P.append(f"候选作业的 config_hash 不唯一：{sorted(cfg)}")
+    sets = {tuple(sorted(r["name"] for j in js for r in j["episodes"]))
+            for by_seed in raw.values() for js in by_seed.values()}
+    if len(sets) > 1:
+        P.append("各产物覆盖的集合不一致")
+    return P
 
 
 def load_runs(out) -> dict:
-    """→ {model: {seed: [逐集行]}}。同一模型的 config_hash 必须唯一，且每个种子 5 折齐全。"""
+    """→ {model: {seed: [逐集行]}}。先做完整性检查；任何问题 ⇒ RuntimeError（列出全部）。"""
     raw: dict = {}
     for p in sorted((Path(out) / "jobs").glob("*/seed*/*.json")) + \
             sorted((Path(out) / "refs").glob("*/*.json")):
         j = json.loads(p.read_text())
+        j["_path"] = str(p)
         raw.setdefault(j["model"], {}).setdefault(str(j["seed"]), []).append(j)
-    runs = {}
-    for m, by_seed in raw.items():
-        hashes = {j["config_hash"] for js in by_seed.values() for j in js}
-        if len(hashes) != 1:
-            raise RuntimeError(f"{m}: 产物来自不同配置/代码 {sorted(hashes)} —— 先重跑过期作业")
-        for s, js in by_seed.items():
-            if sorted(j["fold"] for j in js) != sorted(SESS):
-                raise RuntimeError(f"{m} seed {s}: 折不齐")
-        runs[m] = {s: [r for j in js for r in j["episodes"]] for s, js in by_seed.items()}
-    return runs
+    problems = verify(raw)
+    if problems:
+        raise RuntimeError("产物不完整或不一致：\n  " + "\n  ".join(problems))
+    return {m: {s: [r for j in js for r in j["episodes"]] for s, js in by_seed.items()}
+            for m, by_seed in raw.items()}
 
 
 def rho_by_session(rows, key: str = "num") -> dict:
@@ -2819,13 +3181,13 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `$PY -m pytest sim/q1/test_q1_report.py -q`
-Expected: `4 passed`
+Expected: `12 passed`
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add sim/q1/q1_report.py sim/q1/test_q1_report.py
-git commit -m "阶段一 Q1：汇总与推进判据（逐会话不高于 G-2 且等权平均严格改善；b 相对 a 只报告）"
+git commit -m "阶段一 Q1：汇总与推进判据（强制完整性核验；逐会话不高于 G-2 且等权平均严格改善；b 相对 a 只报告）"
 ```
 
 ---
@@ -3110,7 +3472,7 @@ git commit -m "阶段一 Q1：pp2 波形图（候选 / 实机 / G-2）与可重�
 - [ ] **Step 1: 全量自测**
 
 Run: `$PY -m pytest sim/q1 -q`
-Expected: `72 passed`，约 3–4 分钟。任何失败都先修，不进入 Step 2。
+Expected: `98 passed`，约 3–4 分钟。任何失败都先修，不进入 Step 2。
 
 - [ ] **Step 2: 耗时测量**
 
@@ -3124,7 +3486,7 @@ Expected: 6 行 `<模型>: x.xxx s/步`，再加一行「预计 … 核·小时 
 - [ ] **Step 3: 写预注册草稿** —— `reports/PREREG_Q1_STAGE1.md`
 
 填入以下三项：
-- 抬头：`git rev-parse --short HEAD`，以及 `code_sha` 前 16 位；后者用 `$PY -c "import sys; sys.path.insert(0,'sim/q1'); import q1_train as TR; print(TR.code_sha()[:16])"` 得到；
+- 抬头：`git rev-parse --short HEAD`，以及 `code_sha=<16 位>`（**照此格式**，冻结闸门按 `code_sha=` 后的 16 位十六进制核对）；后者用 `$PY -c "import sys; sys.path.insert(0,'sim/q1'); import q1_train as TR; print(TR.code_sha()[:16])"` 得到；
 - §7：Step 2 的 6 个数字与两个预计值；
 - 日期。
 
@@ -3135,14 +3497,15 @@ Expected: 6 行 `<模型>: x.xxx s/步`，再加一行「预计 … 核·小时 
 
 **状态：草稿（<日期>），待用户冻结。冻结前不运行 `prepare / job / refs / fullfit`。**
 - 依据：`reports/DESIGN_G_PI_V2.md` §2、§4 阶段一、§5 #1–4（用户 2026-10-02 定）。
-- 实施：`reports/PLAN_IMPL_Q1_STAGE1.md`；代码 `sim/q1/`（提交 `<git 短哈希>`，`code_sha` 前 16 位 `<…>`）。
+- 实施：`reports/PLAN_IMPL_Q1_STAGE1.md`；代码 `sim/q1/`（提交 `<git 短哈希>`，`code_sha=<16 位十六进制>`）。
+- 冻结时把状态行整行改为 `**状态：已冻结（<日期>，用户确认）**`。正式入口只认这一行，并核对 `code_sha=`；代码改动后须重新冻结。
 - 零机时；不训练 π；不做 Q2 / Q3；不修改 G-2。
 
 ## 0 冻结前已经看到的数（如实披露）
 
 - G-2 旧口径（整集前向）逐会话 redu：ab5 39.56 / ab6 36.49 / ab7 33.36 / ab2 23.41 / ab4 50.03%。来源 `outputs/fabs_g0/fabs_g0_v1.json`，已发表；Task 3 复现到 1e-5。
 - 写实施计划时的原型检查（2026-10-02，在暂存区镜像里做，未提交）：
-  - 折内 AR 参照在 ab5/A 留出上的冒烟值 redu **+37.7%**（一次，非正式）；
+  - 折内 AR 参照在 ab5/A 留出上的冒烟值 redu **+37.7%**（一次，非正式）。⚠ 当时的 AR 含逐前瞻截距与有效比例列（可学到 chunk 相位模板），现已去掉；**新形式未计算过**；
   - 用**实测关节（含未来）**的传感器层在 ab5/A 前 10 集 redu 0.80 —— 实现自检，**不是模型分数**；
   - G-2 窗口重预测与整集前向只在每个 chunk 末 6 个计分帧不同（最大 0.55 rad/s）。
 - **未计算过**任何候选模型的留出分数，也**未计算过** G-2 同口径重预测的分数。
@@ -3167,16 +3530,21 @@ Expected: 6 行 `<模型>: x.xxx s/步`，再加一行「预计 … 核·小时 
 
 | 编号 | 结构 | 输入 | 参数 |
 |---|---|---|---|
-| 1a / 1b | 分层：逐关节伺服 MLP（3×32 softsign）→ `R·kin(q̂) + r_s`；1b 另加实测传感器残差的逐前瞻线性项 | 1a 只用指令（开环起点状态）；1b 在起点读实测编码器与陀螺历史 20 帧 | 24 780 + 闭式层 |
+| 1a / 1b | 分层：逐关节伺服 MLP（3×32 softsign）→ `R·kin(q̂) + r_s`；1b 另加实测传感器残差的逐前瞻线性项（**无截距**，没有有效残差时精确为 0） | 1a 只用指令（开环起点状态）；1b 在起点读实测编码器与陀螺历史 20 帧 | 24 780 + 闭式层 |
 | 2a / 2b | 端到端 TCN（因果空洞卷积 4 层 64ch，与 `F_abs` 主干同构），直接多步 | 过去 20 帧 + 窗口 102 帧；b 版加实测历史 | 66 441 / 69 961 |
 | 3a / 3b | 端到端因果 Transformer（2 层、d64、4 头、FF128），直接多步 | 同上 | 76 361 / 77 065 |
 | G-2 | 冻结；同口径窗口重预测 | 只读指令 | — |
-| AR | 折内线性 AR：逐前瞻 OLS，三轴联合，20 个原始 gap | 只用起点可得的 gap | — |
+| AR | 折内线性 AR：逐前瞻 OLS，三轴联合，20 个原始 gap，**无截距** | 只用起点可得的 gap | — |
 | G-2 旧口径 | 整集前向（只对照，不作判据） | — | — |
 
 结构性说明：
 - TCN 感受野 61 帧 ⇒ b 版的实测历史只能影响前瞻 ≤ 60 帧的预测；Transformer 能看到全窗口。
 - 1a 的起点状态来自整集开环，隐含使用了全部过去指令；端到端 a 版只看过去 20 帧指令。这是两种结构固有的差别。
+- **训练方法不同**（用户 2026-10-02 要求注明）：
+  - 分层：关节层只用关节损失训练，传感器层用实测关节闭式拟合 —— 训练用实测关节、推理用 q̂（训练—推理差异，首版保留）；
+  - 端到端：ω + 关节联合损失端到端训练，还能从窗口位置学到 chunk 相位模板；分层没有对应项。
+  - ⇒ 三行之间的胜负**不能单独归因于网络结构**。
+- 无效样本：编码器无效值不经中心差分、FIR、带通进入任何拟合或目标（按支撑排除）；推理时支撑内有效/无效混合即按数据契约报错。本数据中只有 t0 = 0 是全填充。
 
 ## 4 训练（§11 列出的默认值待确认）
 
@@ -3221,6 +3589,7 @@ Expected: 6 行 `<模型>: x.xxx s/步`，再加一行「预计 … 核·小时 
 - 阶段一即使成功，也只支持「20 Hz 口径下、这 5 个会话上的 Q1 预测收益」，不代表 Q2 / Q3。
 - b 未优于 a 时，只能写「本轮未测到实测历史的预测收益」。不能写「状态历史无信息」，也不能推出「π 学不到有用反馈」（排除 ≠ 证明）。
 - G 内部的任何改善都不是补正有效的证据；直到阶段四才检验 π 的真机效果。
+- 比较三种结构时，只能写「在本训练方法组合下……」，**不能把胜负单独归因于网络结构**（见 §3）。
 
 ## 9 不做
 
@@ -3239,17 +3608,34 @@ Expected: 6 行 `<模型>: x.xxx s/步`，再加一行「预计 … 核·小时 
 - `refs/`、`fullfit/`、`fig/`；
 - `summary.json`、`logs/`。
 
-结果报告记录冻结提交哈希、`code_sha` 与各 `state_sha256`。
+- 每个作业的 JSON 记录 `config_hash`、`code_sha`、`state_sha256`，以及 `.pt` / `.npz` 的文件 sha256。
+- 汇总前强制核验以下各项，任一不满足即拒绝汇总：
+  - 6 模型 × 3 种子 × 5 折，加 3 个参照 × 5 折；
+  - 文件存在且哈希一致；
+  - 候选的 `config_hash` 唯一；
+  - `code_sha` = 当前代码；
+  - 训练会话不含留出会话；
+  - 每份产物覆盖同一组 100 集。
 
-## 11 我定的默认值（逐条待你确认或改）
+结果报告记录冻结提交哈希与 `code_sha`。
+
+## 11 用户审阅订正（2026-10-02，已定，不再是默认值）
+
+1. 端到端 `q̂` 的基线用钳位后的可见指令；`ê` 与 `q̂` 都测「改 `t1` 之后的指令不变」。
+2. 1b 附加项只用掩码后的残差数值，无截距、无有效比例；没有有效残差时精确为 0。
+3. 传感器层的无效关节样本按支撑排除，推理时混合即报错。
+4. 正式入口检查冻结状态与 `code_sha`；`timing` 单独允许。
+5. 汇总强制核验产物完整一致（见 §10）。
+6. `r_s` 用实测关节拟合保留为首版，并注明训练—推理差异与训练方法差异（见 §3）。
+
+## 12 我定的默认值（逐条待你确认或改）
 
 1. 分层关节层：逐关节 MLP 3×32 softsign，输入 61 维（20 帧跟踪误差 + 20 帧速度 + 20 帧有效位 + 下一帧指令误差），一阶滞后先验 `g = 0.3`，头部零初始化。
 2. 1a 训练时，起点状态取自无梯度的开环滚动；窗口内有梯度。
-3. 传感器层 `r_s`：
-   - 用**实测关节**拟合：无折内泄漏，代价是训练用实测、推理用 q̂；
+3. 传感器层 `r_s`（是否用实测关节拟合已由你定为首版，见 §11-6）：
    - FIR nlag 16、相对岭 1e-4，沿用 G-2 的选定值，不调参；
    - 在 0.5–9 Hz 带内拟合，特征加理想陀螺。
-4. 1b 读实测 IMU 的方式：起点前 20 帧的实测传感器残差 → 逐前瞻线性项（普通最小二乘）。
+4. 1b 读实测 IMU 的方式：起点前 20 帧的实测传感器残差 → 逐前瞻线性项（普通最小二乘；无截距按 §11-2）。
 5. 端到端：
    - 未来段 102 帧，外加「是否仍在当前 chunk」指示通道；
    - 两种网络都因果；
@@ -3266,7 +3652,7 @@ Expected: 6 行 `<模型>: x.xxx s/步`，再加一行「预计 … 核·小时 
     - 候选用全部 100 集训练的 seed 0 模型，只作图；
     - 三条线：实机 / 候选 / G-2；
     - 不画逐集条形，沿用脚本 2026-09-02 的版式；逐集数值打印到日志。
-12. AR 参照的具体形式，即设计稿 §2.5 的默认值。
+12. AR 参照的具体形式：设计稿 §2.5 的默认值，**另按 §11-2 的同一原则去掉截距与有效比例列**。这是我补的，你可撤回；撤回则恢复带截距的形式。
 13. 预算上限：墙钟 ≤ 4 小时。
 ```
 
@@ -3298,7 +3684,7 @@ git commit -m "阶段一 Q1：预注册草稿（待用户冻结；不授权正�
 
 - [ ] **Step 1: 记录冻结**
 
-把预注册状态行改为「**已冻结**（日期，用户确认）」，然后提交：
+把预注册状态行整行改为 `**状态：已冻结（<日期>，用户确认）**`（冻结闸门只认以「**状态：已冻结」开头的行），并确认 `code_sha=` 仍等于当前代码，然后提交：
 
 ```bash
 git add reports/PREREG_Q1_STAGE1.md
@@ -3337,6 +3723,10 @@ Expected: 结尾打印「完成：outputs/q1_stage1/summary.json …」。脚本
 <粘贴 report.md 第一张表>
 - 通过：<编号>；不过：<编号 + 哪个会话不满足 / 平均未严格改善>。
 - ⚠ 这是开发筛查规则，不代表统计上已证明泛化。
+- ⚠ 三行（结构）之间的胜负**不能单独归因于网络结构**，原因有三：
+  - 分层与端到端的训练方法不同：分层的关节层只用关节损失，传感器层用实测关节闭式拟合；端到端用 ω + 关节联合损失；
+  - `r_s` 训练用实测关节、推理用 q̂；
+  - 端到端能从窗口位置学到 chunk 相位模板，分层没有对应项。
 
 ## 二、状态历史：b 相对 a（只报告，不替代推进判据）
 <粘贴 report.md 第二张表>
@@ -3384,3 +3774,17 @@ git commit -m "阶段一 Q1：结果（推进判据逐候选、b 相对 a、参�
 - [ ] **Step 7: 停**
 
 阶段二（Q2 检验）需另写预注册（§5 #5 门槛仍待定），**不自动开始**。
+
+---
+
+## 修订记录
+
+- 2026-10-02 初版（`ad9fa7a`）。
+- 2026-10-02 按用户静态审阅订正（执行方式定为 Native；只实施 Task 1–13，交付预注册草稿即停）：
+  1. 端到端 `decode` 的 `q̂` 基线改用钳位后的可见指令。新增测试：`test_no_leakage` 同时查 `ê` 与 `q̂`；`test_forward_windows_ignore_commands_after_t1` 覆盖 6 个模型的训练前向。
+  2. 1b 附加项去掉截距与有效比例 ⇒ 没有有效残差时精确为 0。AR 参照按同一原则去掉截距（我补的，可撤回）。
+  3. 传感器层与关节损失：无效样本按支撑排除（`clean_rows` / `band_clean`），推理时支撑混合即报错（`check_window_support`）。
+  4. 正式入口加冻结闸门（`require_frozen`：状态行 + `code_sha`）；`timing` 不受限。`q1_run.py` 计入代码指纹。
+  5. 汇总强制核验产物完整一致（`verify`：模型/种子/折/文件哈希/配置与代码指纹/集合覆盖）。
+  6. 预注册与结果模板注明：`r_s` 训练—推理差异；分层与端到端训练方法不同，不能把胜负单独归因于网络结构。
+  - 测试由 72 个增至 98 个（快速 94 + 集成 4）。按任务顺序逐个重放：每个任务实现前测试失败，实现后通过。
