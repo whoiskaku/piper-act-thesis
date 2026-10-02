@@ -34,17 +34,23 @@ def test_prediction_ignores_gap_after_origin():
     assert np.array_equal(AR.window_ehat(coef, e2, w), base)
 
 
-def test_fit_is_exact_on_a_linear_target():
-    rng = np.random.default_rng(0)
-    eps = [T.synthetic_episode(s) for s in range(16)]
-    M = rng.normal(0, 0.1, (AR.N_FEAT, 3))
-    sel = lambda e: [w for w in W.chunk_windows(e) if w.t0 >= 100]
-    for e in eps:
-        for w in sel(e):
-            e.gap[w.t0] = AR.design_row(e, w.t0) @ M          # 只改 h = 0 的目标
-    coef = AR.fit(eps, windows_of=sel)
-    w = sel(eps[0])[1]
-    assert np.allclose(AR.window_ehat(coef, eps[0], w)[0], AR.design_row(eps[0], w.t0) @ M)
+def _ridge(X, Y, lam_rel):
+    G = X.T @ X
+    return np.linalg.solve(G + lam_rel * np.trace(G) / G.shape[0] * np.eye(G.shape[0]), X.T @ Y)
+
+
+def test_fit_is_fixed_relative_ridge():
+    """用户 2026-10-02 定：AR 改用固定岭回归（不调）；λ = RIDGE_REL·tr(XᵀX)/p，同 `train_rq.fit`。"""
+    eps = [T.synthetic_episode(s) for s in range(8)]
+    assert AR.RIDGE_REL == 1e-2
+    coef = AR.fit(eps)
+    for h in (0, 50, 99):
+        rows = [(AR.design_row(e, w.t0), e.gap[w.t0 + h]) for e in eps for w in W.chunk_windows(e)
+                if h < w.n_scored]
+        X = np.stack([r[0] for r in rows]); Y = np.stack([r[1] for r in rows])
+        assert np.allclose(coef[h], _ridge(X, Y, 1e-2), rtol=1e-10, atol=1e-12)
+        ols = np.linalg.lstsq(X, Y, rcond=None)[0]
+        assert np.linalg.norm(coef[h]) < np.linalg.norm(ols)       # 确实收缩了
 
 
 def test_missing_lead_raises():

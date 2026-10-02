@@ -55,6 +55,27 @@ def test_cmap_term_is_exactly_zero_without_valid_history():
     assert all(C[h].shape == (3 * D.HIST, 3) and (x0 @ C[h] == 0).all() for h in C)
 
 
+def test_fit_cmap_is_fixed_relative_ridge():
+    """用户 2026-10-02 定：1b 前瞻项改用固定岭回归（不调），与 AR 同一实现、同一强度。"""
+    import q1_ar as AR
+    eps = [T.synthetic_episode(s) for s in range(4)]
+    R = np.eye(3)
+    Wrs = S.fit_rs(eps, R)
+    C = S.fit_cmap(eps, R, Wrs)
+    h = 0
+    X, Y = [], []
+    for e in eps:
+        y = S.sensor_residual(e, R, Wrs)
+        for w in W.chunk_windows(e):
+            k = w.t0 + h + D.ALIGN_L
+            if np.isfinite(y[k]).all():
+                X.append(S.residual_history(e, w.t0, R, Wrs)); Y.append(y[k])
+    X, Y = np.asarray(X), np.asarray(Y)
+    G = X.T @ X
+    want = np.linalg.solve(G + AR.RIDGE_REL * np.trace(G) / G.shape[0] * np.eye(G.shape[0]), X.T @ Y)
+    assert np.allclose(C[h], want, rtol=1e-10, atol=1e-12)
+
+
 def _dropout(e, k, value):
     e.q_valid = e.q_valid.copy(); e.q_valid[k] = False
     e.q = e.q.copy(); e.q[k] = value

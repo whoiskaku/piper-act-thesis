@@ -2,7 +2,8 @@
 
 目标 = gap `e_t`（t ∈ [t0, s1]）；输入 = 起点可得的最近 20 个**原始**实测 gap
 `e_{t0−3−l}`（l = 0…19；`e_{t0−3}` 只用到 `ω_{t0}`），三轴联合；每个前瞻一组系数；
-普通最小二乘、不调超参。历史不足（`t0−3−l < 0`）填 0。
+**固定岭回归**（用户 2026-10-02 定，替代普通最小二乘；不调超参）：`λ = RIDGE_REL·tr(XᵀX)/p`，
+与 `train_rq.fit` 同一实现；强度 `RIDGE_REL = 1e-2` 是我定的默认值。历史不足（`t0−3−l < 0`）填 0。
 **无截距、无有效比例列**：没有有效历史时预测精确为 0；逐前瞻截距会学到 chunk 相位的平均
 模板，那不是「误差延续」（与 1b 附加项同一原则，用户 2026-10-02 订正 1b 时定）。
 不复用 `oracle_causal_feedback.py` 的权重与残差目标。
@@ -15,6 +16,13 @@ import q1_data as D
 import q1_windows as W
 
 N_FEAT = 3 * D.HIST
+RIDGE_REL = 1e-2             # 固定相对岭强度（默认值，可改；1b 前瞻项共用）
+
+
+def ridge(X, Y) -> np.ndarray:
+    """固定相对岭 `λ = RIDGE_REL·tr(XᵀX)/p`（`train_rq.fit` 同一实现）；不调超参。"""
+    from train_rq import fit
+    return fit([np.asarray(X, np.float64)], [np.asarray(Y, np.float64)], RIDGE_REL)
 
 
 def design_row(ep, t0: int) -> np.ndarray:
@@ -36,8 +44,7 @@ def fit(eps, windows_of=W.chunk_windows) -> dict:
                 X, Y = rows.setdefault(h, ([], []))
                 X.append(x)
                 Y.append(e.gap[w.t0 + h])
-    return {h: np.linalg.lstsq(np.asarray(X), np.asarray(Y), rcond=None)[0]
-            for h, (X, Y) in rows.items()}
+    return {h: ridge(X, Y) for h, (X, Y) in rows.items()}
 
 
 def window_ehat(coef: dict, ep, w: W.Window) -> np.ndarray:

@@ -9,7 +9,8 @@
 
 无效关节样本（存为 0）：FIR 第 k 行用到 `q_{k−17 … k+2}`（16 个滞后 + 二阶中心差分），
 只有这段支撑全有效的行才进拟合/目标/历史；带通拟合再要求 ±20 帧全干净。
-1b 的附加项**无截距、无有效比例**：没有有效残差时精确为 0（用户 2026-10-02 订正）。
+1b 的附加项**无截距、无有效比例**：没有有效残差时精确为 0（用户 2026-10-02 订正）；
+用**固定岭回归**拟合（用户 2026-10-02 定；与 AR 同一实现、同一强度 `q1_ar.RIDGE_REL`）。
 """
 from __future__ import annotations
 
@@ -119,7 +120,8 @@ def sensor_residual(ep, R, Wrs) -> np.ndarray:
 
 
 def fit_cmap(eps, R, Wrs, windows_of=W.chunk_windows) -> dict:
-    """1b 的逐前瞻线性项：`s_{t0+h+3} ≈ x(t0)·C_h`（无截距），只用训练折，普通最小二乘。"""
+    """1b 的逐前瞻线性项：`s_{t0+h+3} ≈ x(t0)·C_h`（无截距），只用训练折，固定岭回归。"""
+    from q1_ar import ridge
     rows: dict = {}
     for e in eps:
         y = sensor_residual(e, R, Wrs)
@@ -131,5 +133,4 @@ def fit_cmap(eps, R, Wrs, windows_of=W.chunk_windows) -> dict:
                     X, Y = rows.setdefault(h, ([], []))
                     X.append(x)
                     Y.append(y[k])
-    return {h: np.linalg.lstsq(np.asarray(X), np.asarray(Y), rcond=None)[0]
-            for h, (X, Y) in rows.items()}
+    return {h: ridge(X, Y) for h, (X, Y) in rows.items()}
