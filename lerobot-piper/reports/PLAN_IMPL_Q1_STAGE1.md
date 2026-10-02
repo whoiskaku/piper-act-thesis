@@ -3795,3 +3795,4 @@ git commit -m "阶段一 Q1：结果（推进判据逐候选、b 相对 a、参�
   4. `q1_run`：`prepare` 一次写好全数据传感器层；`fullfit` 只读并核对；新增 `load_sensor_all` / `load_fullfit`。`fig_pp2_q1` 改用 `load_fullfit`。
   5. 新测试：分层计分输出不读下一 chunk、参照合成端到端（slow）、全数据拟合产物核验、运行脚本空跑 4 例 —— 共 112 个。
   - 预注册草稿同步：新 `code_sha`、§4 交叉引用改为 §12、前瞻分组、§12-4 的 OLS 过拟合风险、全数据模型核验。
+- 2026-10-02 用户三项决定后（`fdbf1ec`）：1b 前瞻项与 AR 改用固定岭回归（`q1_ar.ridge`，`RIDGE_REL = 1e-2`），97–102 组保留只报告，AR 无截距保留；测试 113 个；预注册草稿同步新 `code_sha`。
