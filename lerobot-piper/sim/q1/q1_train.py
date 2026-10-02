@@ -27,9 +27,11 @@ CONFIG = {"max_steps": 10000,
           "ckpts": (0, 250, 500, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 10000),
           "select": "inner leave-one-session-out; min equal-weight mean of per-session rho; earliest tie",
           "tie_rtol": 1e-12, "tie_atol": 1e-15,
-          "lr": 1e-3, "clip": 1.0, "threads": 1, "device": "cpu"}
+          "lr": 1e-3, "clip": 1.0, "threads": 1, "device": "cpu",
+          "budget_hours": 24}             # 本轮墙钟上限（用户 2026-10-02 定）；超出 ⇒ 未完成
 CODE_FILES = ("q1_data.py", "q1_windows.py", "q1_losses.py", "q1_layered.py", "q1_e2e.py",
-              "q1_sensor.py", "q1_train.py", "q1_ar.py", "q1_g2ref.py", "q1_run.py", "q1_report.py")
+              "q1_sensor.py", "q1_train.py", "q1_ar.py", "q1_g2ref.py", "q1_run.py", "q1_report.py",
+              "q1_roster.json")
 
 
 def code_sha() -> str:

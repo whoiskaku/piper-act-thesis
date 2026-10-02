@@ -40,9 +40,13 @@ def test_code_sha_covers_the_report():
 
 
 # ── 完整产物树（用 q1_run 的路径与指纹函数构造，保证与真实产物同构）──────────
+def _row(fold, name):
+    return {"name": name, "sess": fold, "num": 0.4, "den": 1.0, "f3": 3, "num_aux": 0.5,
+            "lead": {b: [0.1, 0.2] for b in BINS}}
+
+
 def _episodes(fold):
-    return [{"name": f"{fold}_ep{i}", "sess": fold, "num": 0.4, "den": 1.0, "f3": 3, "num_aux": 0.5,
-             "lead": {b: [0.1, 0.2] for b in BINS}} for i in range(D.EXPECTED_COUNTS[fold])]
+    return [_row(fold, n) for n in D.ROSTER[fold]]                        # 冻结名单上的集名
 
 
 def _curve(model, fold, val, seed):
@@ -55,8 +59,12 @@ def _curve(model, fold, val, seed):
 
 
 def _tree(tmp):
+    import time
     import torch
     code, cfg = TR.code_sha(), TR.config_hash()
+    now = time.time()
+    RUN.atomic_json(RUN.deadline_file(tmp), {"code_sha": code, "config_hash": cfg, "budget_hours": 24,
+                                             "started_at": now - 3600, "deadline": now + 3600})
     data = tmp / "d.json"
     data.write_text("{}")
     dfiles, dfp = RUN.files_fp([data])
@@ -78,7 +86,8 @@ def _tree(tmp):
                     RUN.atomic_json(RUN.inner_json(tmp, m, f, v, seed),
                                     {"model": m, "fold": f, "val": v, "seed": seed, "config_hash": cfg,
                                      "code_sha": code, "inputs": inputs, "input_fp": RUN.fp_of(inputs),
-                                     "train_sessions": list(RUN.inner_train(f, v)), "n_val": 1, "scores": sc})
+                                     "train_sessions": list(RUN.inner_train(f, v)), "n_val": 1, "scores": sc,
+                                     "finished_at": now - 60})
                 V, step = RUN.selection(tmp, m, f, seed)
                 base = RUN.final_base(tmp, m, f, seed)
                 base.parent.mkdir(parents=True, exist_ok=True)
@@ -92,14 +101,16 @@ def _tree(tmp):
                     "train_sessions": list(RUN.train_sessions(f)), "V": {str(s): V[s] for s in sorted(V)},
                     "step_star": step, "boundary": step == TR.CONFIG["max_steps"],
                     "state_sha256": TR.state_dict_sha(sd), "pt_sha256": RUN.file_sha(base.with_suffix(".pt")),
-                    "npz_sha256": RUN.file_sha(base.with_suffix(".npz")), "episodes": _episodes(f)})
+                    "npz_sha256": RUN.file_sha(base.with_suffix(".npz")), "episodes": _episodes(f),
+                    "finished_at": now - 30})
     for r in REP.REFS:
         for f in S:
             inputs = RUN.refs_inputs(I)
             RUN.atomic_json(tmp / "refs" / r / f"{RUN.tag(f)}.json", {
                 "model": r, "seed": "-", "fold": f, "config_hash": code[:16], "code_sha": code,
                 "inputs": inputs, "input_fp": RUN.fp_of(inputs),
-                "train_sessions": [x for x in S if x != f] if r == "ar" else [], "episodes": _episodes(f)})
+                "train_sessions": [x for x in S if x != f] if r == "ar" else [], "episodes": _episodes(f),
+                "finished_at": now - 90})
     return data
 
 
@@ -164,3 +175,44 @@ def test_load_runs_rejects_incomplete_or_inconsistent(tmp_path, damage):
         next((tmp_path / "sensor").iterdir()).write_bytes(b"changed")
     with pytest.raises(RuntimeError):
         REP.load_runs(tmp_path)
+
+
+def test_load_runs_rejects_a_roster_swap_that_keeps_the_total(tmp_path):
+    """ab5 少一集、ab6 多一集：每份产物仍是 100 集，也必须按冻结名单拦下。"""
+    _tree(tmp_path)
+    paths = [RUN.final_base(tmp_path, m, f, k).with_suffix(".json")
+             for m in REP.CANDIDATES for k in (0, 1, 2) for f in ("ab5/A", "ab6/A")]
+    paths += [tmp_path / "refs" / r / f"{RUN.tag(f)}.json" for r in REP.REFS for f in ("ab5/A", "ab6/A")]
+    for p in paths:                                   # 所有产物一致地挪一集 ⇒ 只有名单核对能发现
+        j = json.loads(p.read_text())
+        if j["fold"] == "ab5/A":
+            _edit(p, episodes=j["episodes"][1:])
+        else:
+            _edit(p, episodes=j["episodes"] + [_row("ab6/A", "ab6/A_ep30")])
+    with pytest.raises(RuntimeError, match="名单"):
+        REP.load_runs(tmp_path)
+
+
+@pytest.mark.parametrize("case", ["marker", "late_final", "late_inner", "no_deadline"])
+def test_report_marks_incomplete_and_gives_no_verdict(tmp_path, case, capsys):
+    _tree(tmp_path)
+    d = json.loads(RUN.deadline_file(tmp_path).read_text())
+    if case == "marker":
+        RUN.mark_incomplete(tmp_path, "测试")
+    elif case == "late_final":
+        _edit(RUN.final_base(tmp_path, "2a", "ab4/P0", 2).with_suffix(".json"), finished_at=d["deadline"] + 1)
+    elif case == "late_inner":
+        _edit(RUN.inner_json(tmp_path, "3b", "ab2/A", "ab4/P0", 1), finished_at=d["deadline"] + 1)
+    else:
+        RUN.deadline_file(tmp_path).unlink()
+    assert REP.main(["--out", str(tmp_path)]) == 3
+    s = json.loads((tmp_path / "summary.json").read_text())
+    assert s["status"] == "未完成" and "candidates" not in s
+    assert "未完成" in capsys.readouterr().out
+
+
+def test_report_on_a_complete_on_time_run(tmp_path):
+    _tree(tmp_path)
+    assert REP.main(["--out", str(tmp_path)]) == 0
+    s = json.loads((tmp_path / "summary.json").read_text())
+    assert s["status"] == "完成" and set(s["candidates"]) == set(REP.CANDIDATES)

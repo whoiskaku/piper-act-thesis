@@ -13,6 +13,9 @@
   `FOLD = all`：五会话内层留一选步、全数据训练，**只供 pp2 图**。
 续跑：每个作业记录配置指纹与输入指纹（数据文件、依赖代码与环境、所用传感器层、内层评分表）；
 两者都与当前一致才算已完成。`prepare` 遇到已是最新的传感器层文件不重拟合。
+墙钟上限：第一次 `prepare` 记录本轮截止时间（开始时刻 + 24 小时），续跑不重置；正式入口超时即拒绝并
+标记「未完成」，运行中的作业到点由闹钟中止；汇总遇到未完成或晚于截止时间的产物不作通过判决。
+数据名单：载入的集必须与冻结名单（`q1_roster.json`）逐会话、逐集名一致，否则停止。
 
     python -u sim/q1/q1_run.py timing --steps 30
     python -u sim/q1/q1_run.py prepare   --out outputs/q1_stage1
@@ -29,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import time
 from pathlib import Path
@@ -63,6 +67,10 @@ G2_FILES = ("outputs/step4_gvnext/rq/rq_fir.npz", "outputs/step4_gvnext/rq/selec
 
 class NotFrozenError(RuntimeError):
     """预注册不存在、未冻结，或冻结时的代码/配置指纹与当前不符。"""
+
+
+class DeadlineExceeded(RuntimeError):
+    """本轮已超出预注册的墙钟上限：停止，并标记「未完成」。"""
 
 
 def require_frozen(prereg=None) -> None:
@@ -206,8 +214,52 @@ def read_inputs(out) -> dict:
 
 
 def check_data(eps, I: dict) -> None:
+    D.check_roster(eps)
     if files_fp(data_files(eps))[1] != I["data"]:
         raise RuntimeError("数据文件与 prepare 时不同 —— 重跑 prepare")
+
+
+# ── 本轮截止时间 ──────────────────────────────────────────────────────────
+def deadline_file(out) -> Path:
+    return Path(out) / "deadline.json"
+
+
+def incomplete_file(out) -> Path:
+    return Path(out) / "INCOMPLETE.json"
+
+
+def mark_incomplete(out, reason: str) -> None:
+    if not incomplete_file(out).exists():
+        atomic_json(incomplete_file(out), {"status": "未完成", "reason": reason, "at": time.time()})
+
+
+def enforce_deadline(out, create: bool = False) -> dict:
+    """第一次 prepare 记录截止时间（续跑不重置）；超时 ⇒ 标记未完成并拒绝；否则设闹钟，到点中止本作业。"""
+    p = deadline_file(out)
+    fp = {"code_sha": TR.code_sha(), "config_hash": TR.config_hash()}
+    if p.exists():
+        d = json.loads(p.read_text())
+        if {k: d.get(k) for k in fp} != fp:
+            raise RuntimeError(f"{p}: 本目录属于另一版冻结的实验 —— 换一个 --out")
+    elif create:
+        now = time.time()
+        d = {**fp, "budget_hours": TR.CONFIG["budget_hours"], "started_at": now,
+             "deadline": now + TR.CONFIG["budget_hours"] * 3600}
+        atomic_json(p, d)
+    else:
+        raise RuntimeError(f"缺 {p} —— 先跑 prepare")
+    left = d["deadline"] - time.time()
+    if left <= 0:
+        mark_incomplete(out, f"超出预注册的墙钟上限（{TR.CONFIG['budget_hours']} 小时）")
+        raise DeadlineExceeded("已超出本轮截止时间 —— 拒绝运行，本轮标记为未完成")
+
+    def on_alarm(signum, frame):
+        mark_incomplete(out, f"作业运行中到达墙钟上限（{TR.CONFIG['budget_hours']} 小时）")
+        raise DeadlineExceeded("到达本轮截止时间 —— 作业中止，本轮标记为未完成")
+
+    signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(int(left) + 1)
+    return d
 
 
 def sensor_set_file(out, sessions) -> Path:
@@ -264,13 +316,16 @@ def cmd_prepare(out, prereg=None) -> None:
     """输入指纹 + 全部训练会话集合的传感器层（`r_s` + 1b 前瞻项）；已是最新的文件不重拟合。"""
     require_frozen(prereg)
     eps = D.load_bare()
+    D.check_roster(eps)
+    enforce_deadline(out, create=True)             # 数据通过名单核验后才开始计时；续跑不重置
     R, _ = D.calibration()
     dfiles, dfp = files_fp(data_files(eps))
     pfiles, _ = files_fp([ROOT / f for f in DEP_FILES])
     gfiles, gfp = files_fp([ROOT / f for f in G2_FILES])
     env = env_versions()
     I = {"code_sha": TR.code_sha(), "data": dfp, "deps": fp_of({"files": pfiles, "env": env}), "g2": gfp,
-         "data_files": dfiles, "deps_files": pfiles, "env": env, "g2_files": gfiles, "sensor": {}}
+         "data_files": dfiles, "deps_files": pfiles, "env": env, "g2_files": gfiles, "sensor": {},
+         "roster": {s: sorted(e.name for e in eps if e.sess == s) for s in SESS}}
     for ss in sensor_sets():
         path = sensor_set_file(out, ss)
         if not sensor_is_current(path, ss, I):
@@ -344,6 +399,7 @@ def cmd_list_jobs(out, phase: str) -> None:
 # ── 内层：训到上限，给内层验证会话的每个检查点评分 ────────────────────────
 def cmd_inner(out, model: str, fold: str, val: str, seed: int, prereg=None) -> None:
     require_frozen(prereg)
+    enforce_deadline(out)
     tr_s = inner_train(fold, val)
     I = read_inputs(out)
     eps = D.load_bare()
@@ -367,7 +423,8 @@ def cmd_inner(out, model: str, fold: str, val: str, seed: int, prereg=None) -> N
                  "config_hash": TR.config_hash(), "code_sha": TR.code_sha(),
                  "inputs": inputs, "input_fp": fp_of(inputs), "train_sessions": list(tr_s),
                  "n_val": len(va), "scores": scores, "sec": res["sec"],
-                 "loss_tail": float(np.mean(res["loss"][-100:])) if res["loss"] else None})
+                 "loss_tail": float(np.mean(res["loss"][-100:])) if res["loss"] else None,
+                 "finished_at": time.time()})
     print(f"  内层完成 {model} {fold} 验证 {val} seed{seed}  {res['sec']:.0f}s", flush=True)
 
 
@@ -393,6 +450,7 @@ def selection(out, model: str, fold: str, seed: int):
 
 def cmd_final(out, model: str, fold: str, seed: int, prereg=None) -> None:
     require_frozen(prereg)
+    enforce_deadline(out)
     I = read_inputs(out)
     V, step = selection(out, model, fold, seed)
     inputs = final_inputs(out, I, model, fold, seed)
@@ -428,6 +486,7 @@ def cmd_final(out, model: str, fold: str, seed: int, prereg=None) -> None:
             preds[e.name.replace("/", "__")] = main
         atomic_npz(base.with_suffix(".npz"), **preds)
         rec.update({"npz_sha256": file_sha(base.with_suffix(".npz")), "episodes": rows})
+    rec["finished_at"] = time.time()
     atomic_json(base.with_suffix(".json"), rec)
     note = "（最佳点落在搜索边界，尚不能确认训练充分）" if boundary else ""
     print(f"  终训完成 {model} {fold} seed{seed}：step* = {step}{note}", flush=True)
@@ -461,6 +520,7 @@ def _ref_json(out, name: str, fold: str) -> Path:
 def cmd_refs(out, prereg=None) -> None:
     """G-2 同口径重预测、旧口径整集 G-2（只对照）、折内 AR 参照；输入未变的折跳过。"""
     require_frozen(prereg)
+    enforce_deadline(out)
     I = read_inputs(out)
     inputs = refs_inputs(I)
     fp = fp_of(inputs)
@@ -498,7 +558,7 @@ def cmd_refs(out, prereg=None) -> None:
                         {"model": name, "fold": fold, "seed": "-", "config_hash": TR.code_sha()[:16],
                          "code_sha": TR.code_sha(), "inputs": inputs, "input_fp": fp,
                          "train_sessions": sorted({e.sess for e in tr}) if name == "ar" else [],
-                         "episodes": r})
+                         "episodes": r, "finished_at": time.time()})
         print(f"  参照 {fold} 完成", flush=True)
 
 
@@ -582,6 +642,9 @@ def main(argv=None) -> int:
     except NotFrozenError as err:
         print(err, flush=True)
         return 2
+    except DeadlineExceeded as err:
+        print(err, flush=True)
+        return 3
     return 0
 
 

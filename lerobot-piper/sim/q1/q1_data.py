@@ -29,6 +29,9 @@ CHUNK_MAX = 100
 Q_VALID_FROM = 2              # 核实 2026-10-02：100 集编码器 state 前 2 帧全为零
 MDEG = np.pi / 180.0 / 1000.0
 CALIB_JSON = ROOT / "outputs/step1_H/step1_H_v1.json"
+# 冻结的集名名单（各会话 40/30/15/10/5；ab2/A 的 ep8、ep9 因帧数/IMU 不合格不在内）——
+# q1_roster.json 在代码指纹里，prepare 与汇总都按它核对
+ROSTER = json.loads((HERE / "q1_roster.json").read_text())
 
 
 class DataContractError(RuntimeError):
@@ -136,6 +139,20 @@ def load_bare(sessions=SESSIONS) -> list[Q1Episode]:
             except ValueError:
                 continue
     return out
+
+
+def check_roster(eps) -> None:
+    """载入的集必须与冻结名单逐会话、逐集名完全一致（总数相同但会话间挪了一集也要拦下）。"""
+    got = {}
+    for e in eps:
+        got.setdefault(e.sess, []).append(e.name)
+    bad = []
+    for s in sorted(set(got) | set(ROSTER)):
+        a, b = set(got.get(s, [])), set(ROSTER.get(s, []))
+        if a != b or len(got.get(s, [])) != len(a):
+            bad.append(f"{s}: 缺 {sorted(b - a)[:3]} 多 {sorted(a - b)[:3]}（{len(got.get(s, []))} 集，应为 {len(b)}）")
+    if bad:
+        raise DataContractError("数据与冻结名单不符：" + "；".join(bad))
 
 
 def by_session(eps) -> dict:

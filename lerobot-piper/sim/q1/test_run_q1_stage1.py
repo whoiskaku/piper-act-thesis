@@ -77,3 +77,14 @@ def test_blas_threads_are_pinned_for_bit_stable_fits(tmp_path):
     fake, calls = _fake(tmp_path, [], [])
     assert _run(tmp_path, fake).returncode == 0
     assert all(line.endswith("BLAS=1") for line in calls.read_text().splitlines())
+
+
+def test_a_job_stopped_by_the_deadline_stops_the_run_with_a_clear_message(tmp_path):
+    """作业因截止时间退出（码 3）⇒ 脚本停止、不汇总，并指向「未完成」标记。"""
+    fake, calls = _fake(tmp_path, ["1a ab5/A ab6/A 0"], ["1a ab5/A 0"])
+    text = fake.read_text().replace('case "$*" in *"--phase inner"*)',
+                                    'case "$*" in *"q1_run.py inner"*) exit 3 ;; esac\ncase "$*" in *"--phase inner"*)', 1)
+    fake.write_text(text)
+    r = _run(tmp_path, fake)
+    assert r.returncode != 0 and "INCOMPLETE.json" in r.stdout
+    assert not _cmds(calls, "final") and "q1_report.py" not in calls.read_text()

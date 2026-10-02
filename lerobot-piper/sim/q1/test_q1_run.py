@@ -18,11 +18,22 @@ def _fake_fit(tr, R):
             np.full((100, 3 * D.HIST, 3), 1e-3 * len(tr)))
 
 
+ALARMS = []
+
+
 @pytest.fixture()
 def syn_data(monkeypatch):
-    """5 个会话 × 2 集合成数据；检查点缩成 (0, 1, 2) 让端到端用例跑得快。"""
+    """5 个会话 × 2 集合成数据；检查点缩成 (0, 1, 2) 让端到端用例跑得快；名单换成合成集名；
+    闹钟只记录、不真设（免得到点打断后面的用例）。"""
+    import signal
     eps = [T.synthetic_episode(i, sess=f"{s}/{a}") for i, (s, a) in
            enumerate([x for x in D.SESSIONS for _ in range(2)])]
+    roster = {}
+    for e in eps:
+        roster.setdefault(e.sess, []).append(e.name)
+    monkeypatch.setattr(D, "ROSTER", roster)
+    ALARMS.clear()
+    monkeypatch.setattr(signal, "alarm", lambda sec: ALARMS.append(sec))
     monkeypatch.setattr(D, "load_bare", lambda *a, **k: eps)
     monkeypatch.setattr(D, "calibration", lambda: (np.eye(3), np.zeros(3)))
     monkeypatch.setattr(RUN, "data_files", lambda e: [D.CALIB_JSON])
@@ -216,11 +227,100 @@ def test_refs_end_to_end_on_synthetic(tmp_path, syn_data):
 @pytest.mark.slow
 def test_prepare_with_the_real_sensor_fit(tmp_path, syn_data, monkeypatch):
     """真实的传感器层拟合走一遍 prepare（快速用例里用的是替身）。"""
+    import signal
     import q1_sensor as S
+    roster = dict(D.ROSTER)                       # 夹具换上的合成名单
     monkeypatch.undo()
+    monkeypatch.setattr(D, "ROSTER", roster)
+    monkeypatch.setattr(signal, "alarm", lambda sec: ALARMS.append(sec))
     monkeypatch.setattr(D, "load_bare", lambda *a, **k: syn_data)
     monkeypatch.setattr(D, "calibration", lambda: (np.eye(3), np.zeros(3)))
     monkeypatch.setattr(RUN, "data_files", lambda e: [D.CALIB_JSON])
     RUN.cmd_prepare(tmp_path, prereg=_prereg(tmp_path))
     Wrs, C, man = RUN.load_sensor_set(tmp_path, ("ab2/A", "ab4/P0", "ab7/Apost"))
     assert Wrs.shape == (S.NLAG * S.N_FEAT + 1, 3) and len(C) == 100 and np.abs(Wrs).max() > 0
+
+
+# ── 数据名单 ──────────────────────────────────────────────────────────────
+def _swap(eps):
+    """ab5 少一集、ab6 多一集（总数不变）。"""
+    extra = T.synthetic_episode(77, sess="ab6/A")
+    return [e for e in eps if e.name != eps[0].name] + [extra]
+
+
+def test_prepare_refuses_a_roster_swap_that_keeps_the_total(tmp_path, syn_data, monkeypatch):
+    sw = _swap(syn_data)
+    assert len(sw) == len(syn_data)
+    monkeypatch.setattr(D, "load_bare", lambda *a, **k: sw)
+    with pytest.raises(D.DataContractError):
+        RUN.cmd_prepare(tmp_path, prereg=_prereg(tmp_path))
+
+
+def test_jobs_refuse_data_that_no_longer_matches_the_roster(tmp_path, syn_data, monkeypatch):
+    pre = _prereg(tmp_path)
+    RUN.cmd_prepare(tmp_path, prereg=pre)
+    monkeypatch.setattr(D, "load_bare", lambda *a, **k: _swap(syn_data))
+    with pytest.raises(D.DataContractError):
+        RUN.cmd_inner(tmp_path, "2a", "ab5/A", "ab6/A", 0, prereg=pre)
+
+
+# ── 24 小时上限 ───────────────────────────────────────────────────────────
+def test_prepare_records_the_deadline_once_and_resume_does_not_reset_it(tmp_path, syn_data):
+    pre = _prereg(tmp_path)
+    RUN.cmd_prepare(tmp_path, prereg=pre)
+    d1 = json.loads(RUN.deadline_file(tmp_path).read_text())
+    assert d1["deadline"] - d1["started_at"] == TR.CONFIG["budget_hours"] * 3600 == 24 * 3600
+    RUN.cmd_prepare(tmp_path, prereg=pre)
+    assert json.loads(RUN.deadline_file(tmp_path).read_text()) == d1
+    assert 0 < ALARMS[-1] <= 24 * 3600 + 1                                  # 作业到点会被中止
+
+
+def test_passed_deadline_stops_every_formal_command_and_marks_incomplete(tmp_path, syn_data):
+    pre = _prereg(tmp_path)
+    RUN.cmd_prepare(tmp_path, prereg=pre)
+    d = json.loads(RUN.deadline_file(tmp_path).read_text())
+    d["deadline"] = d["started_at"] - 1
+    RUN.deadline_file(tmp_path).write_text(json.dumps(d))
+    for call in (lambda: RUN.cmd_prepare(tmp_path, prereg=pre),
+                 lambda: RUN.cmd_refs(tmp_path, prereg=pre),
+                 lambda: RUN.cmd_inner(tmp_path, "2a", "ab5/A", "ab6/A", 0, prereg=pre),
+                 lambda: RUN.cmd_final(tmp_path, "2a", "ab5/A", 0, prereg=pre)):
+        with pytest.raises(RUN.DeadlineExceeded):
+            call()
+    assert json.loads(RUN.incomplete_file(tmp_path).read_text())["status"] == "未完成"
+    assert RUN.main(["inner", "--out", str(tmp_path), "--prereg", str(pre), "2a", "ab5/A", "ab6/A", "0"]) == 3
+
+
+def test_alarm_aborts_a_running_job_and_marks_incomplete(tmp_path, syn_data):
+    import signal
+    RUN.cmd_prepare(tmp_path, prereg=_prereg(tmp_path))
+    handler = signal.getsignal(signal.SIGALRM)
+    with pytest.raises(RUN.DeadlineExceeded):
+        handler(signal.SIGALRM, None)
+    assert RUN.incomplete_file(tmp_path).exists()
+
+
+def test_deadline_of_another_frozen_experiment_is_not_reused(tmp_path, syn_data):
+    pre = _prereg(tmp_path)
+    RUN.cmd_prepare(tmp_path, prereg=pre)
+    d = json.loads(RUN.deadline_file(tmp_path).read_text())
+    d["config_hash"] = "0" * 16
+    RUN.deadline_file(tmp_path).write_text(json.dumps(d))
+    with pytest.raises(RuntimeError):
+        RUN.cmd_prepare(tmp_path, prereg=pre)
+
+
+def test_jobs_record_when_they_finished(tmp_path, syn_data):
+    pre = _prereg(tmp_path)
+    RUN.cmd_prepare(tmp_path, prereg=pre)
+    RUN.cmd_inner(tmp_path, "2a", "ab5/A", "ab6/A", 0, prereg=pre)
+    d = json.loads(RUN.deadline_file(tmp_path).read_text())
+    j = json.loads(RUN.inner_json(tmp_path, "2a", "ab5/A", "ab6/A", 0).read_text())
+    assert d["started_at"] <= j["finished_at"] <= d["deadline"]
+
+
+def test_a_roster_failure_does_not_start_the_clock(tmp_path, syn_data, monkeypatch):
+    monkeypatch.setattr(D, "load_bare", lambda *a, **k: _swap(syn_data))
+    with pytest.raises(D.DataContractError):
+        RUN.cmd_prepare(tmp_path, prereg=_prereg(tmp_path))
+    assert not RUN.deadline_file(tmp_path).exists()

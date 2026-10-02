@@ -48,3 +48,30 @@ def test_load_bare_matches_fabs_loader(bare_eps, calib):
         assert np.array_equal(e.ideal[:e.n], o.ideal)
         assert e.q_valid[D.Q_VALID_FROM:].all() and not e.q_valid[:D.Q_VALID_FROM].any()
         assert len(e.cmd) == 600 and set(e.caps.tolist()) == {99, 199, 299, 399, 499, 599}
+
+
+def test_roster_is_frozen_with_the_expected_counts():
+    """名单随代码冻结（q1_roster.json 在 CODE_FILES 里）：各会话 40/30/15/10/5、集名不重复。"""
+    import q1_train as TR
+    assert "q1_roster.json" in TR.CODE_FILES
+    assert {s: len(v) for s, v in D.ROSTER.items()} == D.EXPECTED_COUNTS
+    names = [n for v in D.ROSTER.values() for n in v]
+    assert len(set(names)) == 100 and all(n.startswith(s + "_ep") for s, v in D.ROSTER.items() for n in v)
+
+
+def test_check_roster_rejects_a_swap_that_keeps_the_total():
+    """ab5 少一集、ab6 多一集：总数仍是 100，也必须拦下。"""
+    from types import SimpleNamespace as NS
+    eps = [NS(sess=s, name=n) for s, v in D.ROSTER.items() for n in v]
+    D.check_roster(eps)
+    swapped = [e for e in eps if e.name != "ab5/A_ep3"] + [NS(sess="ab6/A", name="ab6/A_ep30")]
+    assert len(swapped) == 100
+    with pytest.raises(D.DataContractError):
+        D.check_roster(swapped)
+    with pytest.raises(D.DataContractError):
+        D.check_roster(eps[:-1])
+
+
+@pytest.mark.slow
+def test_real_data_matches_the_frozen_roster(bare_eps):
+    D.check_roster(bare_eps)

@@ -10,6 +10,8 @@
 - 候选终训的 `config_hash` = **冻结的选模规则**（不要求各作业的 step* 相同）；全部 `code_sha` = 当前代码。
 - 输入自 prepare 以来未变（数据、依赖、G-2、传感器层文件逐一重算哈希）；每个作业的输入指纹与当前一致。
 - 由内层评分表重算 `V` 与 step*，与记录一致；`.pt` 的步数 = step*、权重哈希与记录一致；预测文件哈希一致。
+- 每份产物逐会话覆盖**冻结名单**（`q1_roster.json`）上的集，不只是总数 100。
+本轮未完成（有「未完成」标记、缺截止时间记录、或任一产物晚于截止时间）⇒ 只写「未完成」，**不作通过判决**。
 """
 from __future__ import annotations
 import argparse
@@ -98,6 +100,10 @@ def verify(raw, out) -> list:
             names = [r["name"] for j in js for r in j["episodes"]]
             if len(names) != N_EPISODES or len(set(names)) != N_EPISODES:
                 P.append(f"{m} seed {s}: {len(set(names))} 个不同的集，应为 {N_EPISODES}")
+            for x in SESS:
+                got = sorted(r["name"] for j in js for r in j["episodes"] if r["sess"] == x)
+                if got != sorted(D.ROSTER[x]):
+                    P.append(f"{m} seed {s}: {x} 的集与冻结名单不符（{len(got)} 集，应为 {len(D.ROSTER[x])}）")
             for j in js:
                 if any(r["sess"] != j["fold"] for r in j["episodes"]):
                     P.append(f"{j['_path']}: 含非留出会话的集")
@@ -136,6 +142,24 @@ def load_runs(out) -> dict:
         raise RuntimeError("产物不完整或不一致：\n  " + "\n  ".join(problems))
     return {m: {s: [r for j in js for r in j["episodes"]] for s, js in by_seed.items()}
             for m, by_seed in raw.items()}
+
+
+def run_status(out) -> tuple[bool, str]:
+    """本轮是否在截止时间内完成：有「未完成」标记、缺截止时间记录、或任一产物晚于截止时间 ⇒ 未完成。"""
+    out = Path(out)
+    mark = RUN.incomplete_file(out)
+    if mark.exists():
+        return False, json.loads(mark.read_text()).get("reason", "已标记未完成")
+    dp = RUN.deadline_file(out)
+    if not dp.exists():
+        return False, "缺本轮截止时间记录（deadline.json）"
+    deadline = json.loads(dp.read_text())["deadline"]
+    files = (sorted((out / "jobs").glob("*/seed*/*.json")) + sorted((out / "refs").glob("*/*.json"))
+             + sorted((out / "inner").glob("*/seed*/*.json")))
+    late = [p for p in files if json.loads(p.read_text()).get("finished_at", float("inf")) > deadline]
+    if late:
+        return False, f"{len(late)} 份产物晚于本轮截止时间（如 {late[0].relative_to(out)}）"
+    return True, ""
 
 
 def load_selection(out) -> dict:
@@ -258,7 +282,13 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    s = summarize(load_runs(a.out), load_selection(a.out))
+    ok, why = run_status(a.out)
+    if not ok:
+        (Path(a.out) / "summary.json").write_text(json.dumps(
+            {"status": "未完成", "reason": why}, indent=1, ensure_ascii=False))
+        print(f"**本轮未完成**：{why} —— 按预注册记为未完成，不作通过判决。")
+        return 3
+    s = {"status": "完成", **summarize(load_runs(a.out), load_selection(a.out))}
     (Path(a.out) / "summary.json").write_text(json.dumps(s, indent=1, ensure_ascii=False))
     print(markdown(s))
     return 0
