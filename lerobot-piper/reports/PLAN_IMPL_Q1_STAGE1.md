@@ -3476,12 +3476,12 @@ Expected: `98 passed`，约 3–4 分钟。任何失败都先修，不进入 Ste
 
 - [ ] **Step 2: 耗时测量**
 
-这一步只测耗时：在 ab5/A 折的训练会话上训 30 步，**不预测留出、不存权重**；数字只用于填预算。
+这一步只测耗时：在 ab5/A 折的一个内层（训练 ab7/ab2/ab4、验证 ab6）上训 30 步，并对验证会话的检查点评分计时；**不预测外层留出会话、不存权重、不打印任何 ρ**；数字只用于填预算。（停止规则改版后的命令，见修订记录。）
 
-Run: `$PY -u sim/q1/q1_run.py timing --steps 30`
-Expected: 6 行 `<模型>: x.xxx s/步`，再加一行「预计 … 核·小时 … 最长单作业 … 分钟」。镜像里的单线程参考值：
-- 1a ≈ 0.32 s/步，1b ≈ 0.15 s/步；
-- 端到端 ≈ 0.01–0.02 s/步。
+Run: `OPENBLAS_NUM_THREADS=1 $PY -u sim/q1/q1_run.py timing --steps 30`
+Expected: 6 行 `<模型>: x.xxx s/步 · 检查点评分 x.xxx s/集`，6 行逐模型的内层/终训核·小时，再加一行合计（核·小时、最长单作业、15 路并行墙钟）。2026-10-02 实测：
+- 1a 0.347 s/步（评分 0.430 s/集），1b 0.154（0.393）；端到端 0.010–0.017（0.003–0.006）；
+- 合计 ≤ 137.2 核·小时，最长单作业约 62 分钟，15 路并行约 9.1 小时。
 
 - [ ] **Step 3: 写预注册草稿** —— `reports/PREREG_Q1_STAGE1.md`
 
@@ -3698,14 +3698,15 @@ git commit -m "阶段一 Q1：预注册冻结"
 在用户自己的终端运行（也可在本会话输入 `! bash sim/q1/run_q1_stage1.sh`）：
 
 Run: `bash sim/q1/run_q1_stage1.sh`
-Expected: 结尾打印「完成：outputs/q1_stage1/summary.json …」。脚本可重入：中断或某个作业失败时，查 `outputs/q1_stage1/logs/job_*.log`，修复后重跑即可。
+Expected: 结尾打印「完成：outputs/q1_stage1/summary.json …」。脚本分两阶段（先全部内层作业，再全部终训作业），可重入：中断或某个作业失败时，查 `outputs/q1_stage1/logs/inner_*.log` / `final_*.log`，修复后重跑即可。
 
 - [ ] **Step 3: 核对产物**
 
 依次核对：
-- 作业 JSON 数：`ls outputs/q1_stage1/jobs/*/seed*/*.json | wc -l` → `90`；
+- 内层评分表数：`ls outputs/q1_stage1/inner/*/seed*/*.json | wc -l` → `390`；
+- 终训 JSON 数：`ls outputs/q1_stage1/jobs/*/seed*/*.json | wc -l` → `90`；全数据拟合：`ls outputs/q1_stage1/fullfit/*.pt | wc -l` → `6`；
 - 参照 JSON 数：`ls outputs/q1_stage1/refs/*/*.json | wc -l` → `15`；
-- 汇总：`$PY -u sim/q1/q1_report.py --out outputs/q1_stage1` 不报错，即配置指纹唯一、折齐全；
+- 汇总：`$PY -u sim/q1/q1_report.py --out outputs/q1_stage1` 不报错，即通过 §10 的全部核验（冻结的选模规则、输入指纹、由内层评分表重算的 step*、权重对应关系）；
 - 图：`ls outputs/q1_stage1/fig/` 有 6 张 `pp2_*_vs_real.png`。
 
 墙钟或核·小时超出预注册 §7 的上限 ⇒ 按预注册记为未完成，**不临时改判据、不补跑挑结果**。
@@ -3721,6 +3722,7 @@ Expected: 结尾打印「完成：outputs/q1_stage1/summary.json …」。脚本
 
 ## 一、推进判据（§5 #1）
 <粘贴 report.md 第一张表>
+- 选步：<粘贴 report.md 的 step* 表>。落在上限的写「最佳点落在搜索边界，尚不能确认训练充分」；第 0 步按预注册 §4 的语义解读。
 - 通过：<编号>；不过：<编号 + 哪个会话不满足 / 平均未严格改善>。
 - ⚠ 这是开发筛查规则，不代表统计上已证明泛化。
 - ⚠ 三行（结构）之间的胜负**不能单独归因于网络结构**，原因有三：
@@ -3796,3 +3798,9 @@ git commit -m "阶段一 Q1：结果（推进判据逐候选、b 相对 a、参�
   5. 新测试：分层计分输出不读下一 chunk、参照合成端到端（slow）、全数据拟合产物核验、运行脚本空跑 4 例 —— 共 112 个。
   - 预注册草稿同步：新 `code_sha`、§4 交叉引用改为 §12、前瞻分组、§12-4 的 OLS 过拟合风险、全数据模型核验。
 - 2026-10-02 用户三项决定后（`fdbf1ec`）：1b 前瞻项与 AR 改用固定岭回归（`q1_ar.ridge`，`RIDGE_REL = 1e-2`），97–102 组保留只报告，AR 无截距保留；测试 113 个；预注册草稿同步新 `code_sha`。
+
+- 2026-10-02 用户定停止规则后（`b6d8cdb`）：**不再「3000 步、取最后一步」**，改为内层留一会话选步（上限 10000、11 个检查点、四会话 ρ 等权平均、平局取最早、每个「模型 × 外层折 × 种子」独立选 step*），终训只训到 step*，外层留出会话只评一次；pp2 全数据拟合按五会话内层留一（`final MODEL all 0`）。同时补齐：
+  - 冻结配置核验：预注册记 `code_sha` 与 `config_hash`，正式入口不再接受 `--steps`；
+  - 续跑绑定输入指纹：数据文件、依赖代码与库版本、G-2 权重、传感器层、内层评分表；
+  - 汇总核验：由内层评分表重算 step*，并核对权重的对应关系。
+  - 命令由 `prepare / list-jobs / job / refs / fullfit` 改为 `prepare / refs / list-jobs --phase inner|final / inner / final`；传感器层按训练会话集合存取（16 份）。Task 10–13 代码块与仓库不再一致，**以仓库为准**；测试 129 个。
