@@ -5,8 +5,11 @@
 **推进判据**（每个候选单独判，不要求六个全过）：5 个留出会话都 `ρ_s ≤ ρ_s(G-2)`，
 且 5 会话等权平均 `mean ρ_s < mean ρ_s(G-2)`。G-2 = 同口径窗口重预测。
 ⚠ 开发筛查规则，不代表统计上已证明泛化。
-汇总前强制完整性检查：6 模型 × 3 种子 × 5 折 + 3 个参照 × 5 折；每个作业的权重与预测文件存在且
-哈希与记录一致；候选的 config_hash 唯一；全部产物的 code_sha = 当前代码；每份产物恰好覆盖同一组 100 集。
+汇总前强制核验（任一不满足即拒绝汇总，并列出全部问题）：
+- 6 模型 × 3 种子 × 5 折 + 3 个参照 × 5 折；每份产物恰好覆盖同一组 100 集；训练会话不含留出会话。
+- 候选终训的 `config_hash` = **冻结的选模规则**（不要求各作业的 step* 相同）；全部 `code_sha` = 当前代码。
+- 输入自 prepare 以来未变（数据、依赖、G-2、传感器层文件逐一重算哈希）；每个作业的输入指纹与当前一致。
+- 由内层评分表重算 `V` 与 step*，与记录一致；`.pt` 的步数 = step*、权重哈希与记录一致；预测文件哈希一致。
 """
 from __future__ import annotations
 import argparse
@@ -21,6 +24,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 import q1_data as D            # noqa: E402
+import q1_run as RUN           # noqa: E402
 import q1_train as TR          # noqa: E402
 
 CANDIDATES = ("1a", "1b", "2a", "2b", "3a", "3b")
@@ -34,9 +38,54 @@ def file_sha(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def verify(raw) -> list:
+def _check_final(j: dict, out: Path, I: dict, P: list) -> None:
+    """候选终训的选模记录：配置、输入指纹、由内层评分表重算的 step*、权重与预测文件。"""
+    import torch
+    m, fold, seed, path = j["model"], j["fold"], int(j["seed"]), Path(j["_path"])
+    if j.get("config_hash") != TR.config_hash():
+        P.append(f"{path}: config_hash 与冻结的选模规则不符")
+    if j.get("train_sessions") != list(RUN.train_sessions(fold)):
+        P.append(f"{path}: 训练会话 {j.get('train_sessions')} 不对")
+    exp = RUN.final_inputs(out, I, m, fold, seed)
+    if exp is None or j.get("inputs") != exp or j.get("input_fp") != RUN.fp_of(exp):
+        P.append(f"{path}: 输入指纹与当前的内层评分表 / 传感器层 / 数据不符")
+    try:
+        V, step = RUN.selection(out, m, fold, seed)
+    except RuntimeError as err:
+        P.append(str(err))
+        return
+    if j.get("V") != {str(s): V[s] for s in sorted(V)} or j.get("step_star") != step:
+        P.append(f"{path}: 记录的 V / step* 与内层评分表重算不符")
+    if j.get("boundary") != (step == TR.CONFIG["max_steps"]):
+        P.append(f"{path}: 边界标记与 step* 不符")
+    pt, npz = path.with_suffix(".pt"), path.with_suffix(".npz")
+    if not pt.exists() or file_sha(pt) != j.get("pt_sha256"):
+        P.append(f"{pt}: 缺失或与记录的 pt_sha256 不符")
+    else:
+        ck = torch.load(pt, weights_only=False)
+        if ck.get("step") != step or TR.state_dict_sha(ck["state_dict"]) != j.get("state_sha256"):
+            P.append(f"{pt}: 权重的步数或哈希与 step* 记录不符")
+    if not npz.exists() or file_sha(npz) != j.get("npz_sha256"):
+        P.append(f"{npz}: 缺失或与记录的 npz_sha256 不符")
+
+
+def verify(raw, out) -> list:
     """完整性检查 → 问题列表（空 = 通过）。"""
+    out = Path(out)
+    try:
+        I = RUN.read_inputs(out)
+    except RuntimeError as err:
+        return [str(err)]
     P = []
+    for key in ("data_files", "deps_files", "g2_files"):
+        for rel, h in I.get(key, {}).items():
+            f = RUN.ROOT / rel
+            if not f.exists() or file_sha(f) != h:
+                P.append(f"输入文件自 prepare 以来已变或缺失：{rel}")
+    for st, h in I["sensor"].items():
+        f = out / "sensor" / f"{st}.npz"
+        if not f.exists() or file_sha(f) != h:
+            P.append(f"传感器层文件自 prepare 以来已变或缺失：{f.name}")
     code_now = TR.code_sha()
     for m in CANDIDATES + REFS:
         by_seed = raw.get(m, {})
@@ -54,20 +103,14 @@ def verify(raw) -> list:
                     P.append(f"{j['_path']}: 含非留出会话的集")
                 if j.get("code_sha") != code_now:
                     P.append(f"{j['_path']}: code_sha 与当前代码不一致")
-                if m not in CANDIDATES:
+                if m in CANDIDATES:
+                    _check_final(j, out, I, P)
                     continue
+                if j.get("input_fp") != RUN.fp_of(RUN.refs_inputs(I)):
+                    P.append(f"{j['_path']}: 参照的输入指纹与当前不符")
                 ts = j.get("train_sessions", [])
-                if j["fold"] in ts or len(ts) != len(SESS) - 1:
-                    P.append(f"{j['_path']}: 训练会话 {ts} 不对")
-                for key, suf in (("pt_sha256", ".pt"), ("npz_sha256", ".npz")):
-                    f = Path(j["_path"]).with_suffix(suf)
-                    if not f.exists():
-                        P.append(f"缺 {f}")
-                    elif file_sha(f) != j.get(key):
-                        P.append(f"{f}: 与记录的 {key} 不符")
-    cfg = {j["config_hash"] for m in CANDIDATES for js in raw.get(m, {}).values() for j in js}
-    if len(cfg) > 1:
-        P.append(f"候选作业的 config_hash 不唯一：{sorted(cfg)}")
+                if m == "ar" and (j["fold"] in ts or len(ts) != len(SESS) - 1):
+                    P.append(f"{j['_path']}: AR 的训练会话 {ts} 不对")
     sets = {tuple(sorted(r["name"] for j in js for r in j["episodes"]))
             for by_seed in raw.values() for js in by_seed.values()}
     if len(sets) > 1:
@@ -75,19 +118,37 @@ def verify(raw) -> list:
     return P
 
 
-def load_runs(out) -> dict:
-    """→ {model: {seed: [逐集行]}}。先做完整性检查；任何问题 ⇒ RuntimeError（列出全部）。"""
+def _read_jobs(out) -> dict:
     raw: dict = {}
     for p in sorted((Path(out) / "jobs").glob("*/seed*/*.json")) + \
             sorted((Path(out) / "refs").glob("*/*.json")):
         j = json.loads(p.read_text())
         j["_path"] = str(p)
         raw.setdefault(j["model"], {}).setdefault(str(j["seed"]), []).append(j)
-    problems = verify(raw)
+    return raw
+
+
+def load_runs(out) -> dict:
+    """→ {model: {seed: [逐集行]}}。先做完整性检查；任何问题 ⇒ RuntimeError（列出全部）。"""
+    raw = _read_jobs(out)
+    problems = verify(raw, out)
     if problems:
         raise RuntimeError("产物不完整或不一致：\n  " + "\n  ".join(problems))
     return {m: {s: [r for j in js for r in j["episodes"]] for s, js in by_seed.items()}
             for m, by_seed in raw.items()}
+
+
+def load_selection(out) -> dict:
+    """→ {model: {fold: {seed: {step_star, boundary, V}}}}（候选终训的选步记录）。"""
+    sel: dict = {}
+    for m, by_seed in _read_jobs(out).items():
+        if m not in CANDIDATES:
+            continue
+        for s, js in by_seed.items():
+            for j in js:
+                sel.setdefault(m, {}).setdefault(j["fold"], {})[s] = {
+                    "step_star": j["step_star"], "boundary": j["boundary"], "V": j["V"]}
+    return sel
 
 
 def rho_by_session(rows, key: str = "num") -> dict:
@@ -128,7 +189,7 @@ def lead_rho(by_seed) -> dict:
     return {b: n / d for b, (n, d) in acc.items()}
 
 
-def summarize(runs) -> dict:
+def summarize(runs, selection=None) -> dict:
     g2 = seed_mean(runs["g2"])
     out = {"g2": g2, "ar": seed_mean(runs["ar"]), "g2_whole": seed_mean(runs["g2_whole"]),
            "lead_refs": {m: lead_rho(runs[m]) for m in ("g2", "ar")},
@@ -145,6 +206,8 @@ def summarize(runs) -> dict:
         c = out["candidates"]
         if f + "a" in c and f + "b" in c:
             out["b_vs_a"][f] = b_vs_a(c[f + "a"]["rho"], c[f + "b"]["rho"])
+    if selection is not None:
+        out["selection"] = selection
     return out
 
 
@@ -169,6 +232,25 @@ def markdown(s: dict) -> str:
           "| 结构 | " + " | ".join(SESS) + " |", "|" + "---|" * (len(SESS) + 1)]
     for f, d in s["b_vs_a"].items():
         L.append(f"| {f}b vs {f}a | " + " | ".join(f"{d[x] * 100:+.1f}%" for x in SESS) + " |")
+    sel = s.get("selection")
+    if sel:
+        top = TR.CONFIG["max_steps"]
+        L += ["", "### step*（内层留一会话选出；每格为种子 0 / 1 / 2；† = 落在上限）", "",
+              "| 模型 | " + " | ".join(SESS) + " |", "|" + "---|" * (len(SESS) + 1)]
+        hit = False
+        for m in CANDIDATES:
+            if m not in sel:
+                continue
+            cells = []
+            for x in SESS:
+                ks = [sel[m][x][k] for k in sorted(sel[m].get(x, {}))]
+                hit |= any(k["boundary"] for k in ks)
+                cells.append(" / ".join(f"{k['step_star']}{'†' if k['boundary'] else ''}" for k in ks))
+            L.append(f"| {m} | " + " | ".join(cells) + " |")
+        if hit:
+            L += ["", f"† 最佳点落在搜索边界（{top} 步），尚不能确认训练充分；按预注册不追加步数。"]
+        L += ["", "第 0 步的含义不统一：端到端 = 零预测（误差输出为零）；分层 = 伺服先验 + 已拟合的传感器层"
+              "（关节层未训练）。不套用 F_inc「step* = 0」的解释。"]
     return "\n".join(L)
 
 
@@ -176,7 +258,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    s = summarize(load_runs(a.out))
+    s = summarize(load_runs(a.out), load_selection(a.out))
     (Path(a.out) / "summary.json").write_text(json.dumps(s, indent=1, ensure_ascii=False))
     print(markdown(s))
     return 0

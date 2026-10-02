@@ -1,8 +1,10 @@
 """阶段一的训练与预测 —— 6 个模型 × 留一会话 × 训练种子。
 
-每步均匀抽一个训练集，取它的全部主窗口（chunk 开头起点），拼接后算损失；
-**固定步数、取最后一步权重**；留出会话只在最后预测一次，不参与任何选择。
-CPU 单线程 + 确定性算法 ⇒ 同种子逐位复现。
+每步均匀抽一个训练集，取它的全部主窗口（chunk 开头起点），拼接后算损失。
+**停止规则**（用户 2026-10-02 定）：训练上限 10000 步，在 11 个检查点处快照；step* 由**内层留一会话**
+选出（外层四个训练会话各轮流当验证会话，验证 ρ 的等权平均最小者；完整精度平局取最早）；
+最终权重 = 在外层四个训练会话上同种子训到 step* 的权重。外层留出会话只在最后预测一次，不参与选步。
+同种子 ⇒ 训到第 s 步的权重与长跑中第 s 步的快照逐位相同。CPU 单线程 + 确定性算法。
 """
 from __future__ import annotations
 import hashlib
@@ -21,7 +23,11 @@ import q1_windows as W
 MODELS = {"1a": ("layered", "a"), "1b": ("layered", "b"),
           "2a": ("tcn", "a"), "2b": ("tcn", "b"),
           "3a": ("tr", "a"), "3b": ("tr", "b")}
-CONFIG = {"steps": 3000, "lr": 1e-3, "clip": 1.0, "threads": 1, "device": "cpu"}
+CONFIG = {"max_steps": 10000,
+          "ckpts": (0, 250, 500, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 10000),
+          "select": "inner leave-one-session-out; min equal-weight mean of per-session rho; earliest tie",
+          "tie_rtol": 1e-12, "tie_atol": 1e-15,
+          "lr": 1e-3, "clip": 1.0, "threads": 1, "device": "cpu"}
 CODE_FILES = ("q1_data.py", "q1_windows.py", "q1_losses.py", "q1_layered.py", "q1_e2e.py",
               "q1_sensor.py", "q1_train.py", "q1_ar.py", "q1_g2ref.py", "q1_run.py", "q1_report.py")
 
@@ -34,10 +40,19 @@ def code_sha() -> str:
     return h.hexdigest()
 
 
-def config_hash(steps) -> str:
-    """训练/预测相关的配置 + 代码指纹。改了代码或步数 ⇒ 旧产物作废、需重跑。"""
-    blob = json.dumps({"config": {**CONFIG, "steps": steps}, "code": code_sha()}, sort_keys=True)
+def config_hash() -> str:
+    """选模规则与训练配置（上限、检查点、平局容差、优化器……）+ 代码指纹。
+    锁定的是**规则**，不是各作业选中的 step*。"""
+    blob = json.dumps({"config": CONFIG, "code": code_sha()}, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def pick_step(V: dict) -> int:
+    """`V[step]`（内层验证会话 ρ 的等权平均）→ 最小值的检查点；完整精度平局取最早。"""
+    steps = sorted(V)
+    vmin = min(V[s] for s in steps)
+    tol = CONFIG["tie_atol"] + CONFIG["tie_rtol"] * abs(vmin)
+    return int(min(s for s in steps if abs(V[s] - vmin) <= tol))
 
 
 def split_fold(eps, held: str):
@@ -85,9 +100,13 @@ def forward_windows(model_id, model, st, ep, windows):
     return Ee, Qq, None
 
 
-def train_one(model_id: str, tr_eps, seed: int, steps=None, log=None) -> dict:
+def train_one(model_id: str, tr_eps, seed: int, ckpts=None, log=None) -> dict:
+    """训到 `max(ckpts)` 步，在每个检查点（含第 0 步 = 初始权重）保存 `state_dict` 深拷贝。"""
     import torch
-    steps = CONFIG["steps"] if steps is None else steps
+    ckpts = tuple(CONFIG["ckpts"] if ckpts is None else ckpts)
+    if list(ckpts) != sorted(set(ckpts)) or ckpts[0] < 0:
+        raise ValueError(f"检查点须严格递增且非负：{ckpts}")
+    steps = ckpts[-1]
     _determinism(seed)
     model, st = build(model_id, tr_eps)
     norms = LS.loss_norms(tr_eps)
@@ -95,6 +114,13 @@ def train_one(model_id: str, tr_eps, seed: int, steps=None, log=None) -> dict:
     rng = np.random.default_rng(seed)
     wins = [W.chunk_windows(e) for e in tr_eps]
     hist, t_start = [], time.time()
+    snaps = {}
+
+    def snap():
+        return {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    if 0 in ckpts:
+        snaps[0] = snap()
     for it in range(steps):
         i = int(rng.integers(len(tr_eps)))
         Ee, Qq, _ = forward_windows(model_id, model, st, tr_eps[i], wins[i])
@@ -106,10 +132,20 @@ def train_one(model_id: str, tr_eps, seed: int, steps=None, log=None) -> dict:
         torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["clip"])
         opt.step()
         hist.append(float(loss.item()))
+        if it + 1 in ckpts:
+            snaps[it + 1] = snap()
         if log and (it + 1) % 500 == 0:
             log(f"    {model_id} seed{seed} step {it + 1}/{steps} "
                 f"loss {np.mean(hist[-500:]):.5f} {time.time() - t_start:.0f}s")
-    return {"model": model, "stats": st, "norms": norms, "loss": hist, "sec": time.time() - t_start}
+    return {"model": model, "stats": st, "norms": norms, "loss": hist, "sec": time.time() - t_start,
+            "ckpt": snaps}
+
+
+def with_weights(model_id: str, st: dict, state_dict):
+    """按统计量重建网络并载入某个快照。"""
+    model = rebuild(model_id, st)
+    model.load_state_dict(state_dict)
+    return model
 
 
 def predict_windows(model_id, model, st, ep, windows, R=None, Wrs=None, C=None) -> list:
@@ -143,9 +179,25 @@ def predict_episode(model_id, model, st, ep, windows, R=None, Wrs=None, C=None) 
     return W.stitch(ep.n, windows, predict_windows(model_id, model, st, ep, windows, R, Wrs, C))
 
 
-def state_sha256(model) -> str:
+def session_scores(model_id, model, st, eps, R=None, Wrs=None, C=None) -> dict:
+    """主窗口预测 → {会话: [Σnum, Σden]}（会话内按集池化；ρ = num/den）。"""
+    K = W.kernel()
+    out: dict = {}
+    for e in eps:
+        n, d, _ = W.score(e.gap, predict_episode(model_id, model, st, e, W.chunk_windows(e), R, Wrs, C), K)
+        a = out.setdefault(e.sess, [0.0, 0.0])
+        a[0] += n
+        a[1] += d
+    return out
+
+
+def state_dict_sha(state_dict) -> str:
     h = hashlib.sha256()
-    for k, v in sorted(model.state_dict().items()):
+    for k, v in sorted(state_dict.items()):
         h.update(k.encode())
         h.update(v.detach().cpu().contiguous().numpy().tobytes())
     return h.hexdigest()
+
+
+def state_sha256(model) -> str:
+    return state_dict_sha(model.state_dict())

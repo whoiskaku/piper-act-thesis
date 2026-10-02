@@ -2,7 +2,7 @@
 
 规则「改完 G 必出 pp2 波形图」：沿用 `sim/step2_g/fig_pp2_gq_vs_real.py` 的版式 ——
 中位集 + 最难集、0.5–9 Hz、各模型取自己的最优大域位移并写在图上、两条口径注记。
-候选 = `q1_run.py fullfit` 的全数据拟合（seed 0，**只作图，不进任何判据**）；
+候选 = `q1_run.py final MODEL all 0` 的全数据拟合（五会话内层留一选步、seed 0，**只作图，不进任何判据**）；
 G-2 = 同口径窗口重预测。窗口规则与阶段一相同（chunk 开头起点、末端钳位）。
 
     python -u sim/q1/fig_pp2_q1.py --out outputs/q1_stage1 --model 2b
@@ -107,7 +107,7 @@ def main(argv=None) -> int:
     ap.add_argument("--model", required=True, choices=list(TR.MODELS))
     a = ap.parse_args(argv)
     R, b = D.calibration()
-    model, st, Wrs, C = RUN.load_fullfit(a.out, a.model)      # 核对代码指纹与冻结步数
+    model, st, Wrs, C = RUN.load_fullfit(a.out, a.model)      # 核对代码指纹、选模规则与 step* 记录
     g2 = G.load_g2()
     eps = [D.load_episode(p, "pp2/bare") for p in bare_logs()]
     raw = []

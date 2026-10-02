@@ -22,11 +22,11 @@ def syn():
 def test_train_is_bit_reproducible_and_predicts(mid, syn):
     import torch
     tr, te, R, Wrs, C = syn
-    a = TR.train_one(mid, tr, seed=0, steps=3)
+    a = TR.train_one(mid, tr, seed=0, ckpts=(3,))
     assert torch.get_num_threads() == TR.CONFIG["threads"]
-    b = TR.train_one(mid, tr, seed=0, steps=3)
+    b = TR.train_one(mid, tr, seed=0, ckpts=(3,))
     assert TR.state_sha256(a["model"]) == TR.state_sha256(b["model"]) and a["loss"] == b["loss"]
-    c = TR.train_one(mid, tr, seed=1, steps=3)
+    c = TR.train_one(mid, tr, seed=1, ckpts=(3,))
     assert TR.state_sha256(c["model"]) != TR.state_sha256(a["model"])
     eh = TR.predict_episode(mid, a["model"], a["stats"], te, W.chunk_windows(te), R, Wrs, C)
     assert eh.shape == (te.n, 3) and np.isfinite(eh).all()
@@ -35,7 +35,7 @@ def test_train_is_bit_reproducible_and_predicts(mid, syn):
 @pytest.mark.parametrize("mid", ["1b", "2b", "3b"])
 def test_prediction_ignores_measurements_after_origin(mid, syn):
     tr, te, R, Wrs, C = syn
-    out = TR.train_one(mid, tr, seed=0, steps=2)
+    out = TR.train_one(mid, tr, seed=0, ckpts=(2,))
     ws = W.chunk_windows(te)
     base = TR.predict_episode(mid, out["model"], out["stats"], te, ws, R, Wrs, C)
     w = ws[3]
@@ -80,9 +80,67 @@ def test_split_fold_excludes_held_out_session():
         TR.split_fold(eps, "nope/A")
 
 
-def test_config_hash_tracks_steps():
-    assert TR.config_hash(3000) != TR.config_hash(2999)
-    assert TR.config_hash(3000) == TR.config_hash(3000)
+def test_config_hash_tracks_the_selection_rule(monkeypatch):
+    """配置指纹锁定的是选模规则（检查点、平局容差、上限……），不是某个作业选中的步数。"""
+    h = TR.config_hash()
+    assert TR.config_hash() == h and len(h) == 16
+    assert TR.CONFIG["ckpts"][-1] == TR.CONFIG["max_steps"] == 10000 and len(TR.CONFIG["ckpts"]) == 11
+    monkeypatch.setitem(TR.CONFIG, "ckpts", (0, 10000))
+    assert TR.config_hash() != h
+    monkeypatch.undo()
+    monkeypatch.setitem(TR.CONFIG, "tie_rtol", 1e-9)
+    assert TR.config_hash() != h
+
+
+@pytest.mark.parametrize("mid", ["1a", "2b"])
+def test_checkpoints_are_prefixes_of_one_run(mid, syn):
+    """同种子 ⇒ 训到第 s 步的权重 = 长跑中第 s 步的快照（终训只训到 step* 才成立）。"""
+    tr, te, R, Wrs, C = syn
+    long = TR.train_one(mid, tr, seed=0, ckpts=(0, 2, 4))
+    short = TR.train_one(mid, tr, seed=0, ckpts=(2,))
+    zero = TR.train_one(mid, tr, seed=0, ckpts=(0,))
+    assert sorted(long["ckpt"]) == [0, 2, 4] and sorted(short["ckpt"]) == [2]
+    assert TR.state_dict_sha(long["ckpt"][2]) == TR.state_dict_sha(short["ckpt"][2])
+    assert TR.state_dict_sha(long["ckpt"][0]) == TR.state_dict_sha(zero["ckpt"][0])
+    assert TR.state_dict_sha(long["ckpt"][4]) == TR.state_sha256(long["model"])
+    assert TR.state_dict_sha(long["ckpt"][2]) != TR.state_dict_sha(long["ckpt"][4])
+    m2 = TR.with_weights(mid, long["stats"], long["ckpt"][2])
+    assert TR.state_sha256(m2) == TR.state_dict_sha(short["ckpt"][2])
+
+
+def test_pick_step_takes_the_earliest_minimum_within_full_precision_ties():
+    assert TR.pick_step({0: 0.5, 250: 0.4, 500: 0.4 + 1e-17, 1000: 0.41}) == 250
+    assert TR.pick_step({0: 0.4, 250: 0.4, 500: 0.39999}) == 500
+    assert TR.pick_step({0: 0.4, 250: 0.4}) == 0
+    assert TR.pick_step({10000: 0.1, 0: 0.2}) == 10000
+
+
+def test_step_zero_is_not_uniformly_a_zero_prediction(syn):
+    """第 0 步：端到端的误差输出恰为 0；分层模型仍有伺服先验与已拟合的传感器层 ⇒ 非零。"""
+    tr, te, R, Wrs, C = syn
+    ws = W.chunk_windows(te)
+    for mid in ("2a", "3b"):
+        r = TR.train_one(mid, tr, seed=0, ckpts=(0,))
+        assert (TR.predict_episode(mid, r["model"], r["stats"], te, ws, R, Wrs, C) == 0).all()
+    for mid in ("1a", "1b"):
+        r = TR.train_one(mid, tr, seed=0, ckpts=(0,))
+        assert np.abs(TR.predict_episode(mid, r["model"], r["stats"], te, ws, R, Wrs, C)).max() > 0
+
+
+def test_session_scores_pool_within_each_session(syn):
+    tr, te, R, Wrs, C = syn
+    r = TR.train_one("2a", tr, seed=0, ckpts=(2,))
+    eps = tr[:4]
+    got = TR.session_scores("2a", r["model"], r["stats"], eps, R, Wrs, C)
+    K = W.kernel()
+    for sess in {e.sess for e in eps}:
+        num = den = 0.0
+        for e in eps:
+            if e.sess == sess:
+                n_, d_, _ = W.score(e.gap, TR.predict_episode("2a", r["model"], r["stats"], e,
+                                                              W.chunk_windows(e), R, Wrs, C), K)
+                num += n_; den += d_
+        assert np.isclose(got[sess][0], num, rtol=1e-12) and np.isclose(got[sess][1], den, rtol=1e-12)
 
 
 @pytest.mark.parametrize("mid", ["1a", "1b"])
