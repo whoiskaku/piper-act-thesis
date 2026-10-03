@@ -65,6 +65,23 @@ def test_beta_across_seeds_averages_only_defined_seeds():
     assert REP.beta_seed_mean({0: [{"num": 0.0, "den": 0.0}]})["mean"] is None
 
 
+def test_fold_mean_is_equal_weight_over_defined_folds():
+    m = REP.fold_mean({"ab5": 0.2, "ab6": None, "ab7": 0.4})
+    assert m["n_defined"] == 2 and abs(m["mean"] - 0.3) < 1e-12
+    assert REP.fold_mean({"ab5": None, "ab6": None, "ab7": None}) == {"mean": None, "n_defined": 0}
+
+
+def test_report_entry_disables_gc(tmp_path):
+    """入口须关 GC：verify 会导入 MuJoCo 与 scipy，二者共存时 GC 会段错误。"""
+    import gc
+    gc.enable()
+    try:
+        assert REP.main(["--out", str(tmp_path)]) == 3
+        assert not gc.isenabled()
+    finally:
+        gc.disable()
+
+
 def test_code_fingerprint_covers_the_report():
     assert "q2_report.py" in TR.CODE_FILES_Q2
 
@@ -125,6 +142,37 @@ def test_complete_tree_verifies_and_aggregates(tree):
     assert set(s["q1_recheck"]) == {"nominal", "g2"} and set(s["lead"]) == set(rb)
     md = REP.markdown(s)
     assert "开发检验" in md and "不能把胜负单独解释成非线性是否有用" in md and "step*" in md and "不等于统计显著" in md
+
+
+def test_ab4_reports_the_three_fold_average_and_per_seed_beta(tree):
+    """设计稿第 5 项：ab4 逐折报告并给出三折等权平均；β 保留逐种子值与有效种子数（summary.json 与 summary.md 都有）。"""
+    out, _ = tree
+    s = REP.summarize(out)
+    for a in ("P2", "P3"):
+        t = s["aux"][a]
+        for p in ("zero", "H", "nonlinear", "condlinear"):
+            assert abs(t["rho_fold_mean"][p] - np.mean([t["rho"][p][f] for f in F])) < 1e-12
+        b = t["beta_fold_mean"]["H"]
+        assert b["n_defined"] == 3 and abs(b["mean"] - np.mean([t["beta"]["H"][f]["mean"] for f in F])) < 1e-12
+    md = REP.markdown(s)
+    assert "三折等权平均" in md and "3/3：" in md
+
+
+def test_a_diverged_inner_checkpoint_keeps_the_run_verifiable(tree, tmp_path):
+    """内层某检查点的验证 ρ 为 NaN（训练发散）：不被选中、终训照常、核验仍通过，汇总里注明。"""
+    import shutil
+    src, _ = tree
+    out = tmp_path / "copy"
+    shutil.copytree(src, out)
+    p = RUN.inc_inner_json(out, "condlinear", "ab7", "ab5", 1)
+    j = json.loads(p.read_text())
+    j["scores"]["1"]["rho"] = float("nan")
+    p.write_text(json.dumps(j))
+    RUN.cmd_inc_final(out, "condlinear", "ab7", 1, prereg=out / "PREREG.md")
+    f = json.loads(RUN.inc_final_base(out, "condlinear", "ab7", 1).with_suffix(".json").read_text())
+    assert f["V"]["1"] == float("inf") and f["step_star"] != 1
+    assert REP.verify(out) == []
+    assert "非有限" in REP.markdown(REP.summarize(out))
 
 
 @pytest.mark.parametrize("damage", ["missing_final", "tampered_pt", "tampered_npz", "changed_inner", "stale_config",

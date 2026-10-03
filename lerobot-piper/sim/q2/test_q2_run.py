@@ -222,6 +222,19 @@ def test_jobs_train_and_select_only_on_the_allowed_runs(tmp_path, syn, monkeypat
                       + [("condlinear", {("ab5", "corr")})] * n_ck + [("condlinear", {("ab7", "corr")})] * n_ck)
 
 
+def test_selection_treats_a_non_finite_validation_rho_as_never_best(tmp_path):
+    """训练发散的检查点（验证 ρ 非有限）按 +∞ 处理：永不被选中，记录值可经 JSON 往返，核验时比较一致。"""
+    tables = []
+    for v, rhos in (("a", {0: 0.9, 1: float("nan"), 2: 0.5}), ("b", {0: 0.8, 1: 0.1, 2: 0.6})):
+        p = tmp_path / f"{v}.json"
+        p.write_text(json.dumps({"scores": {str(k): {"rho": r} for k, r in rhos.items()}}))
+        tables.append(p)
+    V, step = RUN.selection(tables, (0, 1, 2))
+    assert V[1] == float("inf") and step == 2
+    rec = {str(k): V[k] for k in V}
+    assert json.loads(json.dumps(rec)) == rec                          # 终训记录的 V 与核验时重算的 V 可逐值比较
+
+
 def test_list_jobs_counts_and_requeue_on_input_change(tmp_path, syn, capsys):
     pre = _prereg(tmp_path)
     RUN.cmd_prepare(tmp_path, prereg=pre)

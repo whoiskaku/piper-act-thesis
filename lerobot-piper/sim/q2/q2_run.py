@@ -291,8 +291,13 @@ def load_nominal(out, fold, seed):
     return model, ck["stats"]
 
 
+def _finite_or_inf(v: float) -> float:
+    return v if np.isfinite(v) else float("inf")
+
+
 def selection(paths, ckpts) -> tuple:
-    """两张内层表 → (V {step: 平均 ρ}, step*)。表缺失或检查点不符 ⇒ RuntimeError。"""
+    """两张内层表 → (V {step: 平均 ρ}, step*)。表缺失或检查点不符 ⇒ RuntimeError。
+    非有限的验证 ρ（训练发散）按 +∞ 处理：永不被选中；+∞ 可经 JSON 往返，核验时比较一致。"""
     rho = []
     for p in paths:
         j = _load(p)
@@ -300,7 +305,7 @@ def selection(paths, ckpts) -> tuple:
             raise RuntimeError(f"缺内层表 {p}")
         if sorted(int(s) for s in j["scores"]) != list(ckpts):
             raise RuntimeError(f"{p}: 检查点与选步规则不符")
-        rho.append({int(s): float(r["rho"]) for s, r in j["scores"].items()})
+        rho.append({int(s): _finite_or_inf(float(r["rho"])) for s, r in j["scores"].items()})
     V = {s: float(np.mean([r[s] for r in rho])) for s in ckpts}
     return V, TR.pick_step(V)
 

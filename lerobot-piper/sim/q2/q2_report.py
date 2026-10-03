@@ -15,7 +15,9 @@
 """
 from __future__ import annotations
 import argparse
+import gc
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -262,6 +264,12 @@ def beta_seed_mean(by_seed: dict) -> dict:
     return {"per_seed": per, "mean": float(np.mean(ok)) if ok else None, "n_defined": len(ok)}
 
 
+def fold_mean(by_fold: dict) -> dict:
+    """{fold: 值或 None} → 三折等权平均（只平均有定义的折）与有定义的折数；全部 None ⇒ 平均 None。"""
+    ok = [v for v in by_fold.values() if v is not None]
+    return {"mean": float(np.mean(ok)) if ok else None, "n_defined": len(ok)}
+
+
 def lead_rho(by_seed: dict) -> dict:
     """{seed: 逐集行} → 按前瞻分组的 ρ（各组分子分母先对种子平均再池化）。"""
     acc, k = {}, len(by_seed)
@@ -283,6 +291,7 @@ def collect(out) -> dict:
     braw = {p: {f: {} for f in FOLDS} for p in ("H",) + FORMS}
     q1 = {f: {} for f in FOLDS}
     steps = {b: {f: {} for f in FOLDS} for b in ("nominal",) + FORMS}
+    nonfinite = []                                                    # 验证 ρ 非有限（按 +∞ 处理）的检查点
     for f in FOLDS:
         for s in SEEDS:
             n = A[("nom-final", f, s)]
@@ -290,22 +299,29 @@ def collect(out) -> dict:
             aux["zero"][f][s], aux["H"][f][s], braw["H"][f][s] = n["aux_zero"], n["aux_H"], n["aux_H_beta"]
             q1[f][s] = n["q1"]
             steps["nominal"][f][s] = {"step_star": n["step_star"], "boundary": n["boundary"]}
+            nonfinite += [["nominal", f, s, int(k)] for k, v in n["V"].items() if not np.isfinite(v)]
             for form in FORMS:
                 c = A[("inc-final", form, f, s)]
                 held[form][f][s], aux[form][f][s], braw[form][f][s] = c["cand"], c["aux_cand"], c["aux_beta"]
                 steps[form][f][s] = {"step_star": c["step_star"], "boundary": c["boundary"]}
-    return {"held": held, "aux": aux, "beta": braw, "q1": q1, "steps": steps,
+                nonfinite += [[form, f, s, int(k)] for k, v in c["V"].items() if not np.isfinite(v)]
+    return {"held": held, "aux": aux, "beta": braw, "q1": q1, "steps": steps, "nonfinite": nonfinite,
             "g2": {f: A[("refs", f)]["episodes"] for f in FOLDS}}
 
 
 def aux_table(aux: dict, braw: dict) -> dict:
-    """ab4 P2 / P3 分开：每折终训模型上的 ρ̄（种子平均）与 β（逐种子 + 有定义种子的平均）。"""
+    """ab4 P2 / P3 分开：每折终训模型上的 ρ̄（种子平均）与 β（逐种子 + 有定义种子的平均），以及三折等权平均。"""
     arm = lambda rows, a: [r for r in rows if r["arm"] == a]
-    return {a: {"rho": {p: seed_mean_rho({f: {s: arm(rows, a) for s, rows in aux[p][f].items()} for f in FOLDS})
-                        for p in PREDICTORS},
-                "beta": {p: {f: beta_seed_mean({s: arm(rows, a) for s, rows in braw[p][f].items()}) for f in FOLDS}
-                         for p in braw}}
-            for a in AUX_ARMS}
+    out = {}
+    for a in AUX_ARMS:
+        rho = {p: seed_mean_rho({f: {s: arm(rows, a) for s, rows in aux[p][f].items()} for f in FOLDS})
+               for p in PREDICTORS}
+        bet = {p: {f: beta_seed_mean({s: arm(rows, a) for s, rows in braw[p][f].items()}) for f in FOLDS}
+               for p in braw}
+        out[a] = {"rho": rho, "beta": bet,
+                  "rho_fold_mean": {p: float(np.mean([rho[p][f] for f in FOLDS])) for p in PREDICTORS},
+                  "beta_fold_mean": {p: fold_mean({f: bet[p][f]["mean"] for f in FOLDS}) for p in bet}}
+    return out
 
 
 def summarize(out) -> dict:
@@ -319,7 +335,7 @@ def summarize(out) -> dict:
             "aux": aux_table(C["aux"], C["beta"]),
             "lead": {p: lead_rho({s: [r for f in FOLDS for r in C["held"][p][f][s]] for s in SEEDS})
                      for p in PREDICTORS},
-            "steps": C["steps"]}
+            "steps": C["steps"], "nonfinite_ckpts": C["nonfinite"]}
 
 
 def markdown(s: dict) -> str:
@@ -367,16 +383,25 @@ def markdown(s: dict) -> str:
         ps = s["rho_per_seed"][p]
         L.append(f"| {LABEL[p]} | " + " | ".join(" / ".join(rho(ps[f][k]) for k in SEEDS) for f in FOLDS) + " |")
     L += ["", "### ab4 辅助参考（旧装置；复用每折终训模型；P1 不参与；不用于选步、选模或判决）", ""]
-    na = lambda b: "N/A" if b["mean"] is None else (
-        f"{b['mean']:.3f}" + ("" if b["n_defined"] == len(SEEDS) else f"（{b['n_defined']}/{len(SEEDS)} 个种子有定义）"))
+
+    def bcell(b):                                                     # 有定义种子的平均（有效种子数：逐种子值）
+        seeds = " / ".join("N/A" if b["per_seed"][k] is None else f"{b['per_seed'][k]:.3f}" for k in SEEDS)
+        return ("N/A" if b["mean"] is None else f"{b['mean']:.3f}") + f"（{b['n_defined']}/{len(SEEDS)}：{seeds}）"
+
+    def fcell(m):                                                     # 三折等权平均（有定义的折数）
+        return ("N/A" if m["mean"] is None else f"{m['mean']:.3f}") + f"（{m['n_defined']}/{len(FOLDS)} 折）"
+
     for a in AUX_ARMS:
         t = s["aux"][a]
-        L += [f"**{a}**：ρ̄（种子平均）与投影尺度 β（有定义种子的平均）；列 = 各折的终训模型", "",
-              "| 预测 | " + " | ".join(f"ρ̄ {f}" for f in FOLDS) + " | " + " | ".join(f"β {f}" for f in FOLDS) + " |",
-              "|---" * 7 + "|"]
+        L += [f"**{a}**：ρ̄（种子平均）与投影尺度 β；列 = 各折的终训模型与三折等权平均。"
+              "β 每格 = 有定义种子的平均（有效种子数：逐种子值）", "",
+              "| 预测 | " + " | ".join(f"ρ̄ {f}" for f in FOLDS) + " | ρ̄ 三折等权平均 | "
+              + " | ".join(f"β {f}" for f in FOLDS) + " | β 三折等权平均 |", "|---" * 9 + "|"]
         for p in PREDICTORS:
-            bc = [na(t["beta"][p][f]) if p in t["beta"] else "—" for f in FOLDS]
-            L.append(f"| {LABEL[p]} | " + " | ".join(rho(t["rho"][p][f]) for f in FOLDS) + " | " + " | ".join(bc) + " |")
+            rc = [rho(t["rho"][p][f]) for f in FOLDS] + [rho(t["rho_fold_mean"][p])]
+            bc = ([bcell(t["beta"][p][f]) for f in FOLDS] + [fcell(t["beta_fold_mean"][p])]
+                  if p in t["beta"] else ["—"] * (len(FOLDS) + 1))
+            L.append(f"| {LABEL[p]} | " + " | ".join(rc + bc) + " |")
         L.append("")
     L += ["- β 只是投影尺度，不是「方向和大小都正确」：β ≈ 1 时仍可能漏掉很大的正交响应；增量恒为 0（选中第 0 步）时 β 不定义，记 N/A。",
           "- 闭环运行下，随机探针不能自动保证与名义预测误差无关；扣掉名义预测后的残差不能称为「已分离的真实增量」。",
@@ -403,6 +428,10 @@ def markdown(s: dict) -> str:
         L += ["", f"† 最佳点落在搜索边界（{top} 步），尚不能确认训练充分；按预注册不追加步数。"]
     if zero:
         L += ["", "增量选中第 0 步 = 保留零响应（未训练），是有效选择；该处候选与零响应逐集相同。"]
+    nf = s.get("nonfinite_ckpts", [])
+    if nf:
+        L += ["", f"‡ {len(nf)} 个检查点的验证 ρ 非有限（训练发散），按 +∞ 处理、未被选中：" + "、".join(
+            f"{LABEL[b]} {f} seed{k} 第 {st} 步" for b, f, k, st in nf) + "。"]
     return "\n".join(L)
 
 
@@ -414,6 +443,7 @@ def _key_str(obj):
 
 
 def main(argv=None) -> int:
+    gc.disable()                                                      # verify 会导入 MuJoCo 与 scipy：二者共存时 GC 会段错误
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
@@ -437,4 +467,6 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    code = main()
+    sys.stdout.flush()
+    os._exit(code)
