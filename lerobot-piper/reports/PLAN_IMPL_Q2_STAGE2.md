@@ -29,15 +29,15 @@
 - 零机时，不连接机械臂；不训练 π；不采集数据。
 - 不改 `sim/q1/`：阶段一的 `code_sha=d6a823ba1ed4a862`、`config_hash=be83d2e77958e85c` 保持不变。
 
-**需要你确认的两处（预注册没写死，我先定了默认）**
-1. **ab4 的 β 跨种子怎么汇总**（只报告；Task 6 `beta_seed_mean`）：
-   - 每个「折 × 种子」先算 β = Σ分子 / Σ分母；
-   - 再对有定义的种子取平均，注明有几个种子有定义；全部 N/A 则记 N/A；
-   - 逐种子的值写进 `summary.json`。
-2. **加了一张只报告的波形图**（Task 7），依据常设规则「改完 G 必出波形图」：
-   - 内容：留出补正运行上的中位集与最难集。左列画实测 IMU 与四种预测；右列画名义模型没解释的部分与三种预测增量；
-   - 不进代码指纹，也不进任何判据；
-   - 不要这张图的话：删掉 Task 7，并删掉运行脚本最后的作图行及其测试断言。
+**用户 2026-10-03 认可的两处默认（已同步写进预注册 §7，`405a7a5`）**
+1. **ab4 的 β 跨种子汇总**（只报告；Task 6 `beta_seed_mean`）：
+   - 每个「折 × 种子」先汇总内积再相除；
+   - 再平均有定义的种子；
+   - 保留逐种子值与有效种子数；全部无定义记 N/A。
+2. **保留只报告的波形图**（Task 7）：
+   - 固定 seed 0；按零响应误差选中位集与最难集；
+   - 只读保存的预测；
+   - 不参与判据，也不进代码指纹。
 
 ---
 
@@ -133,6 +133,13 @@
 - 输入指纹含：数据文件；「冻结的标定 R、b 文件哈希、固定 H 文件哈希」；依赖代码与库版本；名义与增量产物。续跑只跳过指纹一致的作业。
 - 截止时间：「第一次 prepare 在名单核验通过后记录截止时间，续跑不重置；超时则拒绝运行并标记『未完成』，汇总不作通过判决。」上限暂定墙钟 ≤ 24 小时（§13-7）。
 - 汇总前强制核验：「3 折 × 3 种子 × {名义, 两种增量} 齐全、名单一致、由内层评分表重算的选中步数与权重对应、全部产物在截止时间内。」
+- 计划审阅补的三项执行检查（用户 2026-10-03）：
+  - 「测速入口：在函数入口强制 1 ≤ steps ≤ 30，越界时在加载数据、训练之前拒绝」；
+  - 「续跑完成判定：终训作业还须检查 .pt、.npz 的存在和哈希；损坏就重新排队，不能只凭 JSON 指纹跳过」；
+  - 「运行日志：每次尝试保留独立日志和退出状态，避免续跑覆盖失败证据」。
+- 「若修复涉及冻结代码，须重新冻结，不能直接沿用旧实验继续。」
+  - ⇒ 新的 `code_sha` / `config_hash`，并换新的 `OUT` 从头运行；
+  - 旧目录的截止时间记录绑定旧指纹，入口会拒绝。
 
 **工作方式**
 - 工作区里有另一会话的未提交文件，**不碰、不提交**：
@@ -154,8 +161,8 @@
    → Task 2 `test_h_window_matches_the_gap_axis_formula_without_shift`、`test_h_window_uses_past_corrections_and_never_future_ones`、`test_load_h_checks_the_frozen_fingerprint`；Task 4 `test_predictor_shapes_and_h_equals_the_whole_episode_convolution`。
 4. **零点被破坏**：j4 的 δa 恒为 0、选中第 0 步、δa = 0 时增量不为 0。任何一种都会让候选与零响应不可比，或让 β 失去意义。
    → Task 3 `test_da_scale_preserves_zero_and_uses_rms_not_std`、`test_zero_init_is_zero_response`、`test_zero_correction_gives_exactly_zero_increment`；Task 4 `test_checkpoints_are_prefixes_and_step_zero_is_zero_response`；Task 5 `test_increment_chain_and_zero_step_keeps_zero_response`；Task 6 `test_beta_is_na_when_the_increment_is_identically_zero`。
-5. **未冻结就运行、混用过期或被篡改的产物、超时后仍给判决**。
-   → Task 5 `test_formal_commands_refuse_unless_frozen`、`test_jobs_refuse_when_inputs_changed_after_prepare`、`test_passed_deadline_stops_every_formal_command`、`test_list_jobs_counts_and_requeue_on_input_change`；Task 6 `test_damaged_trees_are_rejected`（8 种损坏）、`test_main_marks_incomplete_runs_and_gives_no_verdict`；Task 8 `test_a_job_stopped_by_the_deadline_stops_the_run_with_a_clear_message`。
+5. **未冻结就运行、测速变成旁路、混用过期或被篡改的产物、续跑覆盖失败证据、超时后仍给判决**。
+   → Task 5 `test_formal_commands_refuse_unless_frozen`、`test_timing_refuses_out_of_range_steps_before_loading_or_training`、`test_jobs_refuse_when_inputs_changed_after_prepare`、`test_passed_deadline_stops_every_formal_command`、`test_list_jobs_counts_and_requeue_on_input_change`、`test_final_jobs_requeue_when_weights_or_predictions_are_missing_or_corrupt`、`test_changed_code_cannot_continue_an_old_run`；Task 6 `test_damaged_trees_are_rejected`（8 种损坏）、`test_main_marks_incomplete_runs_and_gives_no_verdict`；Task 8 `test_each_attempt_keeps_its_own_logs_and_exit_status`、`test_a_job_stopped_by_the_deadline_stops_the_run_with_a_clear_message`。
 
 ---
 
@@ -175,7 +182,7 @@
 | `q2_run.py` | 命令行 `timing / prepare / refs / list-jobs / nom-inner / nom-final / inc-inner / inc-final`；冻结闸门、截止时间、输入指纹、原子写产物 |
 | `q2_report.py` | 完整性核验、先种子后折的 ρ̄、判据、两种形式之间的选择、只报告项；输出 `summary.json` 与 `summary.md` |
 | `fig_q2.py` | 只报告的波形图（不在代码指纹里） |
-| `run_q2_stage2.sh` | 正式运行（可重入、并行）；**冻结后**在用户终端执行 |
+| `run_q2_stage2.sh` | 正式运行（可重入、并行；每次尝试独立日志与退出状态）；**冻结后**在用户终端执行；不在代码指纹里 |
 | `test_*.py` | 每个模块一份 |
 
 报告：
@@ -188,9 +195,9 @@
 
 - 所有命令在 `lerobot-piper/` 下执行；`PY=/home/enolab-guo/miniconda3/envs/lerobot/bin/python`。
 - 测试命令：
-  - 快速测试：`$PY -m pytest sim/q2 -q -m "not slow"`（84 个，约 30 s）；
+  - 快速测试：`$PY -m pytest sim/q2 -q -m "not slow"`（91 个，约 30 s）；
   - 集成测试：`$PY -m pytest sim/q2 -q -m slow`（2 个，约 90 s：读 183 集真实数据并核对名单与日志契约；G-2 在合成集上的参照）。
-- 本计划的代码已在暂存区镜像里跑通：快速测试 84 个、集成测试 2 个全部通过。镜像通过软链接指向真实的 `outputs/`、`lerobot/` 和既有 `sim/` 模块（含 `sim/q1/`）。
+- 本计划的代码已在暂存区镜像里跑通：快速测试 91 个、集成测试 2 个全部通过。镜像通过软链接指向真实的 `outputs/`、`lerobot/` 和既有 `sim/` 模块（含 `sim/q1/`）。
   - 并且按任务顺序逐个重放过：每个任务在实现前测试失败，实现后通过；最终文件与镜像逐字节相同。
   - 照抄即可。若与仓库现状不符，先查原因再改；**不要为了让测试通过而放宽测试**。
 - 提交信息格式 `阶段二 Q2：<内容>`，**不加 `Co-Authored-By`**。
@@ -1361,8 +1368,8 @@ git commit -m "阶段二 Q2：训练与计分（名义复用 train_one；增量�
   - Task 1–4；`q1_g2ref`：`load_g2()`、`episode_ehat(g2, ep, windows, R, b)`；`q1_data.calibration()`
   - `q1_run`：`atomic_json / atomic_npz / atomic_torch`、`file_sha`、`files_fp`、`fp_of`、`env_versions`、`DEP_FILES`、`G2_FILES`
 - Produces（Task 6–8 依赖这些名字与字段）：
-  - 常量：`PREREG`、`CALIB_FILES`（`outputs/step1_H/step1_H_v1.json`、`outputs/p2_labels/pp2a-deploy/manifest.json`）、`H_FILES`、`RUNNER_JOBS = 15`、`PHASES = ("refs","nom-inner","nom-final","inc-inner","inc-final")`
-  - 异常：`NotFrozenError`、`DeadlineExceeded`；`require_frozen(prereg=None)`
+  - 常量：`PREREG`、`CALIB_FILES`（`outputs/step1_H/step1_H_v1.json`、`outputs/p2_labels/pp2a-deploy/manifest.json`）、`H_FILES`、`RUNNER_JOBS = 15`、`TIMING_MAX_STEPS = 30`、`PHASES = ("refs","nom-inner","nom-final","inc-inner","inc-final")`
+  - 异常：`NotFrozenError`、`DeadlineExceeded`、`TimingRefused`（测速步数越界）；`require_frozen(prereg=None)`
   - 折与路径：
     - `train_sessions(fold)`、`inner_train(fold, val)`
     - `nom_inner_json(out, fold, val, seed)`、`nom_final_base(out, fold, seed)`
@@ -1371,9 +1378,10 @@ git commit -m "阶段二 Q2：训练与计分（名义复用 train_one；增量�
     - `roster_files()`、`inputs_file(out)`、`read_inputs(out)`、`current_inputs()`、`check_inputs(I)`
     - `deadline_file(out)`、`incomplete_file(out)`、`mark_incomplete(out, reason)`、`enforce_deadline(out, create=False)`
     - `_load(path)`、`is_done(path, inputs)`
+    - `final_done(base, inputs)`：终训作业的完成判定 = JSON 的配置与输入指纹一致 **且** `.pt`、`.npz` 存在、哈希与 JSON 记录一致
   - 作业输入：`ref_inputs(I)`、`nom_inner_inputs(I, fold, val)`、`nom_final_inputs(out, I, fold, seed)`、`nominal_pt_sha(out, fold, seed)`、`inc_inner_inputs(out, I, form, fold, val, seed)`、`inc_final_inputs(out, I, form, fold, seed)`
   - 工具：`load_eps(folds, kinds)`、`load_nominal(out, fold, seed)`、`selection(paths, ckpts) -> (V, step*)`、`stamp(rec, inputs)`、`score_nominal(...)`、`score_increment(...)`、`jobs(out, phase)`
-  - 命令：`cmd_prepare / cmd_refs / cmd_nom_inner / cmd_nom_final / cmd_inc_inner / cmd_inc_final / cmd_list_jobs / cmd_timing`；`main(argv)`（未冻结 → 2，超时 → 3）
+  - 命令：`cmd_prepare / cmd_refs / cmd_nom_inner / cmd_nom_final / cmd_inc_inner / cmd_inc_final / cmd_list_jobs / cmd_timing`；`main(argv)`（未冻结或测速步数越界 → 2，超时 → 3）
   - 产物字段（`stamp` 统一加 `config_hash, code_sha, inputs, input_fp, finished_at`）：
     - `refs/g2/{fold}.json`：`kind="g2", fold, episodes`
     - `nom/inner/seed{k}/{fold}__val_{val}.json`：`kind, fold, val, seed, train_sessions=[内层训练会话], scores={step: {rho, state_sha256}}, sec`
@@ -1623,6 +1631,48 @@ def test_list_jobs_counts_and_requeue_on_input_change(tmp_path, syn, capsys):
     assert ["condlinear", "ab6", "ab5", "0"] in RUN.jobs(tmp_path, "inc-inner")
 
 
+def test_final_jobs_requeue_when_weights_or_predictions_are_missing_or_corrupt(tmp_path, syn):
+    """终训的 JSON 指纹一致还不够：.pt、.npz 缺失或哈希与记录不符 ⇒ 重新排队。"""
+    pre = _prereg(tmp_path)
+    RUN.cmd_prepare(tmp_path, prereg=pre)
+    _run_all(tmp_path, pre, forms=("condlinear",))
+    assert ["ab6", "0"] not in RUN.jobs(tmp_path, "nom-final")
+    assert ["condlinear", "ab6", "0"] not in RUN.jobs(tmp_path, "inc-final")
+    nom, inc = RUN.nom_final_base(tmp_path, "ab6", 0), RUN.inc_final_base(tmp_path, "condlinear", "ab6", 0)
+    keep = {p: p.read_bytes() for p in (nom.with_suffix(".npz"), inc.with_suffix(".pt"), inc.with_suffix(".npz"))}
+    nom.with_suffix(".npz").write_bytes(b"corrupt")                    # 名义的预测文件损坏
+    assert ["ab6", "0"] in RUN.jobs(tmp_path, "nom-final")
+    nom.with_suffix(".npz").write_bytes(keep[nom.with_suffix(".npz")])
+    assert ["ab6", "0"] not in RUN.jobs(tmp_path, "nom-final")
+    inc.with_suffix(".pt").unlink()                                     # 增量权重缺失
+    assert ["condlinear", "ab6", "0"] in RUN.jobs(tmp_path, "inc-final")
+    inc.with_suffix(".pt").write_bytes(keep[inc.with_suffix(".pt")])
+    inc.with_suffix(".npz").write_bytes(keep[inc.with_suffix(".npz")] + b"x")    # 增量预测文件被改
+    assert ["condlinear", "ab6", "0"] in RUN.jobs(tmp_path, "inc-final")
+
+
+def test_changed_code_cannot_continue_an_old_run(tmp_path, syn, monkeypatch):
+    """冻结代码改动后须重新冻结，且不能在旧目录里续跑：截止时间记录绑定旧指纹 ⇒ prepare 与作业都拒绝。"""
+    RUN.cmd_prepare(tmp_path, prereg=_prereg(tmp_path))
+    monkeypatch.setattr(TR, "code_sha", lambda: "f" * 64)              # 模拟改了冻结代码
+    pre2 = _prereg(tmp_path)                                            # 已按新指纹重新冻结
+    for call in (lambda: RUN.cmd_prepare(tmp_path, prereg=pre2),
+                 lambda: RUN.cmd_nom_inner(tmp_path, "ab6", "ab5", 0, prereg=pre2)):
+        with pytest.raises(RuntimeError, match="另一版冻结的实验"):
+            call()
+
+
+@pytest.mark.parametrize("steps", [0, -1, 31, 10000])
+def test_timing_refuses_out_of_range_steps_before_loading_or_training(steps, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("越界必须在加载数据、训练之前拒绝")
+    monkeypatch.setattr(D2, "load", boom)
+    monkeypatch.setattr(TR, "train_nominal", boom)
+    with pytest.raises(RUN.TimingRefused):
+        RUN.cmd_timing(steps)
+    assert RUN.main(["timing", "--steps", str(steps)]) == 2
+
+
 def test_timing_needs_no_prereg(syn, monkeypatch, capsys):
     monkeypatch.setattr(RUN, "PREREG", D1.ROOT / "reports" / "does_not_exist.md")
     RUN.cmd_timing(1)
@@ -1654,7 +1704,8 @@ Expected: `ModuleNotFoundError: No module named 'q2_run'`
 
 ⚠ `prepare / refs / nom-inner / nom-final / inc-inner / inc-final` 是**正式运行**：入口先查预注册 ——
 状态行须以「**状态：已冻结」开头，`code_sha=` 与 `config_hash=` 须与当前一致，否则拒绝；不接受训练参数覆盖。
-`timing` 只用于另行授权的短程耗时测量：不评分外层留出会话、不选步、不保存正式训练产物（它不是运行的旁路）。
+`timing` 只用于另行授权的短程耗时测量（1–30 步，越界在读数据之前拒绝）：不评分外层留出会话、不选步、
+不保存正式训练产物（它不是运行的旁路）。
 
 作业（外层折 = 留出的会话；内层验证会话 ∈ 该折另外两个会话）：
 - `nom-inner FOLD VAL SEED`：名义 2a 用「另一个训练会话」的裸跑训到上限，在 VAL 的裸跑上给每个检查点评分；
@@ -1665,8 +1716,9 @@ Expected: `ModuleNotFoundError: No module named 'q2_run'`
 - `inc-final FORM FOLD SEED`：由两张内层表选步 → 用两个训练会话的补正运行训到选中步数（第 0 步 = 保留零响应，不训练）；
   评分：留出补正运行上的候选、ab4 P2/P3 上的候选（含 β 分子分母）；
 - `refs FOLD`：G-2 同口径窗口重预测在留出会话裸跑上的分数（Q1 复查的背景）。
-续跑只跳过配置指纹与输入指纹都一致的作业。输入指纹含数据文件、标定 R/b 文件、固定 H 文件、依赖代码与库版本；
-截止时间与数据名单的落实同阶段一。
+续跑只跳过配置指纹与输入指纹都一致的作业；终训作业还须 `.pt`、`.npz` 存在且哈希与记录一致，损坏就重新排队。
+输入指纹含数据文件、标定 R/b 文件、固定 H 文件、依赖代码与库版本；截止时间与数据名单的落实同阶段一。
+冻结代码一改，`code_sha` / `config_hash` 就变：须重新冻结，且旧目录的截止时间记录绑定旧指纹 ⇒ 不能在旧目录里续跑。
 
     python -u sim/q2/q2_run.py timing --steps 30
     python -u sim/q2/q2_run.py prepare   --out outputs/q2_stage2
@@ -1707,6 +1759,7 @@ PREREG = ROOT / "reports/PREREG_Q2_STAGE2.md"
 CALIB_FILES = ("outputs/step1_H/step1_H_v1.json", "outputs/p2_labels/pp2a-deploy/manifest.json")
 H_FILES = ("outputs/step1_H/step1_H_v1.npz",)
 TIMING_FOLD, TIMING_VAL = "ab5", "ab7"
+TIMING_MAX_STEPS = 30
 RUNNER_JOBS = 15
 atomic_json, atomic_npz, atomic_torch = R1.atomic_json, R1.atomic_npz, R1.atomic_torch
 file_sha, files_fp, fp_of = R1.file_sha, R1.files_fp, R1.fp_of
@@ -1718,6 +1771,10 @@ class NotFrozenError(RuntimeError):
 
 class DeadlineExceeded(RuntimeError):
     """本轮已超出预注册的墙钟上限：停止，并标记「未完成」。"""
+
+
+class TimingRefused(ValueError):
+    """测速步数越界：`timing` 只是另行授权的短程测速（1–30 步），不是运行的旁路。"""
 
 
 def require_frozen(prereg=None) -> None:
@@ -1859,6 +1916,15 @@ def _load(path: Path):
 def is_done(path: Path, inputs) -> bool:
     j = _load(path) if inputs is not None else None
     return bool(j) and j.get("config_hash") == TR.config_hash() and j.get("input_fp") == fp_of(inputs)
+
+
+def final_done(base: Path, inputs) -> bool:
+    """终训作业是否完成：JSON 的配置与输入指纹一致，且 `.pt`、`.npz` 存在、哈希与 JSON 记录一致（损坏就重新排队）。"""
+    if not is_done(base.with_suffix(".json"), inputs):
+        return False
+    j = _load(base.with_suffix(".json"))
+    return all(base.with_suffix(ext).exists() and file_sha(base.with_suffix(ext)) == j.get(key)
+               for ext, key in ((".pt", "pt_sha256"), (".npz", "npz_sha256")))
 
 
 def base_inputs(I: dict) -> dict:
@@ -2135,7 +2201,7 @@ def jobs(out, phase: str) -> list:
                 todo += [[fold, v, str(seed)] for v in train_sessions(fold)
                          if not is_done(nom_inner_json(out, fold, v, seed), nom_inner_inputs(I, fold, v))]
             elif phase == "nom-final":
-                if not is_done(nom_final_base(out, fold, seed).with_suffix(".json"), nom_final_inputs(out, I, fold, seed)):
+                if not final_done(nom_final_base(out, fold, seed), nom_final_inputs(out, I, fold, seed)):
                     todo.append([fold, str(seed)])
             else:
                 for form in FORMS:
@@ -2143,8 +2209,7 @@ def jobs(out, phase: str) -> list:
                         todo += [[form, fold, v, str(seed)] for v in train_sessions(fold)
                                  if not is_done(inc_inner_json(out, form, fold, v, seed),
                                                 inc_inner_inputs(out, I, form, fold, v, seed))]
-                    elif not is_done(inc_final_base(out, form, fold, seed).with_suffix(".json"),
-                                     inc_final_inputs(out, I, form, fold, seed)):
+                    elif not final_done(inc_final_base(out, form, fold, seed), inc_final_inputs(out, I, form, fold, seed)):
                         todo.append([form, fold, str(seed)])
     return todo
 
@@ -2156,6 +2221,9 @@ def cmd_list_jobs(out, phase: str) -> None:
 
 # ── 耗时测量（另行授权的短程测速；不评分外层留出会话、不选步、不保存产物）─────────
 def cmd_timing(steps: int) -> None:
+    if not 1 <= steps <= TIMING_MAX_STEPS:                            # 在读数据、训练之前拒绝
+        raise TimingRefused(f"拒绝测速：--steps 须在 1–{TIMING_MAX_STEPS} 之间（得到 {steps}）—— "
+                            "timing 只是另行授权的短程测速，不是运行的旁路")
     tr_s = inner_train(TIMING_FOLD, TIMING_VAL)
     eps = load_eps((tr_s,), ("bare", "corr"))
     bare, corr = D2.select(eps, tr_s, "bare"), D2.select(eps, tr_s, "corr")
@@ -2235,7 +2303,7 @@ def main(argv=None) -> int:
             cmd_inc_final(a.out, a.form, a.fold, a.seed, a.prereg)
         else:
             cmd_timing(a.steps)
-    except NotFrozenError as err:
+    except (NotFrozenError, TimingRefused) as err:
         print(err, flush=True)
         return 2
     except DeadlineExceeded as err:
@@ -2267,14 +2335,14 @@ CODE_FILES_Q2 = ("q2_data.py", "q2_roster.json", "q2_windows.py", "q2_models.py"
 
 - [ ] **Step 5: 运行，确认通过**
 
-Run: `$PY -m pytest sim/q2/test_q2_run.py sim/q2/test_q2_train.py -q -m "not slow"` → Expected: `28 passed, 1 deselected`
+Run: `$PY -m pytest sim/q2/test_q2_run.py sim/q2/test_q2_train.py -q -m "not slow"` → Expected: `34 passed, 1 deselected`
 Run: `$PY -m pytest sim/q2/test_q2_run.py -q -m slow` → Expected: `1 passed`，约 10 s（G-2 在合成集上的同口径参照，以及「已是最新则跳过」）
 
 - [ ] **Step 6: 提交**
 
 ```bash
 git add sim/q2/q2_run.py sim/q2/test_q2_run.py sim/q2/q2_train.py
-git commit -m "阶段二 Q2：命令行与产物（五个阶段、冻结闸门、截止时间、名单与输入指纹含 R/b 与 H；timing 不评分留出会话）"
+git commit -m "阶段二 Q2：命令行与产物（五个阶段、冻结闸门、截止时间、名单与输入指纹含 R/b 与 H；timing 限 1–30 步且不评分留出会话；终训续跑核对 .pt/.npz 哈希）"
 ```
 
 ---
@@ -2951,7 +3019,7 @@ CODE_FILES_Q2 = ("q2_data.py", "q2_roster.json", "q2_windows.py", "q2_models.py"
 - [ ] **Step 5: 运行，确认通过**
 
 Run: `$PY -m pytest sim/q2 -q -m "not slow"`
-Expected: `73 passed, 2 deselected`。`test_q2_report.py` 的 17 个约 11 s：先在合成集上跑通全部 3 折 × 3 种子 × 两种形式，再逐项损坏后核验。
+Expected: `79 passed, 2 deselected`。`test_q2_report.py` 的 17 个约 11 s：先在合成集上跑通全部 3 折 × 3 种子 × 两种形式，再逐项损坏后核验。
 
 - [ ] **Step 6: 提交**
 
@@ -3206,6 +3274,10 @@ git commit -m "阶段二 Q2：只报告的波形图（留出补正运行的中�
 **Interfaces:**
 - Consumes：`q2_run.py` 的子命令与退出码（`prepare` 未冻结 → 2；作业超时 → 3）、`list-jobs --phase` 的逐行位置参数；`q2_report.py`；`fig_q2.py`
 - Produces：`bash sim/q2/run_q2_stage2.sh`。环境变量：`OUT`（默认 `outputs/q2_stage2`）、`JOBS`（默认 15）、`PY`
+  - 每次运行新建 `$OUT/logs/attempt_NNN/`（`mkdir` 原子取号），里面有：
+    - 逐作业日志 `<阶段>_<参数>.log`，以及 `prepare.log`、`report.log`、`fig.log`、各阶段待办清单；
+    - `status.tsv`：每行「时间、阶段、参数、退出码」。
+  - 续跑不覆盖以前尝试的日志与退出状态。
 
 - [ ] **Step 1: 写失败的测试**（假解释器只记录参数，不训练、不读数据）—— `sim/q2/test_run_q2_stage2.py`
 
@@ -3221,16 +3293,33 @@ TODO = {"refs": ["ab5", "ab7"], "nom-inner": ["ab5 ab6 0", "ab7 ab5 2"], "nom-fi
         "inc-inner": ["condlinear ab5 ab6 0", "nonlinear ab7 ab6 1"], "inc-final": ["nonlinear ab6 2"]}
 
 
-def _fake(tmp_path, todo, extra=""):
-    """假解释器：记录每次调用；每个阶段的 list-jobs 第一次列出待办，之后为空（= 已完成）。"""
+def _fake(tmp_path, todo, extra="", silent=None):
+    """假解释器：记录每次调用。list-jobs 列出该阶段尚未完成的作业；作业成功退出即记为完成
+    （silent 阶段除外：成功退出却不记完成，模拟作业没写出产物）。extra：插在最前面的 shell 片段，用来注入失败。"""
     calls = tmp_path / "calls.log"
-    lines = ["#!/usr/bin/env bash", f'echo "$* | BLAS=$OPENBLAS_NUM_THREADS" >> "{calls}"', extra]
     for ph, jobs in todo.items():
-        body = "".join(t + "\\n" for t in jobs)
-        lines.append(f'case "$*" in *"--phase {ph}") [ -f "{tmp_path}/listed_{ph}" ] || '
-                     f'{{ touch "{tmp_path}/listed_{ph}"; printf "{body}"; }} ;; esac')
+        (tmp_path / f"todo_{ph}.txt").write_text("".join(j + "\n" for j in jobs))
+    keep = "" if silent is None else f'[ "$sub" = "{silent}" ] && exit 0\n  '
     fake = tmp_path / "fakepy.sh"
-    fake.write_text("\n".join(lines) + "\n")
+    fake.write_text(f"""#!/usr/bin/env bash
+echo "$* | BLAS=$OPENBLAS_NUM_THREADS" >> "{calls}"
+{extra}
+if [ "$2" = "sim/q2/q2_run.py" ]; then
+  sub=$3
+  case "$sub" in
+    prepare) echo "prepared"; exit 0 ;;
+    list-jobs)
+      f="{tmp_path}/todo_$7.txt"; [ -f "$f" ] || exit 0
+      while IFS= read -r l; do [ -f "{tmp_path}/done_$7_$(echo "$l" | tr ' ' _)" ] || echo "$l"; done < "$f"
+      exit 0 ;;
+  esac
+  shift 5
+  echo "ran $sub $*"
+  {keep}touch "{tmp_path}/done_${{sub}}_$(echo "$*" | tr ' ' _)"
+  exit 0
+fi
+echo "ran $*"
+""")
     fake.chmod(0o755)
     return fake, calls
 
@@ -3246,6 +3335,11 @@ def _is(line, sub):
 
 def _cmds(calls, sub):
     return [line.split("|")[0].split() for line in calls.read_text().splitlines() if _is(line, sub)]
+
+
+def _status(attempt):
+    """status.tsv → [[阶段, 参数, 退出码]]（第一列是时间）。"""
+    return [line.split("\t")[1:] for line in (attempt / "status.tsv").read_text().splitlines()]
 
 
 def test_phases_run_in_order_with_their_arguments(tmp_path):
@@ -3273,10 +3367,11 @@ def test_resume_with_nothing_left_still_reports_and_draws(tmp_path):
 
 
 def test_prepare_refusal_stops_before_any_job(tmp_path):
-    """预注册未冻结 ⇒ prepare 退出码 2 ⇒ 不跑任何作业。"""
+    """预注册未冻结 ⇒ prepare 退出码 2 ⇒ 不跑任何作业；退出码记进本次尝试的 status.tsv。"""
     fake, calls = _fake(tmp_path, TODO, extra='case "$*" in *"q2_run.py prepare"*) exit 2 ;; esac')
     r = _run(tmp_path, fake)
     assert r.returncode != 0 and not any(_cmds(calls, ph) for ph in PHASES)
+    assert _status(tmp_path / "out" / "logs" / "attempt_001") == [["prepare", "", "2"]]
 
 
 def test_failed_job_stops_the_run_before_later_phases(tmp_path):
@@ -3294,12 +3389,31 @@ def test_a_job_stopped_by_the_deadline_stops_the_run_with_a_clear_message(tmp_pa
 
 
 def test_jobs_still_listed_after_a_phase_stop_the_run(tmp_path):
-    """xargs 成功但 list-jobs 仍列出待办（如作业静默未写产物）⇒ 停止。"""
-    fake, calls = _fake(tmp_path, TODO)
-    text = fake.read_text().replace(f'[ -f "{tmp_path}/listed_nom-final" ] || ', "")
-    fake.write_text(text)
+    """作业成功退出、list-jobs 却仍列出它（如作业没写出产物）⇒ 停止。"""
+    fake, calls = _fake(tmp_path, TODO, silent="nom-final")
     r = _run(tmp_path, fake)
     assert r.returncode != 0 and "todo_nom-final_after" in r.stdout and not _cmds(calls, "inc-inner")
+
+
+def test_each_attempt_keeps_its_own_logs_and_exit_status(tmp_path):
+    """续跑不覆盖失败证据：每次运行新建 attempt 目录，逐作业日志 + status.tsv（时间、阶段、参数、退出码）。"""
+    fail = 'case "$*" in *"q2_run.py nom-final "*) echo "boom $*"; exit 1 ;; esac'
+    fake, calls = _fake(tmp_path, TODO, extra=fail)
+    assert _run(tmp_path, fake).returncode != 0
+    fake.write_text(fake.read_text().replace(fail, ""))                 # 修好后续跑
+    r = _run(tmp_path, fake)
+    assert r.returncode == 0, r.stdout + r.stderr
+    logs = tmp_path / "out" / "logs"
+    a1, a2 = logs / "attempt_001", logs / "attempt_002"
+    assert sorted(p.name for p in logs.iterdir()) == ["attempt_001", "attempt_002"]
+    assert "boom" in (a1 / "nom-final_ab5_0.log").read_text()          # 第一次的失败日志还在
+    assert "ran nom-final ab5 0" in (a2 / "nom-final_ab5_0.log").read_text()
+    s1, s2 = _status(a1), _status(a2)
+    assert ["prepare", "", "0"] in s1 and ["nom-final", "ab5 0", "1"] in s1
+    assert not any(row[0] == "inc-inner" for row in s1)                # 第一次在名义终训失败处就停了
+    assert ["nom-final", "ab5 0", "0"] in s2 and ["report", "", "0"] in s2 and ["fig", "", "0"] in s2
+    assert not any(row[0] == "nom-inner" for row in s2)                 # 已完成的作业续跑时跳过
+    assert str(a2) in r.stdout
 
 
 def test_blas_threads_are_pinned(tmp_path):
@@ -3311,7 +3425,7 @@ def test_blas_threads_are_pinned(tmp_path):
 - [ ] **Step 2: 运行，确认失败**
 
 Run: `$PY -m pytest sim/q2/test_run_q2_stage2.py -q`
-Expected: `7 failed`（脚本不存在，`bash` 返回 127）
+Expected: `8 failed`（脚本不存在，`bash` 返回 127）
 
 - [ ] **Step 3: 实现** —— `sim/q2/run_q2_stage2.sh`
 
@@ -3321,9 +3435,13 @@ Expected: `7 failed`（脚本不存在，`bash` 返回 127）
 # 五个阶段依次进行，每个阶段全部完成才进入下一个：
 #   refs（G-2 在留出裸跑上，Q1 复查的背景）→ nom-inner → nom-final（选步、冻结名义 2a、零响应与固定 H 的分数）
 #   → inc-inner（固定名义模型下的增量选步验证）→ inc-final（候选的分数）；然后汇总（q2_report.py）与作图（fig_q2.py）。
-# 可重入：配置指纹与输入指纹都与当前一致的已完成作业会被跳过；中断后直接重跑本脚本即可。
+# 可重入：配置指纹与输入指纹都一致（终训还须 .pt / .npz 的哈希一致）的作业会被跳过；中断后直接重跑本脚本即可。
+# 每次运行是一次「尝试」：日志写进新建的 $OUT/logs/attempt_NNN/（逐作业日志；status.tsv 记录时间、阶段、参数、退出码），
+# 续跑不覆盖以前的失败证据。
 # 墙钟上限：第一次 prepare 记录截止时间（+24 小时），续跑不重置；到点后作业拒绝/中止并写 INCOMPLETE.json，
 # 汇总只写「未完成」、不作通过判决。
+# 修复若涉及冻结代码（sim/q2 的 q2_*.py 与名单、只读复用的 sim/q1 代码）：须重新冻结预注册，并换新的 OUT 从头运行 ——
+# 旧目录的截止时间记录绑定旧指纹，prepare 与作业都会拒绝。本脚本与作图脚本不在代码指纹里（不改变任何作业的计算）。
 #   bash sim/q2/run_q2_stage2.sh            # 默认 OUT=outputs/q2_stage2 JOBS=15
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -3332,29 +3450,44 @@ PY=${PY:-/home/enolab-guo/miniconda3/envs/lerobot/bin/python}
 OUT=${OUT:-outputs/q2_stage2}
 JOBS=${JOBS:-15}
 mkdir -p "$OUT/logs"
-"$PY" -u sim/q2/q2_run.py prepare --out "$OUT" 2>&1 | tee "$OUT/logs/prepare.log"
+n=1
+while ! mkdir "$OUT/logs/attempt_$(printf %03d "$n")" 2>/dev/null; do n=$((n + 1)); done
+LOG="$OUT/logs/attempt_$(printf %03d "$n")"
+echo "本次尝试的日志：$LOG"
+
+step() {  # step <名字> <命令…>：输出同时写进本次尝试的 <名字>.log，退出码记进 status.tsv
+  local name=$1 rc=0
+  shift
+  "$@" 2>&1 | tee "$LOG/$name.log" || rc=$?
+  printf '%s\t%s\t\t%s\n' "$(date -Iseconds)" "$name" "$rc" >> "$LOG/status.tsv"
+  return "$rc"
+}
 
 run_phase() {
   local ph=$1
-  "$PY" -u sim/q2/q2_run.py list-jobs --out "$OUT" --phase "$ph" > "$OUT/logs/todo_$ph.txt"
-  echo "[$ph] 待跑作业 $(wc -l < "$OUT/logs/todo_$ph.txt") 个，并行 $JOBS"
-  # -r：没有待跑作业时不调用；每行是该阶段作业的位置参数
+  "$PY" -u sim/q2/q2_run.py list-jobs --out "$OUT" --phase "$ph" > "$LOG/todo_$ph.txt"
+  echo "[$ph] 待跑作业 $(wc -l < "$LOG/todo_$ph.txt") 个，并行 $JOBS"
+  # -r：没有待跑作业时不调用；每行是该阶段作业的位置参数；逐作业日志与退出码留在本次尝试的目录里
   xargs -r -P "$JOBS" -L 1 sh -c \
-    'py=$0; ph=$1; out=$2; shift 2; "$py" -u sim/q2/q2_run.py "$ph" --out "$out" "$@" > "$out/logs/${ph}_$(echo "$*" | tr " " _).log" 2>&1' \
-    "$PY" "$ph" "$OUT" < "$OUT/logs/todo_$ph.txt" \
-    || { echo "[$ph] 有作业失败或已到本轮截止时间（见 $OUT/logs/${ph}_*.log；超时会写 $OUT/INCOMPLETE.json）"; exit 1; }
-  "$PY" -u sim/q2/q2_run.py list-jobs --out "$OUT" --phase "$ph" > "$OUT/logs/todo_${ph}_after.txt"
-  if [ -s "$OUT/logs/todo_${ph}_after.txt" ]; then
-    echo "[$ph] 仍有未完成的作业（见 $OUT/logs/todo_${ph}_after.txt 与 ${ph}_*.log）—— 修复后重跑本脚本"; exit 1
+    'py=$0; ph=$1; out=$2; log=$3; shift 3; name="${ph}_$(echo "$*" | tr " " _)"; rc=0
+     "$py" -u sim/q2/q2_run.py "$ph" --out "$out" "$@" > "$log/$name.log" 2>&1 || rc=$?
+     printf "%s\t%s\t%s\t%s\n" "$(date -Iseconds)" "$ph" "$*" "$rc" >> "$log/status.tsv"
+     exit "$rc"' \
+    "$PY" "$ph" "$OUT" "$LOG" < "$LOG/todo_$ph.txt" \
+    || { echo "[$ph] 有作业失败或已到本轮截止时间（见 $LOG/${ph}_*.log 与 $LOG/status.tsv；超时会写 $OUT/INCOMPLETE.json）"; exit 1; }
+  "$PY" -u sim/q2/q2_run.py list-jobs --out "$OUT" --phase "$ph" > "$LOG/todo_${ph}_after.txt"
+  if [ -s "$LOG/todo_${ph}_after.txt" ]; then
+    echo "[$ph] 仍有未完成的作业（见 $LOG/todo_${ph}_after.txt 与 ${ph}_*.log）—— 修复后重跑本脚本"; exit 1
   fi
 }
 
+step prepare "$PY" -u sim/q2/q2_run.py prepare --out "$OUT"
 for ph in refs nom-inner nom-final inc-inner inc-final; do
   run_phase "$ph"
 done
-"$PY" -u sim/q2/q2_report.py --out "$OUT" | tee "$OUT/logs/report.md"
-"$PY" -u sim/q2/fig_q2.py --out "$OUT" | tee "$OUT/logs/fig.log"
-echo "完成：$OUT/summary.json、$OUT/summary.md、$OUT/fig/"
+step report "$PY" -u sim/q2/q2_report.py --out "$OUT"
+step fig "$PY" -u sim/q2/fig_q2.py --out "$OUT"
+echo "完成：$OUT/summary.json、$OUT/summary.md、$OUT/fig/（本次尝试的日志：$LOG）"
 ```
 
 然后 `chmod +x sim/q2/run_q2_stage2.sh`。
@@ -3362,13 +3495,13 @@ echo "完成：$OUT/summary.json、$OUT/summary.md、$OUT/fig/"
 - [ ] **Step 4: 运行，确认通过**
 
 Run: `$PY -m pytest sim/q2/test_run_q2_stage2.py -q`
-Expected: `7 passed`
+Expected: `8 passed`
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add sim/q2/run_q2_stage2.sh sim/q2/test_run_q2_stage2.py
-git commit -m "阶段二 Q2：正式运行脚本（五个阶段依次、可重入、失败或超时即停；冻结后在用户终端运行）"
+git commit -m "阶段二 Q2：正式运行脚本（五个阶段依次、可重入、失败或超时即停；每次尝试独立日志与退出状态；冻结后在用户终端运行）"
 ```
 
 ---
@@ -3381,7 +3514,7 @@ git commit -m "阶段二 Q2：正式运行脚本（五个阶段依次、可重�
 - [ ] **Step 1: 全量自测**
 
 Run: `$PY -m pytest sim/q2 -q`
-Expected: `86 passed`，约 2 分钟。任何失败都先修，不进入 Step 2。
+Expected: `93 passed`，约 2 分钟。任何失败都先修，不进入 Step 2。
 
 - [ ] **Step 2: 确认阶段一没有被改动**
 
@@ -3401,7 +3534,7 @@ Expected：第一条无输出；第二条打印 `d6a823ba1ed4a862 be83d2e77958e8
 - 只在这些训练集上计评分耗时；
 - **不评分外层留出会话、不选步、不保存产物、不打印任何 ρ**。
 
-Run: `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 $PY -u sim/q2/q2_run.py timing --steps 30`
+Run: `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 $PY -u sim/q2/q2_run.py timing --steps 30`（`--steps` 只接受 1–30）
 
 Expected：
 - 3 行 `<nominal | nonlinear | condlinear>: x.xxx s/步 · 评分 x.xxx s/集`；
@@ -3501,8 +3634,11 @@ git commit -m "阶段二 Q2：预注册冻结"
 Run: `bash sim/q2/run_q2_stage2.sh`
 Expected：结尾打印「完成：outputs/q2_stage2/summary.json、outputs/q2_stage2/summary.md、outputs/q2_stage2/fig/」。
 
-脚本五个阶段依次进行，可重入：
-- 某个作业失败：查 `outputs/q2_stage2/logs/<阶段>_*.log`，修复后重跑本脚本；
+脚本五个阶段依次进行，可重入。每次运行新建 `outputs/q2_stage2/logs/attempt_NNN/`，以前尝试的日志与退出状态保留。
+- 某个作业失败：查本次尝试的 `<阶段>_*.log` 与 `status.tsv`，然后分两种情况：
+  - 瞬时故障（如原生库段错误）、代码没改：在原目录重跑本脚本。已完成的作业跳过；JSON、`.pt`、`.npz` 任一缺失或损坏的终训作业重新排队；
+  - 修复涉及冻结代码（`CODE_FILES_Q2` / `CODE_FILES_Q1` 内的文件）：**停**。修复并提交 → 回到 Task 9 Step 4–6 回填新指纹 → 用户重新冻结 → 换新的 `OUT`（如 `OUT=outputs/q2_stage2_r2`）从头运行；
+  - 旧目录只留作记录，不续跑。它的截止时间记录绑定旧指纹，入口会拒绝。
 - 到截止时间：作业写 `INCOMPLETE.json`，本轮按预注册记为未完成，**不临时改判据、不补跑挑结果**。
 
 - [ ] **Step 3: 核对产物**
@@ -3544,7 +3680,7 @@ Expected：结尾打印「完成：outputs/q2_stage2/summary.json、outputs/q2_s
 ## 七、波形图（只报告，不作判据）
 ## 八、证据边界（预注册 §9 原文）
 ## 九、执行偏差
-<失败后用同一冻结配置续跑的作业、墙钟、任何偏离；没有则写「无」>
+<各次尝试（logs/attempt_NNN/status.tsv）里失败的作业、退出码与原因，用同一冻结配置续跑的情况；墙钟；任何偏离。没有则写「无」>
 ## 十、产物
 <outputs/q2_stage2 下 summary.json 的 sha256、各终训产物的 pt / npz sha256 摘要；冻结提交哈希>
 ```
@@ -3569,4 +3705,13 @@ git commit -m "阶段二 Q2：结果（逐候选判据、两种形式之间、Q1
 
 ## 修订记录
 
-- 2026-10-03 初版。代码已在暂存区镜像跑通（快速 84 + 集成 2），并按任务顺序逐个重放：每个任务实现前测试失败、实现后通过，最终文件与镜像逐字节相同。
+- 2026-10-03 初版（`0af206e`）。代码已在暂存区镜像跑通（快速 84 + 集成 2），并按任务顺序逐个重放：每个任务实现前测试失败、实现后通过，最终文件与镜像逐字节相同。
+- 2026-10-03 按用户审阅修订（执行方式定为 Native；两处默认认可并写进预注册 `405a7a5`）：
+  1. `q2_run.cmd_timing` 入口强制 1 ≤ steps ≤ 30，越界在读数据、训练之前抛 `TimingRefused`（入口退出码 2）。
+     测试：`test_timing_refuses_out_of_range_steps_before_loading_or_training`（0 / −1 / 31 / 10000）。
+  2. 终训作业的完成判定改为 `final_done`：JSON 指纹之外，还须 `.pt`、`.npz` 存在且哈希与记录一致，损坏就重新排队。
+     测试：`test_final_jobs_requeue_when_weights_or_predictions_are_missing_or_corrupt`。
+  3. 运行脚本每次运行新建 `logs/attempt_NNN/`，逐作业日志 + `status.tsv`（时间、阶段、参数、退出码），续跑不覆盖失败证据。
+     测试：`test_each_attempt_keeps_its_own_logs_and_exit_status`。空跑测试的假解释器改为「list-jobs 只列未完成的作业」，更接近真实续跑。
+  - 「修复涉及冻结代码须重新冻结、不沿用旧实验」写进 Task 10 与运行脚本说明，并加回归测试 `test_changed_code_cannot_continue_an_old_run`。这一条现有机制已满足，测试一写就通过。
+  - 测试由 86 个增至 93 个（快速 91 + 集成 2）。重新按任务顺序重放：每个任务先红后绿，最终与镜像逐字节相同。
