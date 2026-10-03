@@ -3722,3 +3722,9 @@ git commit -m "阶段二 Q2：结果（逐候选判据、两种形式之间、Q1
   - 新测试 5 个：`test_fold_mean_is_equal_weight_over_defined_folds`、`test_ab4_reports_the_three_fold_average_and_per_seed_beta`、`test_selection_treats_a_non_finite_validation_rho_as_never_best`、`test_a_diverged_inner_checkpoint_keeps_the_run_verifiable`、`test_report_entry_disables_gc`。测试共 98 个（快速 96 + 集成 2）。
   - 预注册重新回填：`code_sha=` / `config_hash=` 换成新值；§5 写明非有限 ρ 的处理（待用户确认）；§7 写明 ab4 三折等权平均；§8 的耗时注记补上分波次的影响。
   - 8 个 Minor 记为暂缓（台账 `Final: minor (deferred)`），没有修。
+- 2026-10-03 冻结前按用户三项决定补齐（`77103cd`），仍以仓库为准：
+  1. 保持 24 小时上限，不调整预算或训练配置。
+  2. 非有限验证 ρ 按 +∞ 只用于内层选步。异常检查点在汇总里逐个报告（分支、折、验证会话、种子、步）。所有检查点都没有有限分数时 `selection` 抛 `RuntimeError`，该作业失败。判据加 `finite`：候选或基准任一折 ρ̄ 非有限即不通过，并写明原因。
+  3. 超时出口：`mark_incomplete` 经 `tempfile.mkstemp` 的独立临时文件原子改名；`run_status` 见到标记即判未完成，标记损坏也不崩溃。
+  - 新测试：`test_selection_fails_when_no_checkpoint_has_a_finite_score`、`test_incomplete_marker_is_written_through_its_own_temp_file`、`test_a_corrupt_incomplete_marker_still_records_an_incomplete_run`、`test_outer_scores_never_pass_by_ignoring_a_non_finite_value`；`test_a_diverged_inner_checkpoint_keeps_the_run_verifiable` 改为核对逐个报告的内容。测试共 102 个（快速 100 + 集成 2）。
+  - 预注册回填最终指纹并写入上述决定，随后冻结。
