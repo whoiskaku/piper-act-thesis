@@ -82,6 +82,18 @@ def test_report_entry_disables_gc(tmp_path):
         gc.disable()
 
 
+def test_a_corrupt_incomplete_marker_still_records_an_incomplete_run(tmp_path):
+    """汇总只要发现「未完成」标记就判未完成；标记损坏也不能崩溃，照样写下结论。"""
+    for name, junk in (("bad", b"{not json"), ("empty", b""), ("list", b"[]")):
+        d = tmp_path / name
+        d.mkdir()
+        RUN.incomplete_file(d).write_bytes(junk)
+        ok, why = REP.run_status(d)
+        assert ok is False and "标记" in why
+        assert REP.main(["--out", str(d)]) == 3
+        assert json.loads((d / "summary.json").read_text())["status"] == "未完成"
+
+
 def test_code_fingerprint_covers_the_report():
     assert "q2_report.py" in TR.CODE_FILES_Q2
 
@@ -172,7 +184,24 @@ def test_a_diverged_inner_checkpoint_keeps_the_run_verifiable(tree, tmp_path):
     f = json.loads(RUN.inc_final_base(out, "condlinear", "ab7", 1).with_suffix(".json").read_text())
     assert f["V"]["1"] == float("inf") and f["step_star"] != 1
     assert REP.verify(out) == []
-    assert "非有限" in REP.markdown(REP.summarize(out))
+    s = REP.summarize(out)
+    assert s["nonfinite_ckpts"] == [["condlinear", "ab7", "ab5", 1, 1]]           # 逐个报告：分支、折、验证会话、种子、步
+    assert "非有限" in REP.markdown(s)
+
+
+def test_outer_scores_never_pass_by_ignoring_a_non_finite_value(tree):
+    """外层评分不能靠忽略异常来通过：候选或基准在任一折的 ρ̄ 非有限 ⇒ 不通过，并写明原因。"""
+    rb = _rb([0.60] * 3, [0.50] * 3, [0.30, 0.30, float("nan")], [0.46] * 3)
+    g = REP.gate(rb)
+    assert not g["nonlinear"]["pass"] and g["nonlinear"]["finite"] is False
+    assert g["condlinear"]["pass"] and g["condlinear"]["finite"] is True
+    rb_h = _rb([0.60] * 3, [0.50, float("nan"), 0.50], [0.30] * 3, [0.30] * 3)
+    assert not any(REP.gate(rb_h)[f]["pass"] or REP.gate(rb_h)[f]["finite"] for f in ("nonlinear", "condlinear"))
+    out, _ = tree
+    s = REP.summarize(out)
+    s["rho_bar"]["nonlinear"]["ab7"] = float("nan")
+    s["gate"] = REP.gate(s["rho_bar"])
+    assert "存在非有限 ρ̄" in REP.markdown(s)
 
 
 @pytest.mark.parametrize("damage", ["missing_final", "tampered_pt", "tampered_npz", "changed_inner", "stale_config",

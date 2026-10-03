@@ -31,6 +31,7 @@ import os
 import re
 import signal
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -171,8 +172,14 @@ def incomplete_file(out) -> Path:
 
 
 def mark_incomplete(out, reason: str) -> None:
-    if not incomplete_file(out).exists():
-        atomic_json(incomplete_file(out), {"status": "未完成", "reason": reason, "at": time.time()})
+    """写「未完成」标记：经独立临时文件再原子改名，多个作业同时到点也不会争写同一个临时文件。"""
+    path = incomplete_file(out)
+    if path.exists():
+        return
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps({"status": "未完成", "reason": reason, "at": time.time()}, indent=1, ensure_ascii=False))
+    os.replace(tmp, path)
 
 
 def enforce_deadline(out, create: bool = False) -> dict:
@@ -297,7 +304,8 @@ def _finite_or_inf(v: float) -> float:
 
 def selection(paths, ckpts) -> tuple:
     """两张内层表 → (V {step: 平均 ρ}, step*)。表缺失或检查点不符 ⇒ RuntimeError。
-    非有限的验证 ρ（训练发散）按 +∞ 处理：永不被选中；+∞ 可经 JSON 往返，核验时比较一致。"""
+    非有限的验证 ρ（训练发散）只在这里（内层选步）按 +∞ 处理：永不被选中；+∞ 可经 JSON 往返，核验时比较一致。
+    所有检查点都没有有限分数 ⇒ RuntimeError（该作业失败）：不默认选第 0 步，也不删掉该种子继续。"""
     rho = []
     for p in paths:
         j = _load(p)
@@ -307,6 +315,9 @@ def selection(paths, ckpts) -> tuple:
             raise RuntimeError(f"{p}: 检查点与选步规则不符")
         rho.append({int(s): _finite_or_inf(float(r["rho"])) for s, r in j["scores"].items()})
     V = {s: float(np.mean([r[s] for r in rho])) for s in ckpts}
+    if not any(np.isfinite(v) for v in V.values()):
+        raise RuntimeError(f"{[str(p) for p in paths]}: 所有检查点的验证 ρ 都没有有限值 —— 本作业失败"
+                           "（不默认选第 0 步，也不删掉该种子继续）")
     return V, TR.pick_step(V)
 
 

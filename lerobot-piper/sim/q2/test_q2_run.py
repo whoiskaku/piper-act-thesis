@@ -235,6 +235,25 @@ def test_selection_treats_a_non_finite_validation_rho_as_never_best(tmp_path):
     assert json.loads(json.dumps(rec)) == rec                          # 终训记录的 V 与核验时重算的 V 可逐值比较
 
 
+def test_selection_fails_when_no_checkpoint_has_a_finite_score(tmp_path):
+    """所有检查点都没有有限分数 ⇒ 该作业失败：不默认选第 0 步，也不删掉该种子继续。"""
+    tables = []
+    for v, rhos in (("a", {0: float("nan"), 1: 0.3, 2: float("inf")}), ("b", {0: 0.8, 1: float("nan"), 2: 0.6})):
+        p = tmp_path / f"{v}.json"
+        p.write_text(json.dumps({"scores": {str(k): {"rho": r} for k, r in rhos.items()}}))
+        tables.append(p)
+    with pytest.raises(RuntimeError, match="都没有有限"):
+        RUN.selection(tables, (0, 1, 2))
+
+
+def test_incomplete_marker_is_written_through_its_own_temp_file(tmp_path):
+    """多个作业同时到点也不争写：标记经独立临时文件原子改名写入，不用共用的固定临时名，也不留下临时文件。"""
+    (tmp_path / "INCOMPLETE.json.tmp").mkdir()                          # 占住共用的固定临时名
+    RUN.mark_incomplete(tmp_path, "测试")
+    assert json.loads(RUN.incomplete_file(tmp_path).read_text())["status"] == "未完成"
+    assert [p.name for p in tmp_path.iterdir() if p.is_file()] == ["INCOMPLETE.json"]
+
+
 def test_list_jobs_counts_and_requeue_on_input_change(tmp_path, syn, capsys):
     pre = _prereg(tmp_path)
     RUN.cmd_prepare(tmp_path, prereg=pre)

@@ -193,8 +193,10 @@ def run_status(out) -> tuple:
     """本轮是否在截止时间内完成：有「未完成」标记、缺截止时间记录、或任一产物晚于截止时间 ⇒ 未完成。"""
     out = Path(out)
     mark = RUN.incomplete_file(out)
-    if mark.exists():
-        return False, json.loads(mark.read_text()).get("reason", "已标记未完成")
+    if mark.exists():                                                 # 有标记就是未完成；标记损坏也不能因此崩溃
+        j = RUN._load(mark)
+        why = j.get("reason") if isinstance(j, dict) else None
+        return False, why or "已标记未完成（标记文件无法解析或缺少原因）"
     d = RUN._load(RUN.deadline_file(out))
     if not d:
         return False, "缺本轮截止时间记录（deadline.json）"
@@ -227,8 +229,9 @@ def gate(rb: dict) -> dict:
         vs_h = {f: bool(c[f] < h[f]) for f in FOLDS}
         vs_z = {f: bool(c[f] < z[f]) for f in FOLDS}
         d_mean = float(np.mean([d[f] for f in FOLDS]))
-        out[form] = {"d": d, "d_mean": d_mean, "per_fold_vs_H": vs_h, "per_fold_vs_zero": vs_z,
-                     "pass": bool(d_mean >= TR.CONFIG["gate_d"] and all(vs_h.values()) and all(vs_z.values()))}
+        fin = all(np.isfinite(x[f]) for x in (c, h, z) for f in FOLDS)   # 外层评分不忽略异常
+        out[form] = {"d": d, "d_mean": d_mean, "per_fold_vs_H": vs_h, "per_fold_vs_zero": vs_z, "finite": bool(fin),
+                     "pass": bool(fin and d_mean >= TR.CONFIG["gate_d"] and all(vs_h.values()) and all(vs_z.values()))}
     return out
 
 
@@ -291,7 +294,13 @@ def collect(out) -> dict:
     braw = {p: {f: {} for f in FOLDS} for p in ("H",) + FORMS}
     q1 = {f: {} for f in FOLDS}
     steps = {b: {f: {} for f in FOLDS} for b in ("nominal",) + FORMS}
-    nonfinite = []                                                    # 验证 ρ 非有限（按 +∞ 处理）的检查点
+    nonfinite = []                                                    # 内层验证 ρ 非有限（选步时按 +∞）的检查点，逐个报告
+    for key, j in A.items():
+        if key[0] in ("nom-inner", "inc-inner"):
+            b = "nominal" if key[0] == "nom-inner" else key[1]
+            f, v, s = key[-3:]
+            nonfinite += [[b, f, v, s, int(k)] for k, r in sorted(j["scores"].items(), key=lambda kv: int(kv[0]))
+                          if not np.isfinite(float(r["rho"]))]
     for f in FOLDS:
         for s in SEEDS:
             n = A[("nom-final", f, s)]
@@ -299,12 +308,10 @@ def collect(out) -> dict:
             aux["zero"][f][s], aux["H"][f][s], braw["H"][f][s] = n["aux_zero"], n["aux_H"], n["aux_H_beta"]
             q1[f][s] = n["q1"]
             steps["nominal"][f][s] = {"step_star": n["step_star"], "boundary": n["boundary"]}
-            nonfinite += [["nominal", f, s, int(k)] for k, v in n["V"].items() if not np.isfinite(v)]
             for form in FORMS:
                 c = A[("inc-final", form, f, s)]
                 held[form][f][s], aux[form][f][s], braw[form][f][s] = c["cand"], c["aux_cand"], c["aux_beta"]
                 steps[form][f][s] = {"step_star": c["step_star"], "boundary": c["boundary"]}
-                nonfinite += [[form, f, s, int(k)] for k, v in c["V"].items() if not np.isfinite(v)]
     return {"held": held, "aux": aux, "beta": braw, "q1": q1, "steps": steps, "nonfinite": nonfinite,
             "g2": {f: A[("refs", f)]["episodes"] for f in FOLDS}}
 
@@ -354,7 +361,8 @@ def markdown(s: dict) -> str:
     for form in FORMS:
         g = s["gate"][form]
         why = [] if g["pass"] else (
-            ([f"平均 d < {TR.CONFIG['gate_d'] * 100:.0f}%"] if g["d_mean"] < TR.CONFIG["gate_d"] else [])
+            (["存在非有限 ρ̄（候选或基准；不忽略）"] if not g["finite"] else [])
+            + ([f"平均 d < {TR.CONFIG['gate_d'] * 100:.0f}%"] if g["d_mean"] < TR.CONFIG["gate_d"] else [])
             + [f"{f} 不优于 H" for f in FOLDS if not g["per_fold_vs_H"][f]]
             + [f"{f} 不优于零响应" for f in FOLDS if not g["per_fold_vs_zero"][f]])
         yn = lambda d: "是" if all(d.values()) else "否（" + "、".join(f for f in FOLDS if not d[f]) + "）"
@@ -430,8 +438,8 @@ def markdown(s: dict) -> str:
         L += ["", "增量选中第 0 步 = 保留零响应（未训练），是有效选择；该处候选与零响应逐集相同。"]
     nf = s.get("nonfinite_ckpts", [])
     if nf:
-        L += ["", f"‡ {len(nf)} 个检查点的验证 ρ 非有限（训练发散），按 +∞ 处理、未被选中：" + "、".join(
-            f"{LABEL[b]} {f} seed{k} 第 {st} 步" for b, f, k, st in nf) + "。"]
+        L += ["", f"‡ {len(nf)} 个内层检查点的验证 ρ 非有限（训练发散），只在内层选步时按 +∞ 处理、未被选中：" + "、".join(
+            f"{LABEL[b]} {f}（验证 {v}）seed{k} 第 {st} 步" for b, f, v, k, st in nf) + "。"]
     return "\n".join(L)
 
 
