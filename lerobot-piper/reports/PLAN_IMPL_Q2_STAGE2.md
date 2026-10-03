@@ -3715,3 +3715,10 @@ git commit -m "阶段二 Q2：结果（逐候选判据、两种形式之间、Q1
      测试：`test_each_attempt_keeps_its_own_logs_and_exit_status`。空跑测试的假解释器改为「list-jobs 只列未完成的作业」，更接近真实续跑。
   - 「修复涉及冻结代码须重新冻结、不沿用旧实验」写进 Task 10 与运行脚本说明，并加回归测试 `test_changed_code_cannot_continue_an_old_run`。这一条现有机制已满足，测试一写就通过。
   - 测试由 86 个增至 93 个（快速 91 + 集成 2）。重新按任务顺序重放：每个任务先红后绿，最终与镜像逐字节相同。
+- 2026-10-03 Native 实施 Task 1–9（`38ddb20`…`2afef23` 代码与本计划代码块逐字节一致；`2936dac` 预注册回填）。随后按整支独立复审（结论「修好后可冻结」：0 Critical、2 Important、8 Minor）修复，见 `12773a4`。**自此仓库代码在以下几处与本计划代码块不同，以仓库为准**：
+  1. `q2_report.aux_table` / `markdown`：ab4 逐折之外加三折等权平均（设计稿第 5 项原文要求，计划漏了）；β 每格显示「有定义种子的平均（有效种子数：逐种子值）」。新增 `fold_mean`。
+  2. `q2_run.selection`：非有限的验证 ρ（训练发散）按 +∞ 处理，永不被选中。原先 NaN 不会被选中，但记录的 V 含 NaN，核验时 NaN ≠ NaN 会让整轮无法汇总。汇总列出这些检查点。
+  3. `q2_report.main` 入口 `gc.disable()`，`__main__` 改用 `os._exit`（全局约束「入口 gc.disable()」）。
+  - 新测试 5 个：`test_fold_mean_is_equal_weight_over_defined_folds`、`test_ab4_reports_the_three_fold_average_and_per_seed_beta`、`test_selection_treats_a_non_finite_validation_rho_as_never_best`、`test_a_diverged_inner_checkpoint_keeps_the_run_verifiable`、`test_report_entry_disables_gc`。测试共 98 个（快速 96 + 集成 2）。
+  - 预注册重新回填：`code_sha=` / `config_hash=` 换成新值；§5 写明非有限 ρ 的处理（待用户确认）；§7 写明 ab4 三折等权平均；§8 的耗时注记补上分波次的影响。
+  - 8 个 Minor 记为暂缓（台账 `Final: minor (deferred)`），没有修。
