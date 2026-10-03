@@ -31,7 +31,8 @@ CONFIG = {"max_steps": 10000,
           "n_basis": Mo.N_BASIS, "n_lag": Mo.N_LAG, "basis_sd": Mo.BASIS_SD, "scale_floor": Mo.SCALE_FLOOR,
           "gate_d": 0.05, "nonlin_margin": 0.02,
           "budget_hours": 24}
-CODE_FILES_Q2 = ("q2_data.py", "q2_roster.json", "q2_windows.py", "q2_models.py", "q2_train.py")
+CODE_FILES_Q2 = ("q2_data.py", "q2_roster.json", "q2_windows.py", "q2_models.py", "q2_train.py",
+                 "q2_run.py")
 CODE_FILES_Q1 = ("q1_data.py", "q1_windows.py", "q1_losses.py", "q1_e2e.py", "q1_train.py", "q1_g2ref.py", "q1_run.py")
 Q2_DIR = Path(__file__).resolve().parent
 
