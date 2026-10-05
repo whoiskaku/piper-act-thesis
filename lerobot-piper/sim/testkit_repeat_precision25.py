@@ -112,3 +112,40 @@ def good_record(run, out_dir, deadline, t0=100.0, seed=0, gyro=None, rotation=No
         "stopped": None, "return_blocked": False, "return_deadline": False,
         "cleanup": {"wrapper_destructor_disarmed": True, "motion_or_disable_sent_by_cleanup": False, "errors": []},
     }
+
+
+def response_gyro(run, i, amp=0.1, noise=0.01, q_amp=None):
+    """合成陀螺：所有条共有的名义运动 + 条件响应（P / Q 各一条波形，正负号反向）+ 逐条独立噪声。"""
+    rng = np.random.default_rng(1000 + i)
+    a = {"P": amp, "Q": amp if q_amp is None else q_amp}
+
+    def g(tr):
+        base = np.stack([0.3 * np.sin(2 * np.pi * 0.7 * tr), 0.2 * np.cos(2 * np.pi * 1.3 * tr),
+                         0.25 * np.sin(2 * np.pi * 2.1 * tr + 0.4)], 1)
+        resp = np.zeros_like(base)
+        if run["use_probe"]:
+            f = 3.0 if run["group"] == "P" else 4.5
+            w = np.stack([np.sin(2 * np.pi * f * tr), np.cos(2 * np.pi * (f + 0.7) * tr), np.sin(2 * np.pi * (f + 1.9) * tr)], 1)
+            resp = run["sign"] * a[run["group"]] * w
+        return base + resp + noise * rng.standard_normal(base.shape)
+    return g
+
+
+def build_session(R, gyro_for=response_gyro, t0=100.0, start=50.0) -> dict:
+    """在 R.OUT（已 prepare、已写 release）里写出 25 条合法记录与完成的账本。"""
+    m = json.loads((R.OUT / "manifest.json").read_text())
+    (R.OUT / "records").mkdir(exist_ok=True)
+    deadline = start + 3000.0
+    attempts = []
+    for i, run in enumerate(m["runs"]):
+        ti = t0 + 60.0 * i
+        rec = good_record(run, R.OUT, deadline, t0=ti, seed=i, gyro=gyro_for(run, i))
+        p = R.OUT / "records" / f"replay_{run['run_id']}.json"
+        p.write_text(json.dumps(rec))
+        attempts.append(dict(run_id=run["run_id"], status="complete", record_sha256=sha(p), exit_code=0,
+                             sequence=run["sequence"], started_monotonic=ti - 20.0, ended_monotonic=ti + 40.0))
+    s = dict(run_set_id="repeat-precision25", token="t", boot_id="b", release_sha256=sha(R.RELEASE),
+             manifest_sha256=sha(R.OUT / "manifest.json"), started_utc="2026-10-05T00:00:00+00:00",
+             started_unix=0.0, started_monotonic=start, deadline_monotonic=deadline, attempts=attempts, halted=False)
+    (R.OUT / "session.json").write_text(json.dumps(s))
+    return s

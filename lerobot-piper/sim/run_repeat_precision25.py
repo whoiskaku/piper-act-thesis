@@ -24,6 +24,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# 本机 OpenBLAS 默认 20 线程：负载下一次 182×182 求解（filtfilt 的初值）要约 3.5 s，并空转约 11 个核。
+# 在 numpy 载入之前钉住单线程（只影响本进程）。
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
