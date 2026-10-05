@@ -454,3 +454,152 @@ def test_cli_has_no_force_or_abbreviation_bypass():
         with pytest.raises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
                 ap.parse_args(bad)
+
+
+# ── 记录完整性核验（Task 3）：从一条合法记录出发，逐项破坏 ─────────────────────
+@pytest.fixture
+def rec_env(env):
+    m = R.prepare()
+    run = R.expected_runs()[2]                                          # b1_Pp：探针条（指令含 δa）
+    assert run["run_id"] == "b1_Pp"
+    (R.OUT / "records").mkdir(exist_ok=True)
+
+    def write(mutate=None, which=run):
+        rec = K.good_record(which, R.OUT, 4000.0, t0=200.0)
+        if mutate:
+            mutate(rec)
+        (R.OUT / "records" / f"replay_{which['run_id']}.json").write_text(json.dumps(rec))
+        return which
+    return m, run, write
+
+
+def test_valid_record_passes_and_reports_coverage(rec_env):
+    m, run, write = rec_env
+    write()
+    info = R.check_record(run, m)
+    assert info["sha256"] == _sha(R.OUT / "records" / "replay_b1_Pp.json")
+    assert info["coverage_lead_s"] >= 0.2 - 0.005 - 1e-9                  # 100 Hz 从首帧前 0.25 s 开始
+    assert info["coverage_tail_s"] > 0 and info["imu100_max_gap_ms"] == 10.0
+    assert info["send_interval_max_s"] == pytest.approx(0.05)
+
+
+def test_valid_bare_and_a0_records_pass(rec_env):
+    m, _, write = rec_env
+    for run in (R.expected_runs()[0], R.expected_runs()[1]):            # A0、b1_bare1
+        write(which=run)
+        R.check_record(run, m)
+
+
+def _set(path, value):
+    def f(rec):
+        d = rec
+        for k in path[:-1]:
+            d = d[k]
+        d[path[-1]] = value
+    return f
+
+
+def _shift_send_from(k, dt):
+    def f(rec):
+        ts = np.asarray(rec["t_send"])
+        ts[k:] += dt
+        rec["t_send"] = ts.tolist()
+        rec["t"] = (ts + 0.002).tolist()
+    return f
+
+
+def _perturb_cmd(dx):
+    def f(rec):
+        rec["cmd"][300][0] += dx
+    return f
+
+
+def _nextafter_cmd(rec):
+    v = np.float32(rec["cmd"][300][0])
+    rec["cmd"][300][0] = float(np.nextafter(v, np.float32(np.inf)))
+
+
+def _drop_imu100(sl):
+    def f(rec):
+        i = np.asarray(rec["imu100"])
+        rec["imu100"] = np.delete(i, sl, axis=0).tolist()
+    return f
+
+
+def _imu100_ms(rec):
+    i = np.asarray(rec["imu100"])
+    i[500, 1] = i[499, 1]
+    rec["imu100"] = i.tolist()
+
+
+def _alter_20hz(rec):
+    rec["imu"][123][4] += 1e-6
+
+
+def _nan_imu(rec):
+    rec["imu"][10][3] = float("nan")
+
+
+def _t_not_increasing(rec):
+    rec["t"][50] = rec["t"][49]
+
+
+def _prehold_frames(rec):
+    for k in ("t", "t_send", "t_send_span", "cmd"):
+        rec["prehold"][k] = rec["prehold"][k][1:]
+    rec["prehold"]["frames"] = 3
+
+
+def _prehold_target_is_first_formal(rec):
+    rec["prehold"]["target"] = rec["cmd"][0]
+    rec["prehold"]["cmd"] = [rec["cmd"][0]] * 4
+
+
+def _prehold_late(rec):
+    rec["prehold"]["t_send"][-1] = rec["t_send"][0] + 0.01
+
+
+def _prehold_mixed_into_formal(rec):
+    rec["cmd"] = rec["prehold"]["cmd"] + rec["cmd"]
+
+
+BREAKS = [
+    ("stopped", _set(["stopped"], "用户中断"), "未完成"),
+    ("return_blocked", _set(["return_blocked"], True), "归位"),
+    ("return_deadline", _set(["return_deadline"], True), "归位"),
+    ("short", lambda r: r.update(imu=r["imu"][:-1]), "帧数"),
+    ("nan", _nan_imu, "有限"),
+    ("t_not_increasing", _t_not_increasing, "时间戳"),
+    ("identity_run", _set(["scope", "run_id"], "b1_Pm"), "身份"),
+    ("identity_seq_sha", _set(["scope", "seq_sha256"], "0" * 64), "身份"),
+    ("identity_release", _set(["scope", "release_id"], "pilot-response14-20260930"), "身份"),
+    ("counts", _perturb_cmd(1e-4), "发送计数"),
+    ("exact_cmd", _nextafter_cmd, "正式指令"),
+    ("imu100_gap", _drop_imu100(slice(700, 702)), "15 ms"),
+    ("imu100_ms_not_monotonic", _imu100_ms, "设备毫秒"),
+    ("20hz_not_in_100hz", _alter_20hz, "20 Hz"),
+    ("send_interval", _shift_send_from(280, 0.051), "写总线间隔"),
+    ("coverage", _drop_imu100(slice(0, 25)), "覆盖"),
+    ("prehold_missing", lambda r: r.pop("prehold"), "前置保持"),
+    ("prehold_frames", _prehold_frames, "前置保持"),
+    ("prehold_target", _prehold_target_is_first_formal, "目标"),
+    ("prehold_late", _prehold_late, "前置保持"),
+    ("prehold_mixed", _prehold_mixed_into_formal, "帧数"),
+]
+
+
+@pytest.mark.parametrize("name,mutate,why", BREAKS, ids=[b[0] for b in BREAKS])
+def test_every_integrity_break_is_rejected(rec_env, name, mutate, why):
+    m, run, write = rec_env
+    write(mutate)
+    with pytest.raises(ValueError, match=why):
+        R.check_record(run, m)
+
+
+def test_integrity_failure_halts_the_session(ses):
+    R.start_session(operator_ready=True)
+    assert run_one(ses, mutate=_alter_20hz) != 0
+    s = R.read_session()
+    assert s["halted"] is True and "20 Hz" in s["attempts"][0]["exception"]
+    with pytest.raises(ValueError):
+        run_one(ses)

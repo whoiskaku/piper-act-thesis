@@ -41,6 +41,8 @@ RELEASE_SCHEMA = "repeat-precision25-release-v1"
 BUDGET = dict(max_attempts=25, max_elapsed_s=3000)
 MIN_START_S = 60.0                       # 剩余不足 60 s 不开始下一条
 PREHOLD_FRAMES = 4                      # 0.2 s 前置保持（20 Hz），单独记录，不进正式帧
+MAX_IMU_GAP_MS = 15.0                   # 方案第七节 3
+MAX_SEND_INTERVAL_S = 0.100             # 方案第七节 5
 COUNTS_PER_RAD = 57324.840764           # audit.json：float32 相加 → Python float → round(x × 本系数)
 EPS_RAD = 0.010000001
 
@@ -387,6 +389,7 @@ def validate_replay_context(context, seqfile, run_id, cmd7, da, use_probe) -> di
 # ── 记录完整性 ────────────────────────────────────────────────────────────────
 def check_record(run, manifest) -> dict:
     """一条复放记录的完整性核验；不过即抛 ValueError（入口据此失败锁停，分析据此判无法判定）。"""
+    import precision_chain as C
     p = OUT / "records" / f"replay_{run['run_id']}.json"
     raw = p.read_bytes()
     rec = json.loads(raw)
@@ -401,17 +404,57 @@ def check_record(run, manifest) -> dict:
         st = np.asarray(rec.get(key, []), float)
         if st.shape != (T,) or not np.isfinite(st).all() or np.any(np.diff(st) <= 0):
             raise ValueError(f"时间戳不完整或不递增: {key}")
+    ts = np.asarray(rec["t_send"], float)
+    if np.diff(ts).max() > MAX_SEND_INTERVAL_S:
+        raise ValueError("写总线间隔超过 100 ms")
     sc = rec.get("scope", {})
     if (sc.get("release_id") != RUN_SET_ID or sc.get("run_id") != run["run_id"]
             or sc.get("sequence") != run["sequence"] or sc.get("seq_sha256") != manifest["files"][run["sequence"]]):
         raise ValueError("记录的身份字段不符")
+    # 方案第七节 2：发送计数与计划计数逐帧一致；指令与冻结波形逐帧完全一致
     with np.load(_artifact(run["sequence"]), allow_pickle=False) as z:
-        expected = z["cmd7"].copy()
-        if run["use_probe"]:
-            expected[:, :6] += z["da"]
-    if not np.array_equal(np.asarray(rec["cmd"], np.float32), expected):
+        cmd7, da, pc = z["cmd7"], z["da"], z["planned_counts"]
+    sent = cmd7.copy()
+    if run["use_probe"]:
+        sent[:, :6] += da
+    if not np.array_equal(planned_counts(cmd.astype(np.float32), np.zeros((T, 6), np.float32)), pc):
+        raise ValueError("发送计数与计划计数不一致")
+    if not np.array_equal(cmd, sent.astype(np.float64)):
         raise ValueError("记录的正式指令与冻结波形不同")
-    return dict(sha256=hashlib.sha256(raw).hexdigest())
+    # 第七节 3：100 Hz 设备时间戳单调、间隔不超过 15 ms
+    i100 = np.asarray(rec.get("imu100", []), float)
+    if i100.ndim != 2 or i100.shape[1] != 8 or len(i100) < 2 or not np.isfinite(i100).all():
+        raise ValueError("100 Hz 流缺失或含非有限值")
+    dms = np.diff(i100[:, 1])
+    if np.any(dms <= 0):
+        raise ValueError("100 Hz 设备毫秒不单调")
+    if dms.max() > MAX_IMU_GAP_MS:
+        raise ValueError("100 Hz 流有超过 15 ms 的间隔")
+    # 第七节 4：每个 20 Hz 样本都能在 100 Hz 流中找到相同的值
+    pool = {tuple(r) for r in i100[:, 2:8].tolist()}
+    if any(tuple(r) not in pool for r in imu.tolist()):
+        raise ValueError("有 20 Hz 样本在 100 Hz 流中找不到相同的值")
+    # 前置保持：单独记录、目标 = 稳定段目标、全部早于第一个正式帧
+    pre = rec.get("prehold")
+    if not isinstance(pre, dict):
+        raise ValueError("前置保持记录缺失")
+    pts, pcmd = np.asarray(pre.get("t_send", []), float), np.asarray(pre.get("cmd", []), float)
+    if (pre.get("frames") != PREHOLD_FRAMES or pts.shape != (PREHOLD_FRAMES,) or pcmd.shape != (PREHOLD_FRAMES, 7)
+            or not np.isfinite(pts).all() or np.any(np.diff(pts) <= 0) or pts[-1] >= ts[0]):
+        raise ValueError("前置保持记录不全，或没有早于第一个正式帧")
+    hold = np.concatenate([cmd7[0, :6], cmd7[0, 6:7]]).astype(np.float32).astype(np.float64)
+    if not np.array_equal(np.asarray(pre.get("target", []), float), hold) or not (pcmd == hold).all():
+        raise ValueError("前置保持的目标不是稳定段目标")
+    # 覆盖：按实际时间戳，处理链的全部取样点都在 100 Hz 流之内（不外推）
+    tb = C.time_base(i100)
+    q = ts + C.OFFSET_S
+    lead, tail = float(q[0] - tb[0]), float(tb[-1] - q[-1])
+    if lead < 0 or tail < 0:
+        raise ValueError("处理链取样点超出 100 Hz 覆盖范围（不外推）")
+    C.frame_locked(rec)                                                 # 整条处理链能跑通
+    return dict(sha256=hashlib.sha256(raw).hexdigest(), coverage_lead_s=lead, coverage_tail_s=tail,
+                timebase_residual_sd_s=float(np.std(i100[:, 0] - tb)), imu100_max_gap_ms=float(dms.max()),
+                send_interval_max_s=float(np.diff(ts).max()), n_imu100=int(len(i100)))
 
 
 # ── 单条执行 ──────────────────────────────────────────────────────────────────
