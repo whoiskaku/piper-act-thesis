@@ -274,11 +274,16 @@ def aux_report(X, recs, runs, mm, session, root, pilot_root) -> dict:
     K = W.kernel()
     out = {}
 
+    def clean(msg):                                                     # 产物不含绝对路径（报错信息也一样）
+        for p, tag in ((Path(pilot_root), "<pilot_root>"), (Path(root), "<root>")):
+            msg = msg.replace(str(p.resolve()), tag).replace(str(p), tag)
+        return msg
+
     def item(name, fn):
         try:
             out[name] = fn()
         except Exception as e:                                          # noqa: BLE001
-            out[name] = {"error": f"{type(e).__name__}: {e}"}
+            out[name] = {"error": clean(f"{type(e).__name__}: {e}")}
 
     def features():
         f = {}
@@ -295,7 +300,7 @@ def aux_report(X, recs, runs, mm, session, root, pilot_root) -> dict:
                 Xo = {k: W.P(C.frame_locked(recs[k], offset=o / 1000.0), K) for k in X}
                 res[str(o)] = _summary(main_metrics(Xo, runs))
             except Exception as e:                                      # noqa: BLE001
-                res[str(o)] = {"error": f"{type(e).__name__}: {e}"}
+                res[str(o)] = {"error": clean(f"{type(e).__name__}: {e}")}
         return res
     times = {k: float(np.mean(recs[k]["t_send"])) - float(session["started_monotonic"]) for k in recs}
     item("kappa", lambda: kappa(X, runs, mm))

@@ -345,7 +345,9 @@ def test_aux_cannot_change_the_verdict(full, monkeypatch):
     assert res2["verdict"] == base["verdict"] and res2["main"] == base["main"]
 
 
-def test_missing_pilot_records_are_reported_not_fatal(full):
+def test_missing_pilot_records_are_reported_not_fatal_and_without_absolute_paths(full):
     K.build_session(R)
-    res = Y.analyze(R.OUT, R.RELEASE, pilot_root=Path("/nonexistent"))
+    missing = full / "no_pilot_here"
+    res = Y.analyze(R.OUT, R.RELEASE, pilot_root=missing)
     assert "error" in res["aux"]["cross_day_pilot"] and res["verdict"]["verdict"] == "support"
+    assert str(full) not in json.dumps(res, ensure_ascii=False)         # 产物不含绝对路径（报错信息也不含）
