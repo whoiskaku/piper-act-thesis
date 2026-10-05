@@ -10,11 +10,18 @@ release 是工程授权记录，不是安全证明；这些 Python 守卫防误�
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import shutil
 import sys
+import time
+import traceback
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +39,8 @@ RUN_SET_ID = "repeat-precision25"
 SCHEMA = "repeat-precision25-v1"
 RELEASE_SCHEMA = "repeat-precision25-release-v1"
 BUDGET = dict(max_attempts=25, max_elapsed_s=3000)
-PREHOLD_FRAMES = 4                       # 0.2 s 前置保持（20 Hz），单独记录，不进正式帧
+MIN_START_S = 60.0                       # 剩余不足 60 s 不开始下一条
+PREHOLD_FRAMES = 4                      # 0.2 s 前置保持（20 Hz），单独记录，不进正式帧
 COUNTS_PER_RAD = 57324.840764           # audit.json：float32 相加 → Python float → round(x × 本系数)
 EPS_RAD = 0.010000001
 
@@ -232,3 +240,276 @@ def load_frozen(require_motion: bool = True) -> tuple:
     m = json.loads((OUT / "manifest.json").read_text())
     _check_manifest(m)
     return release, m
+
+
+# ── 会话、预算、锁停 ──────────────────────────────────────────────────────────
+def now_mono() -> float:
+    return time.monotonic()
+
+
+def boot_id() -> str:
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safety_audit(manifest) -> None:
+    from replay_probe import safety_checks, MISSING_RATE_LIMIT_BLOCKER
+    for name in sorted({r["sequence"] for r in manifest["runs"]}):
+        with np.load(_artifact(name), allow_pickle=False) as z:
+            _, degraded, blockers = safety_checks(z["cmd7"], z["da"], probe_kind="multi_joint_continuous")
+        if degraded or any(b != MISSING_RATE_LIMIT_BLOCKER for b in blockers):
+            raise ValueError(f"{name}: 未豁免的安全检查失败: {degraded!r}, {blockers!r}")
+
+
+@contextlib.contextmanager
+def _lock():
+    OUT.mkdir(parents=True, exist_ok=True)
+    with (OUT / "session.lock").open("a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise ValueError("另一个进程持有本会话") from e
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def read_session() -> dict:
+    return json.loads((OUT / "session.json").read_text())
+
+
+def _check_clock(s, required=MIN_START_S) -> float:
+    if s["boot_id"] != boot_id():
+        raise ValueError("机器重启过：本会话不能继续")
+    remaining = min(s["deadline_monotonic"] - now_mono(),
+                    s["started_unix"] + BUDGET["max_elapsed_s"] - time.time())
+    if remaining < required or now_mono() < s["started_monotonic"]:
+        raise ValueError("现场时间预算已用尽 / 时钟异常：不开始下一条运动")
+    return remaining
+
+
+def start_session(operator_ready=False) -> dict:
+    if not operator_ready:
+        raise ValueError("开始现场计时须 --operator-ready；时钟包含复位与等待")
+    with _lock():
+        _, m = load_frozen(require_motion=True)
+        _safety_audit(m)
+        if (OUT / "session.json").exists():
+            raise ValueError("会话已存在；预算不能重置")
+        if ((OUT / "records").exists() and any((OUT / "records").iterdir())) or (OUT / "alignment_A0.json").exists():
+            raise ValueError("存在以前会话的记录或对齐文件；拒绝开始新预算")
+        start = now_mono()
+        s = dict(run_set_id=RUN_SET_ID, token=uuid.uuid4().hex, boot_id=boot_id(),
+                 release_sha256=sha(RELEASE), manifest_sha256=sha(OUT / "manifest.json"),
+                 started_utc=utc(), started_unix=time.time(), started_monotonic=start,
+                 deadline_monotonic=start + BUDGET["max_elapsed_s"], attempts=[], halted=False)
+        _write(OUT / "session.json", s, exclusive=True)
+        return s
+
+
+def _check_session(s) -> None:
+    if (s.get("run_set_id") != RUN_SET_ID or s.get("release_sha256") != sha(RELEASE)
+            or s.get("manifest_sha256") != sha(OUT / "manifest.json")):
+        raise ValueError("会话与 release / manifest 的绑定被改动")
+    if s.get("halted"):
+        raise ValueError("已锁停：失败后不自动重试、不补跑")
+    runs = expected_runs()
+    if len(s["attempts"]) > len(runs):
+        raise ValueError("尝试次数超出预算")
+    for a, r in zip(s["attempts"], runs):
+        if a.get("run_id") != r["run_id"]:
+            raise ValueError("账本顺序与冻结设计不符")
+    _check_clock(s)
+
+
+def _validate_alignment() -> None:
+    p = OUT / "alignment_A0.json"
+    if not p.exists():
+        raise ValueError("任何探针条之前必须先冻结独立的 A0 对齐")
+    a = json.loads(p.read_text())
+    if (a.get("A0_sha256") != sha(OUT / "records/replay_A0.json")
+            or a.get("reference_sha256") != sha(OUT / "calibration_reference.npz")
+            or a.get("determined_by") != "independent A0 only"):
+        raise ValueError("A0 对齐或其来源被改动")
+    if read_session().get("alignment_sha256") != sha(p):
+        raise ValueError("入账后的 A0 对齐被改动")
+
+
+def freeze_a0() -> dict:
+    """只用已完成的 A0 与冻结的标定参考（与 pilot 同法），绝不用探针条。"""
+    from analyze_probe_3a import fit_frame
+    p = OUT / "records/replay_A0.json"
+    a0 = np.asarray(json.loads(p.read_text())["imu"], float)[:, 3:6]
+    with np.load(OUT / "calibration_reference.npz", allow_pickle=False) as z:
+        om = z["omega0"]
+    if a0.shape != om.shape or not np.isfinite(a0).all() or not np.isfinite(om).all():
+        raise ValueError("A0 / 标定参考的形状或有限值核验失败")
+    Rm, L, cos, angle = fit_frame(a0, om)
+    if not np.isfinite(Rm).all() or np.linalg.det(Rm) < 0:
+        raise ValueError("A0 没有给出有限的正常旋转；不进入探针条")
+    a = dict(determined_by="independent A0 only", frozen_utc=utc(), A0_sha256=sha(p),
+             reference_sha256=sha(OUT / "calibration_reference.npz"),
+             method="analyze_probe_3a.fit_frame; SHIFTS=0..6; raw orthogonal Procrustes",
+             R=Rm.tolist(), L=int(L), cosine=float(cos), angle_deg=float(angle))
+    _write(OUT / "alignment_A0.json", a, exclusive=True)
+    return a
+
+
+def validate_replay_context(context, seqfile, run_id, cmd7, da, use_probe) -> dict:
+    """执行器在构造设备之前调用：磁盘哈希、当前预留、条目与数组、持久预算都必须独立吻合。"""
+    _, m = load_frozen(require_motion=True)
+    s = read_session()
+    _check_session(s)
+    attempts = s["attempts"]
+    if not attempts or len(attempts) > BUDGET["max_attempts"]:
+        raise ValueError("没有为这次复放预留的尝试")
+    a, want = attempts[-1], m["runs"][len(attempts) - 1]
+    if (a.get("status") != "running" or a.get("run_id") != want["run_id"]
+            or context.get("token") != s["token"] or context.get("run_id") != want["run_id"]
+            or run_id != want["run_id"] or bool(use_probe) != want["use_probe"]
+            or Path(seqfile).resolve() != _artifact(want["sequence"]).resolve()):
+        raise ValueError("预留的复放 / 上下文不符")
+    if any(old.get("status") != "complete" for old in attempts[:-1]):
+        raise ValueError("之前的复放未完成")
+    with np.load(_artifact(want["sequence"]), allow_pickle=False) as z:
+        if not np.array_equal(cmd7, z["cmd7"]) or not np.array_equal(da, z["da"]):
+            raise ValueError("载入的数组与冻结序列不同")
+    if use_probe:
+        _validate_alignment()
+    return dict(release_id=RUN_SET_ID, run_id=want["run_id"], sequence=want["sequence"],
+                seq_sha256=m["files"][want["sequence"]], deadline_monotonic=s["deadline_monotonic"])
+
+
+# ── 记录完整性 ────────────────────────────────────────────────────────────────
+def check_record(run, manifest) -> dict:
+    """一条复放记录的完整性核验；不过即抛 ValueError（入口据此失败锁停，分析据此判无法判定）。"""
+    p = OUT / "records" / f"replay_{run['run_id']}.json"
+    raw = p.read_bytes()
+    rec = json.loads(raw)
+    T = manifest["nominal_frames"]
+    if (rec.get("stopped") is not None or rec.get("return_blocked") or rec.get("return_deadline")
+            or rec.get("return_error")):
+        raise ValueError("采集未完成或归位未成功")
+    imu, cmd = np.asarray(rec.get("imu", []), float), np.asarray(rec.get("cmd", []), float)
+    if imu.shape != (T, 6) or cmd.shape != (T, 7) or not np.isfinite(imu).all() or not np.isfinite(cmd).all():
+        raise ValueError("正式帧数或有限值不符")
+    for key in ("t", "t_send"):
+        st = np.asarray(rec.get(key, []), float)
+        if st.shape != (T,) or not np.isfinite(st).all() or np.any(np.diff(st) <= 0):
+            raise ValueError(f"时间戳不完整或不递增: {key}")
+    sc = rec.get("scope", {})
+    if (sc.get("release_id") != RUN_SET_ID or sc.get("run_id") != run["run_id"]
+            or sc.get("sequence") != run["sequence"] or sc.get("seq_sha256") != manifest["files"][run["sequence"]]):
+        raise ValueError("记录的身份字段不符")
+    with np.load(_artifact(run["sequence"]), allow_pickle=False) as z:
+        expected = z["cmd7"].copy()
+        if run["use_probe"]:
+            expected[:, :6] += z["da"]
+    if not np.array_equal(np.asarray(rec["cmd"], np.float32), expected):
+        raise ValueError("记录的正式指令与冻结波形不同")
+    return dict(sha256=hashlib.sha256(raw).hexdigest())
+
+
+# ── 单条执行 ──────────────────────────────────────────────────────────────────
+def run_next(operator_ready=False, replay_fn=None) -> int:
+    if not operator_ready:
+        raise ValueError("确认本条的现场与复位已就绪：--operator-ready")
+    with _lock():
+        _, m = load_frozen(require_motion=True)
+        _safety_audit(m)
+        s = read_session()
+        _check_session(s)
+        if len(s["attempts"]) >= BUDGET["max_attempts"]:
+            raise ValueError("25 次尝试已用完；不授权任何额外或补跑的复放")
+        if any(a.get("status") != "complete" for a in s["attempts"]):
+            raise ValueError("有未完成或失败的尝试；不自动重试")
+        run = m["runs"][len(s["attempts"])]
+        if run["use_probe"]:
+            _validate_alignment()
+        output = OUT / "records" / f"replay_{run['run_id']}.json"
+        if output.exists():
+            raise ValueError("结果已存在；不覆盖、不静默重复")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        attempt = dict(run_id=run["run_id"], status="running", started_utc=utc(),
+                       started_monotonic=now_mono(), sequence=run["sequence"])
+        s["attempts"].append(attempt)
+        _write(OUT / "session.json", s)              # 连接设备之前记账：初始化失败也消耗一次
+        code = 5
+        try:
+            if replay_fn is None:
+                from replay_repeat_precision25 import run as replay_fn
+            code = replay_fn(run=run, seqfile=str(_artifact(run["sequence"])), outdir=output.parent,
+                             context=dict(token=s["token"], run_id=run["run_id"]))
+            if code == 0:
+                info = check_record(run, m)
+                attempt.update(record_sha256=info["sha256"], record_check=info)
+                if run["run_id"] == "A0":
+                    freeze_a0()
+                    if (OUT / "alignment_A0.json").exists():
+                        s["alignment_sha256"] = sha(OUT / "alignment_A0.json")
+                _check_clock(s, required=0)              # 复放结束时已过截止 ⇒ 失败
+            attempt["status"] = "complete" if code == 0 else "failed"
+        except BaseException as e:
+            attempt.update(status="failed", exception=f"{type(e).__name__}: {e}", traceback=traceback.format_exc())
+            code = 130 if isinstance(e, KeyboardInterrupt) else 5
+        finally:
+            attempt.update(exit_code=int(code), ended_utc=utc(), ended_monotonic=now_mono())
+            s["halted"] = attempt["status"] != "complete"
+            _write(OUT / "session.json", s)
+        print(f"{run['run_id']}: {attempt['status']}；已用尝试 {len(s['attempts'])}/{BUDGET['max_attempts']}。"
+              "没有自动开始下一条；先查看现场并复位，再执行下一条命令。")
+        return int(code)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    action = ap.add_mutually_exclusive_group(required=True)
+    for flag in ("--prepare", "--dry-run", "--status", "--fingerprints", "--start-session", "--run-next"):
+        action.add_argument(flag, action="store_true")
+    ap.add_argument("--operator-ready", action="store_true")
+    return ap
+
+
+def main(argv=None) -> int:
+    import gc
+    gc.disable()
+    a = build_parser().parse_args(argv)
+    try:
+        if a.prepare:
+            m = prepare()
+            print(f"离线准备完成：{len(m['runs'])} 条、{len(m['files'])} 个冻结输入。未连接设备，未开始现场时钟。")
+            return 0
+        if a.fingerprints:
+            print(json.dumps(code_fingerprints(), ensure_ascii=False, indent=2))
+            return 0
+        if a.dry_run:
+            release, m = load_frozen(require_motion=False)
+            _safety_audit(m)
+            print("离线核对通过：release、manifest、冻结输入、代码指纹一致；只有已知的速率上限阻断项。")
+            if release.get("motion_authorized") is True:
+                print("motion_authorized: true（本命令未连接设备、未开始会话、没有运动）")
+            else:
+                print("motion_authorized: false —— 运动未授权；--start-session 会拒绝。未连接设备、没有运动。")
+            return 0
+        if a.status:
+            print(json.dumps(read_session() if (OUT / "session.json").exists() else
+                             {"status": "not_started", "motion_performed_by_this_command": False},
+                             ensure_ascii=False, indent=2))
+            return 0
+        if a.start_session:
+            s = start_session(a.operator_ready)
+            print(f"现场时钟已开始 {s['started_utc']}；最多 50 分钟（含复位与等待）。未连接设备。"
+                  "下一步：--run-next --operator-ready（只跑 A0）。")
+            return 0
+        return run_next(a.operator_ready)
+    except (OSError, ValueError, KeyError, AssertionError) as e:
+        print(f"拒绝：{type(e).__name__}: {e}", file=sys.stderr)
+        return 4
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
