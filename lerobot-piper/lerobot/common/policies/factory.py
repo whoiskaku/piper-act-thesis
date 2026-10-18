@@ -134,10 +134,15 @@ def make_policy(
 
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     excluded = set(getattr(cfg, "exclude_input_keys", []) or [])
+    # 加载已训练的策略时只保留它训练时的输入：评测数据集多出来的观测（如开了 IMU 才有的
+    # observation.imu_real）在存档里没有归一化统计量，新建的评测数据集也没有，
+    # 留着会在第一次推理时报 `mean` is infinity（2026-10-18 实测）。
+    trained = set(cfg.input_features) if cfg.pretrained_path and cfg.input_features else None
     cfg.input_features = {
         key: ft
         for key, ft in features.items()
         if key not in cfg.output_features and key not in excluded
+        and (trained is None or key in trained)
     }
     kwargs["config"] = cfg
 
