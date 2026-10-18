@@ -100,12 +100,18 @@ def loo_r2(W):
     return float(1.0 - np.sum((W - others) ** 2) / np.sum(W ** 2))
 
 
-def contact_flags(cmd7, ev, model, center):
-    """每个事件的窗口是否碰到疑似接触段（同 cmd_tracking 口径：夹爪切换前后 CONTACT_S、指令末端在目标区 ZONE_M 内），
-    在冻结序列的名义时间上按帧标。回放中目视确认：抓取下降到最低点时碰到桌面。"""
+def contact_frames(cmd7, model, center):
+    """疑似接触段（同 cmd_tracking 口径：夹爪切换前后 CONTACT_S、指令末端在目标区 ZONE_M 内），在冻结序列上按帧标。
+    回放中目视确认：抓取下降到最低点时碰到桌面。"""
     tn = DT * np.arange(len(cmd7))
-    marked = (T.near(tn, tn[T.grip_events(cmd7[:, 6])], T.CONTACT_S)
-              | (np.linalg.norm(T.tcp(cmd7[:, :6], model) - center, axis=1) <= T.ZONE_M))
+    return (T.near(tn, tn[T.grip_events(cmd7[:, 6])], T.CONTACT_S)
+            | (np.linalg.norm(T.tcp(cmd7[:, :6], model) - center, axis=1) <= T.ZONE_M))
+
+
+def contact_flags(cmd7, ev, model, center):
+    """每个事件的窗口是否碰到疑似接触段（contact_frames）。"""
+    tn = DT * np.arange(len(cmd7))
+    marked = contact_frames(cmd7, model, center)
     return [bool(marked[(tn >= e["t"] + WIN[0]) & (tn <= e["t"] + WIN[1])].any()) for e in ev]
 
 
