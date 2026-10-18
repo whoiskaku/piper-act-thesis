@@ -114,6 +114,16 @@ def predict_action(observation, policy, device, use_amp):
     return action
 
 
+def warm_up_policy(policy) -> None:
+    """录制前先用全零输入推理一次再 reset：第一条的第一帧不用等 CUDA 初始化、cuDNN 选算法和
+    CUDA graph 录制（实测第一帧约 0.4 s，开 cuda_graph 时约 0.9 s）。"""
+    device = next(policy.parameters()).device
+    batch = {key: torch.zeros(1, *ft.shape, device=device) for key, ft in policy.config.input_features.items()}
+    with torch.inference_mode():
+        policy.select_action(batch)
+    policy.reset()
+
+
 def init_keyboard_listener():
     # Allow to exit early while recording an episode or resetting the environment,
     # by tapping the right arrow key '->'. This might require a sudo permission

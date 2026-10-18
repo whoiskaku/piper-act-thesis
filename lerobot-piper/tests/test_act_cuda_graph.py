@@ -53,6 +53,20 @@ def test_graph_actions_equal_eager_bitwise(te):
     assert run(True).equal(eager) and policy._cuda_graph.graph is first      # 多出的键不会触发重新录制
 
 
+def test_warm_up_captures_the_graph_before_the_first_real_frame():
+    from lerobot.common.robot_devices.control_utils import warm_up_policy
+    policy = tiny_policy(te=True)
+    policy.config.cuda_graph = True
+    warm_up_policy(policy)
+    first = policy._cuda_graph.graph
+    assert policy.temporal_ensembler.ensembled_actions is None        # 全零输入的预测不进第一条的 TE 平均
+    frame = {"observation.state": torch.randn(1, 7, device="cuda"),
+             "observation.images.two": torch.rand(1, *IMG, device="cuda")}
+    with torch.inference_mode():
+        policy.select_action(frame)
+    assert policy._cuda_graph.graph is first                           # 第一帧不再录制
+
+
 def test_graph_refuses_history_inputs():
     with pytest.raises(NotImplementedError):
         tiny_config(cuda_graph=True, enable_history_input=True)

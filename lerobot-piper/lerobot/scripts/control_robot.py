@@ -147,6 +147,7 @@ from lerobot.common.robot_devices.control_utils import (
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
     stop_recording,
+    warm_up_policy,
     warmup_record,
 )
 from lerobot.common.robot_devices.robots.utils import Robot, make_robot_from_config
@@ -256,6 +257,8 @@ def record(
 
     # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, cfg.device, ds_meta=dataset.meta)
+    if policy is not None:
+        warm_up_policy(policy)   # 在挂任何 wrapper 之前；第一条的第一帧不再等初始化和 graph 录制
 
     # Stage 5 RefineNet 部署(默认关,env 门控)。三方 A/B 协议(blend/残差已解耦):
     #   A 裸 ACT:     不设 REFINE_CKPT(或 REFINE_MODE=off)
