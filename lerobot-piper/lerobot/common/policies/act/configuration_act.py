@@ -85,6 +85,11 @@ class ACTConfig(PreTrainedConfig):
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
             more information on how ensembling works, please see `ACTTemporalEnsembler`.
+        cuda_graph: Replay the inference forward (normalization, network, unnormalization) as one captured
+            CUDA graph instead of launching its operations one by one from Python: the actions are the same,
+            the call does not wait for the interpreter lock at every operation when other Python threads run.
+            Inference on a CUDA device only, without autocast; training is unaffected. (Ported from
+            ~/ACT_WITH_IMU/lerobot-piper, 2026-10-18.)
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
@@ -127,6 +132,7 @@ class ACTConfig(PreTrainedConfig):
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
+    cuda_graph: bool = False
 
     # Training and loss computation.
     dropout: float = 0.1
@@ -193,6 +199,11 @@ class ACTConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
                 "because the policy needs to be queried every step to compute the ensembled action."
+            )
+        if self.cuda_graph and self.enable_history_input:
+            raise NotImplementedError(
+                "`cuda_graph` only puts the input features into the graph; the history inputs of "
+                "`enable_history_input` are not among them."
             )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(

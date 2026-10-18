@@ -113,6 +113,15 @@ def _no_stats_error_str(name: str) -> str:
     )
 
 
+def _check_stats(buffer: dict[str, Tensor], *names: str) -> None:
+    # Reading the stats back on the CPU is not allowed while a CUDA graph is being captured; the runs before the
+    # capture have checked them. (Ported from ~/ACT_WITH_IMU/lerobot-piper with ACT's `cuda_graph`.)
+    if torch.cuda.is_current_stream_capturing():
+        return
+    for name in names:
+        assert not torch.isinf(buffer[name]).any(), _no_stats_error_str(name)
+
+
 class Normalize(nn.Module):
     """Normalizes data (e.g. "observation.image") for more stable and faster convergence during training."""
 
@@ -166,14 +175,12 @@ class Normalize(nn.Module):
             if norm_mode is NormalizationMode.MEAN_STD:
                 mean = buffer["mean"]
                 std = buffer["std"]
-                assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
-                assert not torch.isinf(std).any(), _no_stats_error_str("std")
+                _check_stats(buffer, "mean", "std")
                 batch[key] = (batch[key] - mean) / (std + 1e-8)
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min = buffer["min"]
                 max = buffer["max"]
-                assert not torch.isinf(min).any(), _no_stats_error_str("min")
-                assert not torch.isinf(max).any(), _no_stats_error_str("max")
+                _check_stats(buffer, "min", "max")
                 # normalize to [0,1]
                 batch[key] = (batch[key] - min) / (max - min + 1e-8)
                 # normalize to [-1, 1]
@@ -239,14 +246,12 @@ class Unnormalize(nn.Module):
             if norm_mode is NormalizationMode.MEAN_STD:
                 mean = buffer["mean"]
                 std = buffer["std"]
-                assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
-                assert not torch.isinf(std).any(), _no_stats_error_str("std")
+                _check_stats(buffer, "mean", "std")
                 batch[key] = batch[key] * std + mean
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min = buffer["min"]
                 max = buffer["max"]
-                assert not torch.isinf(min).any(), _no_stats_error_str("min")
-                assert not torch.isinf(max).any(), _no_stats_error_str("max")
+                _check_stats(buffer, "min", "max")
                 batch[key] = (batch[key] + 1) / 2
                 batch[key] = batch[key] * (max - min) + min
             else:
