@@ -1,5 +1,6 @@
 import abc
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Sequence
 
 import draccus
@@ -600,6 +601,14 @@ class LeKiwiRobotConfig(RobotConfig):
     mock: bool = False
 
 
+def _video_index(by_id: str) -> int:
+    """按 USB 设备名找相机当前的 /dev/videoN。插拔或重启后编号会变，设备名不变。"""
+    p = Path("/dev/v4l/by-id") / by_id
+    if not p.exists():
+        raise FileNotFoundError(f"找不到相机 {p}：没插上？用 v4l2-ctl --list-devices 确认")
+    return int(p.resolve().name.removeprefix("video"))
+
+
 @RobotConfig.register_subclass("piper")
 @dataclass
 class PiperRobotConfig(RobotConfig):
@@ -634,21 +643,22 @@ class PiperRobotConfig(RobotConfig):
             #     width=1920,
             #     height=1080,
             # ),
-            # lerobot connect 无法覆盖相机原生 fps(双开后 V4L2 sticky), 故每相机 fps=其原生值:
-            # Logitech(two) 原生 30; ELECOM(wrist) YUYV 640x480 原生 20。采集时控制 fps 用 20
-            # (较低者; two 由30降采到20, wrist原生20匹配) → 数据集统一 20fps。
+            # 两路都用 MJPG 640x480 @ 30 fps：opencv.py 打开相机时一律先设 MJPG（58df708），
+            # 而 ELECOM 在 640x480 下 MJPG 只有 30 fps（20 fps 只在 YUYV 下有），设 20 必报错
+            # （2026-10-16 实测）。控制回路 20 Hz 每帧取最新一张图 → 数据集仍是 20 fps。
+            # 相机按 USB 设备名找，不写死编号：2026-10 实测两台的 /dev/videoN 互换过
+            # （ELECOM 到了 0、Logitech 到了 3），写死编号时两路画面会悄悄对调。
             "two": OpenCVCameraConfig(
-                camera_index=0,
+                camera_index=_video_index("usb-046d_Logitech_Webcam_C930e_F3EC6ADE-video-index0"),
                 fps=30,
                 width=640,
                 height=480,
             ),
-            # 腕部相机(eye-in-hand) 2026-06-30 新增 for Phase2 插入 — ELECOM 5MP @
-            # /dev/video2 (camera_index=2)。若 replug/reboot 后 index 漂移, 用
-            # v4l2-ctl --list-devices 重新确认 ELECOM 对应的 /dev/videoN。
+            # 腕部相机(eye-in-hand) 2026-06-30 新增 for Phase2 插入 — ELECOM 5MP。
             "wrist": OpenCVCameraConfig(
-                camera_index=2,
-                fps=20,
+                camera_index=_video_index(
+                    "usb-Sonix_Technology_Co.__Ltd._ELECOM_5MP_Webcam_SN0001-video-index0"),
+                fps=30,
                 width=640,
                 height=480,
             ),
