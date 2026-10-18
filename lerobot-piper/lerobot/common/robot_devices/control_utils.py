@@ -9,6 +9,7 @@ import traceback
 from contextlib import nullcontext
 from copy import copy
 from functools import cache
+from pathlib import Path
 
 import cv2
 import torch
@@ -201,20 +202,38 @@ def record_episode(
         if has_method(robot, "teleop_safety_stop"):
             robot.teleop_safety_stop()
             time.sleep(1.0)
-    control_loop(
-        robot=robot,
-        control_time_s=episode_time_s,
-        display_cameras=display_cameras,
-        dataset=dataset,
-        events=events,
-        policy=policy,
-        device=device,
-        use_amp=use_amp,
-        fps=fps,
-        teleoperate=policy is None,
-        single_task=single_task,
-        history_buffer=history_buffer,
-    )
+    # 高频记录（老师 2026-10 计划）：每次策略运行都记，与补正 wrapper、TE 无关。
+    # 编号用数据集的集编号（按 ← 重录时编号不变，文件随之覆盖，与数据集一致）。
+    high_rate_log = hr_path = None
+    if policy is not None:
+        from lerobot.common.robot_devices.high_rate_log import HighRateLog
+        hr_path = Path(dataset.root) / "high_rate" / f"episode_{dataset.meta.total_episodes:06d}.json"
+        high_rate_log = HighRateLog(robot)
+    try:
+        control_loop(
+            robot=robot,
+            control_time_s=episode_time_s,
+            display_cameras=display_cameras,
+            dataset=dataset,
+            events=events,
+            policy=policy,
+            device=device,
+            use_amp=use_amp,
+            fps=fps,
+            teleoperate=policy is None,
+            single_task=single_task,
+            history_buffer=history_buffer,
+            high_rate_log=high_rate_log,
+        )
+    except BaseException as e:      # 含 Ctrl+C：先存已有数据、关掉记录器，再把原异常抛出去
+        if high_rate_log is not None:
+            try:
+                high_rate_log.save(hr_path, error=f"{type(e).__name__}: {e}")
+            except Exception:
+                logging.exception("高频记录保存失败（原异常照常抛出）")
+        raise
+    if high_rate_log is not None:
+        high_rate_log.save(hr_path)
     # End of episode → next episode's history input is this episode's recorded sequence.
     if history_buffer is not None:
         history_buffer.end_episode()
@@ -234,6 +253,7 @@ def control_loop(
     fps: int | None = None,
     single_task: str | None = None,
     history_buffer=None,
+    high_rate_log=None,
 ):
     # TODO(rcadene): Add option to record logs
     if not robot.is_connected:
@@ -266,6 +286,7 @@ def control_loop(
             observation, action = robot.teleop_step(record_data=True)
         else:
             observation = robot.capture_observation()
+            t_obs = time.perf_counter()
 
             if policy is not None:
                 # Inject autoregressive history fields (Phase 1 of teacher's plan).
@@ -276,10 +297,14 @@ def control_loop(
                     observation.update(history_buffer.get_history())
 
                 pred_action = predict_action(observation, policy, device, use_amp)
+                t_inf = time.perf_counter()
                 # Action can eventually be clipped using `max_relative_target`,
                 # so action actually sent is saved in the dataset.
                 action = robot.send_action(pred_action)
+                t_snd = time.perf_counter()
                 action = {"action": action}
+                if high_rate_log is not None:
+                    high_rate_log.frame()
 
                 # Record this step into the history buffer for the *next* episode.
                 if history_buffer is not None:
@@ -295,12 +320,18 @@ def control_loop(
             }
             frame = {**obs_for_frame, **action, "task": single_task}
             dataset.add_frame(frame)
+        t_rec = time.perf_counter()
 
         if display_cameras and not is_headless():
             image_keys = [key for key in observation if "image" in key]
             for key in image_keys:
                 cv2.imshow(key, cv2.cvtColor(observation[key].numpy(), cv2.COLOR_RGB2BGR))
             cv2.waitKey(1)
+
+        if high_rate_log is not None:   # 只在策略运行时有：每段耗时，查回路为什么跑不满 fps
+            t_end = time.perf_counter()
+            high_rate_log.stages(t_obs - start_loop_t, t_inf - t_obs, t_snd - t_inf,
+                                 t_rec - t_snd, t_end - t_rec, t_end - start_loop_t)
 
         if fps is not None:
             dt_s = time.perf_counter() - start_loop_t
