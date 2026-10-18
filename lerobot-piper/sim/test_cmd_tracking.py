@@ -72,6 +72,30 @@ def test_speed_gain_and_overshoot_recover_known_values():
     assert T.overshoot(t, q_act, q_ideal, v_ideal)[0] == pytest.approx(0.01, abs=1e-3)
 
 
+def test_overshoot_only_at_turning_points_not_stop_and_go():
+    # 慢速上行 2 s（每帧 0.003 rad：参考每帧降到零再走，峰速约 0.12 rad/s）再掉头下行；实际 = 指令的线性插值（匀速，不停）。
+    # 旧口径（理想速度变号或降到零）会在每个走停处算一次「过冲」，值约为实际 0.3 s 内继续前进的距离
+    cmd = np.r_[np.arange(41) * 0.003, 0.12 - np.arange(1, 41) * 0.003]
+    t_send = 0.05 * np.arange(len(cmd))
+    traj = T.PlanTrajectory(np.column_stack([cmd, np.zeros((len(cmd), 5))]), t_send)
+    t = np.arange(0.0, t_send[-1], 0.005)
+    ov = T.overshoot(t, np.interp(t, t_send, cmd), traj(t)[:, 0], traj(t, 1)[:, 0])
+    assert len(ov) == 1 and abs(ov[0]) < 0.002                # 只有掉头那一次，且实际没有越过转折点
+
+
+def test_overshoot_is_zero_when_actual_follows_reference_through_close_turns():
+    # 上行 → 回落约 0.7° → 再上行超过旧极值，两次转折相隔不到 0.3 s；实际与参考完全相同，过冲必须为 0
+    cmd = np.r_[np.arange(11) * 0.01, 0.094, 0.088, 0.088 + np.arange(1, 9) * 0.01, np.full(10, 0.168)]
+    t_send = 0.05 * np.arange(len(cmd))
+    traj = T.PlanTrajectory(np.column_stack([cmd, np.zeros((len(cmd), 5))]), t_send)
+    t = np.arange(0.0, t_send[-1], 0.005)
+    q = traj(t)[:, 0]
+    k = T.turning_points(q, np.deg2rad(T.TURN_DEG))[0][0]
+    assert q[(t > t[k]) & (t <= t[k] + 0.3)].max() > q[k]      # 固定 0.3 s 窗口里，参考自己就超过了旧极值
+    ov = T.overshoot(t, q, q, traj(t, 1)[:, 0])
+    assert len(ov) >= 1 and np.allclose(ov, 0.0)
+
+
 def test_boundary_segments_only_without_te():
     t = np.arange(0, 25, 0.005)
     bnd = 0.05 * np.arange(100, 500, 100)                 # 第 100、200、300、400 帧

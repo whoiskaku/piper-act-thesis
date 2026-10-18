@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""实际运动 vs 指令：基线数据相对理想渲染的偏离（方案与口径见 reports/PLAN_actual_vs_command.md v2）。
+"""实际运动 vs 指令：基线数据相对理想渲染的偏离（方案与口径见 reports/PLAN_actual_vs_command.md v2.2）。
 
 理想渲染 = 每帧实发指令（数据集 action）在写总线时刻 t_send 交给加速度受限规划器
 （a_max = 5 rad/s²，本轮参考假设；算法同 sim/step2_g/optuna_ident_enc.accel_limited_dt），不加延迟、不滤波。
@@ -34,6 +34,7 @@ SUB = 20                         # 规划器每帧细分步数（同 accel_limit
 LP_VEL, LP_ACC = 15.0, 3.0       # Hz：速度层 / 加速度层比较时两边同用的零相位低通（选项 A）
 BAND = (3.0, 15.0)               # Hz：陀螺的高频跟踪残差
 TAUS = np.arange(0, 301, 5) / 1000.0
+TURN_DEG = 0.1                   # °：转折点的滞回——理想位置到达极值后往回走这么多才算一次转折（过冲只在转折点算）
 CONTACT_S, ZONE_M, BOUNDARY_S, CHUNK, GRIP_OPEN = 0.5, 0.03, 0.25, 100, 0.04
 ACTIVE = [0, 1, 2, 4, 5]         # j4 两个任务都从不指令运动，不进关节平均（逐关节结果照常输出）
 TASKS = {"pickcube": ("eval_pickcube_base_noTE", "eval_pickcube_base_TE", "pickcube_raw"),
@@ -102,6 +103,11 @@ def load(repo, i):
     root = LR / repo
     h = json.loads((root / "high_rate" / f"episode_{i:06d}.json").read_text())
     act = np.stack(pd.read_parquet(root / f"data/chunk-000/episode_{i:06d}.parquet")["action"].to_numpy())
+    return from_record(h, act)
+
+
+def from_record(h, act):
+    """高频记录 h（评测的 high_rate 文件与 replay_probe 的回放记录字段相同）+ 每帧实发指令 act → 同 load。"""
     t_send = np.asarray(h["t_send"], float)
     n_nan = int(np.isnan(t_send).sum())
     if n_nan:                        # 取不到写总线时刻的帧：按帧号插值补上，并记入质量检查
@@ -193,17 +199,38 @@ def speed_gain(v_act, v_ideal, moving=0.05):
     return float(np.sum(v_act[m] * v_ideal[m]) / np.sum(v_ideal[m] ** 2)) if m.any() else float("nan")
 
 
+def turning_points(q, delta):
+    """带滞回的转折点：位置到达极值后往回走 ≥ delta 才确认 → [(极值所在下标, 之前的方向 ±1)]。"""
+    out, d, ext = [], 0, 0
+    for k in range(1, len(q)):
+        if d == 0:
+            if abs(q[k] - q[0]) >= delta:
+                d, ext = (1 if q[k] > q[0] else -1), k
+        elif d * (q[k] - q[ext]) > 0:
+            ext = k
+        elif d * (q[ext] - q[k]) >= delta:
+            out.append((ext, d))
+            d, ext = -d, k
+    return out
+
+
 def overshoot(t, q_act, q_ideal, v_ideal, min_peak=0.1, before=0.1, after=0.3):
-    """过冲：理想速度换向处，实际位置越过理想换向点的量（rad，正 = 越过）。→ 各换向点的列表。"""
-    s = np.sign(v_ideal)
-    rev = np.flatnonzero((s[:-1] != 0) & (s[1:] != s[:-1]))
-    out, last = [], 0
-    for r in rev:
-        if np.abs(v_ideal[last:r + 1]).max(initial=0) >= min_peak:
-            w = (t >= t[r] - before) & (t <= t[r] + after)
-            ext = q_act[w].max() if s[r] > 0 else q_act[w].min()
-            out.append(float(s[r] * (ext - q_ideal[r])))
-        last = r + 1
+    """过冲：理想位置的转折点（往回走 ≥ TURN_DEG 才确认，且从上一个转折点起理想峰速 ≥ min_peak）处，
+    实际位置越过该转折点的量（rad，正 = 越过）。→ 各转折点的列表。
+    取峰窗口 [t_k − before, t_k + after]，且不跨过前后相邻的转折点：跨过去以后参考自己的下一段运动就可能超过旧极值，
+    实际跟着它走也会被算成过冲。
+    不用「理想速度变号或降到零」：加速度受限参考每次到位都有约 0.01° 的数值小过冲、慢速时每帧走停，
+    实际在那些点上只是继续往前走，会被算成过冲（2026-10-19 更正）。"""
+    tp = turning_points(q_ideal, np.deg2rad(TURN_DEG))
+    out, prev = [], 0
+    for n, (k, d) in enumerate(tp):
+        if np.abs(v_ideal[prev:k + 1]).max() >= min_peak:
+            lo = max(t[k] - before, t[tp[n - 1][0]] if n > 0 else -np.inf)
+            hi = min(t[k] + after, t[tp[n + 1][0]] if n + 1 < len(tp) else np.inf)
+            w = (t >= lo) & (t <= hi)
+            ext = q_act[w].max() if d > 0 else q_act[w].min()
+            out.append(float(d * (ext - q_ideal[k])))
+        prev = k
     return out
 
 
@@ -247,11 +274,13 @@ def episode_metrics(ep, traj, calib, model, sid, center, te):
         if key != "enc_pos":
             rec[f"{key}_act_all"], rec[f"{key}_ref_all"] = rms(act[:, ACTIVE]) * deg, rms(ref[:, ACTIVE]) * deg
     # 逐关节：相对参考的最佳对齐延迟、对齐后残差、钝化增益、过冲
+    n_turn = 0
     for j in range(6):
         tau, e0, e1 = best_delay(tq, q[:, j], lambda t, j=j: traj(t)[:, j])
         qis = traj(tq - tau)[:, j]
         vis = lp_deriv(qis, LP_VEL, 1)                               # 与实际速度同一处理，用于钝化增益
-        ov = overshoot(tq, q[:, j], qis, traj(tq - tau, 1)[:, j])   # 换向/停下用规划器自己的速度判断（停下时正好为 0）
+        ov = overshoot(tq, q[:, j], qis, traj(tq - tau, 1)[:, j])   # 转折点按规划器自己的位置找，峰速用它的速度
+        n_turn += len(ov) if j in ACTIVE else 0
         rec.update({f"tau_j{j+1}": tau * 1e3, f"pos_aligned_j{j+1}": e1 * 180 / np.pi,
                     f"gain_j{j+1}": speed_gain(va[:, j], vis),
                     f"overshoot_med_j{j+1}": float(np.median(ov)) * 180 / np.pi if ov else float("nan"),
@@ -259,6 +288,8 @@ def episode_metrics(ep, traj, calib, model, sid, center, te):
     rec["tau_med"] = float(np.nanmedian([rec[f"tau_j{j+1}"] for j in ACTIVE]))
     rec["gain_med"] = float(np.nanmedian([rec[f"gain_j{j+1}"] for j in ACTIVE]))
     rec["overshoot_med"] = float(np.nanmedian([rec[f"overshoot_med_j{j+1}"] for j in ACTIVE]))
+    rec["overshoot_max"] = float(np.nanmax([rec[f"overshoot_max_j{j+1}"] for j in ACTIVE]))   # 尾部：少数大的过冲
+    rec["overshoot_n"] = n_turn                                                                # 活动关节的转折点数
     # IMU 层：陀螺 <15 Hz、陀螺 3–15 Hz（高频跟踪残差）、加计 <3 Hz；旁列实测、参考各自在该频段的量（去均值）
     acc_i, gyr_i = ideal_imu(traj, ti - calib["delay_s"], calib, model, sid)
     gm, am = ep["imu"][:, 3:], ep["imu"][:, :3]
@@ -282,9 +313,10 @@ def episode_metrics(ep, traj, calib, model, sid, center, te):
 
 # ── 汇总 ─────────────────────────────────────────────────────────────────
 MAIN = ["imu_gyro_lt15_all", "imu_gyro_hf_all", "imu_acc_lt3_all",
-        "enc_pos_all", "enc_vel_lt15_all", "enc_acc_lt3_all", "tau_med", "gain_med", "overshoot_med"]
+        "enc_pos_all", "enc_vel_lt15_all", "enc_acc_lt3_all", "tau_med", "gain_med", "overshoot_med", "overshoot_max"]
 UNITS = {"imu_gyro_lt15": "rad/s", "imu_gyro_hf": "rad/s", "imu_acc_lt3": "m/s²", "enc_pos": "°",
-         "enc_vel_lt15": "°/s", "enc_acc_lt3": "°/s²", "tau_med": "ms", "gain_med": "", "overshoot_med": "°"}
+         "enc_vel_lt15": "°/s", "enc_acc_lt3": "°/s²", "tau_med": "ms", "gain_med": "", "overshoot_med": "°",
+         "overshoot_max": "°"}
 
 
 def paired(a, b, rng, n_boot=10000):
@@ -410,7 +442,7 @@ def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUT / "metrics.csv", index=False)
     summary = summarize(df)
-    (OUT / "summary.json").write_text(json.dumps({"plan": "reports/PLAN_actual_vs_command.md v2", "a_max": A_MAX,
+    (OUT / "summary.json").write_text(json.dumps({"plan": "reports/PLAN_actual_vs_command.md v2.2", "a_max": A_MAX,
                                                   "band_hz": BAND, "summary": summary}, ensure_ascii=False, indent=1))
     for task, cur in summary.items():
         nt, te_ = cur["noTE"], cur["TE"]
