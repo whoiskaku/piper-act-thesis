@@ -69,6 +69,11 @@ def cmd_seq():
 
 # ── 回放 ─────────────────────────────────────────────────────────────────
 def run_one(s, c, r):
+    """子进程跑一遍（本脚本的序列与命名），见 guarded_run。"""
+    return guarded_run(OUT / f"seq_{s}_{c}.npz", f"{s}_{c}_", f"r{r}", OUT)
+
+
+def guarded_run(seqfile, tag, arm, outdir):
     """子进程跑一遍，接住 replay_probe 非 pilot 路径里冒出的异常。预移动、静置阶段的异常（Ctrl-C、到位或稳定断言）
     在那里直接抛出，不落盘也不归位；任其冒出，PiperRobot 被释放时 __del__ 会发一次无插值归位。这里：
     ① 还没有回放记录 → 落一份 stopped 记录（不补跑、分析排除），再走 replay_probe 自己的分段插值归位（受阻即停）；
@@ -80,9 +85,9 @@ def run_one(s, c, r):
     U = importlib.import_module("lerobot.common.robot_devices.robots.utils")
     made, make = [], U.make_robot
     U.make_robot = lambda *a, **k: made.append(make(*a, **k)) or made[-1]     # 留住 robot，异常时才拿得到
-    p = OUT / f"replay_{s}_{c}_r{r}.json"
+    p = outdir / f"replay_{tag}{arm}.json"
     try:
-        return RP.run(f"r{r}", False, seqfile=str(OUT / f"seq_{s}_{c}.npz"), tag=f"{s}_{c}_", outdir=OUT)
+        return RP.run(arm, False, seqfile=str(seqfile), tag=tag, outdir=outdir)
     except BaseException as e:
         reason = f"{type(e).__name__}: {e}"
         print(f"\n  ✗ 这一遍异常退出：{reason}")
@@ -92,13 +97,13 @@ def run_one(s, c, r):
             p.write_text(json.dumps(rec))
             print("  已有回放记录（管线已落盘并归位过），不再归位。")
         else:
-            rec = {"arm": f"r{r}", "seqfile": str(OUT / f"seq_{s}_{c}.npz"), "stopped": reason,
+            rec = {"arm": arm, "seqfile": str(seqfile), "stopped": reason,
                    "traceback": traceback.format_exc()}
             p.write_text(json.dumps(rec))
             if made and made[0].is_connected:
                 try:
                     import torch
-                    grip = float(np.clip(np.load(OUT / f"seq_{s}_{c}.npz")["cmd7"][0, 6], 0, 0.035))
+                    grip = float(np.clip(np.load(seqfile)["cmd7"][0, 6], 0, 0.035))
                     if not RP.staged_return(made[0], torch, grip):
                         rec["return_blocked"] = True
                 except BaseException as e2:                       # 归位中再按 Ctrl-C 也走到这里
@@ -169,17 +174,22 @@ def correction(sent, cmd):
     return {"rms": float(np.sqrt(np.mean(d ** 2)) * 1e3), "max": float(np.abs(d).max() * 1e3)}
 
 
+def raw_gyro(ep, cmd, calib, model, sid):
+    """原始指令线性插值经运动学渲染、按标定换到 IMU 坐标的陀螺读数（IMU 时刻上）：末端角速度偏差的目标（原始指令一族）。"""
+    import mujoco
+    from ideal_imu_kinematic import ideal_imu_traj
+    return (ideal_imu_traj(model, mujoco.MjData(model), LinCmd(ep["t_send"], cmd), ep["ti"] - calib["delay_s"], sid)[1][:, 3:]
+            @ np.asarray(calib["R"]).T + np.asarray(calib["gyro_bias"]))
+
+
 def sq_dev(ep, cmd, calib, model, sid):
     """一遍相对原始策略指令的逐样本平方偏差：关节两种参考（编码器网格上，五个活动关节平方的均值）、
     末端两种参考（IMU 时刻上，陀螺 <15 Hz 三轴平方和）。参考：原始指令一族 = 零阶保持（关节）/ 线性插值经运动学渲染（末端）；
     理想渲染一族 = 原指令经 a_max 规划、从实测起点出发。"""
-    import mujoco
-    from ideal_imu_kinematic import ideal_imu_traj
     tq, q, ti, g, ts = ep["tq"], ep["q"], ep["ti"], ep["imu"][:, 3:], ep["t_send"]
     traj = T.PlanTrajectory(cmd, ts, q0=q[0])
     g_ideal = T.ideal_imu(traj, ti - calib["delay_s"], calib, model, sid)[1]
-    g_raw = (ideal_imu_traj(model, mujoco.MjData(model), LinCmd(ts, cmd), ti - calib["delay_s"], sid)[1][:, 3:]
-             @ np.asarray(calib["R"]).T + np.asarray(calib["gyro_bias"]))
+    g_raw = raw_gyro(ep, cmd, calib, model, sid)
     return {"joint_raw": np.mean((zoh(ts, cmd, tq) - q)[:, T.ACTIVE] ** 2, axis=1),
             "joint_ideal": np.mean((traj(tq)[:, :6] - q)[:, T.ACTIVE] ** 2, axis=1),
             "ee_raw": np.sum(D.lp(g - g_raw, T.LP_VEL, D.FS_I) ** 2, axis=1),
