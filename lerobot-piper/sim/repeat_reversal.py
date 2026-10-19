@@ -186,9 +186,19 @@ def cmd_seq():
 
 
 # ── replay ───────────────────────────────────────────────────────────────
-def attempted(name, r):
+def attempted(name, r, out=OUT):
     """这一遍是否开始过：留下了回放记录，或预移动后的静置记录（臂已动过）。连接失败不算。"""
-    return (OUT / f"replay_{name}_r{r}.json").exists() or any(OUT.glob(f"settle*_{name}_r{r}_*.json"))
+    return (out / f"replay_{name}_r{r}.json").exists() or any(out.glob(f"settle*_{name}_r{r}_*.json"))
+
+
+def run_child(args):
+    """在子进程里跑一遍回放，返回退出码。等待期间父进程忽略 Ctrl-C：只交给子进程（管线先落盘再分段归位），这里继续等它结束。"""
+    p = subprocess.Popen(args)
+    prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        return p.wait()
+    finally:
+        signal.signal(signal.SIGINT, prev)
 
 
 def cmd_replay(dry_run, one=None):
@@ -205,12 +215,7 @@ def cmd_replay(dry_run, one=None):
         if input(f"\n[{k}/{len(plan)}] 序列 {s} 第 {r} 遍：桌面已清空、可以运动就按回车（输入 q 退出）").strip().lower() == "q":
             return 0
         utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        p = subprocess.Popen([sys.executable, "-u", __file__, "replay", "--one", f"{s}{r}"])
-        prev = signal.signal(signal.SIGINT, signal.SIG_IGN)   # Ctrl-C 只交给子进程（管线先落盘再分段归位），这里继续等它结束
-        try:
-            code = p.wait()
-        finally:
-            signal.signal(signal.SIGINT, prev)
+        code = run_child([sys.executable, "-u", __file__, "replay", "--one", f"{s}{r}"])
         with open(OUT / "replay_log.jsonl", "a") as f:
             f.write(json.dumps({"k": k, "seq": s, "rep": r, "utc": utc, "code": code, "replay_probe_sha256": sha}) + "\n")
         if code:
