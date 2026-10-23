@@ -86,13 +86,13 @@ def test_hard_bound_matches_replay_pipeline():
         RP.safety_checks(cmd7, np.zeros((40, 6), np.float32))
 
 
-def test_branch_candidates_identical_when_imu_term_is_zero():
+def test_v06_branch_candidates_identical_when_imu_term_is_zero():
     n, rng = 100, np.random.default_rng(1)
     acc, eq = rng.normal(0, 0.002, (n, 5)), rng.normal(0, 0.003, (n, 5))
-    j = I.Learner("j", 6, acc, (eq, np.zeros((n, 5))), met(10, 0.05), box(n), ["bp"])
-    i = I.Learner("i", 6, acc, (eq, np.zeros((n, 5))), met(10, 0.05), box(n), ["bp"])
+    j = I.Learner("j", 6, acc, (eq, np.zeros((n, 5)), np.zeros((n, 5))), met(10, 0.05), box(n), ["bp"])
+    i = I.Learner("i", 6, acc, (eq, np.zeros((n, 5)), np.zeros((n, 5))), met(10, 0.05), box(n), ["bp"])
     assert np.array_equal(j.next()["delta"], i.next()["delta"])            # 同一状态、同一步长，IMU 项为零 → 同一候选
-    i2 = I.Learner("i", 6, acc, (eq, rng.normal(0, 0.003, (n, 5))), met(10, 0.05), box(n), ["bp"])
+    i2 = I.Learner("i", 6, acc, (eq, rng.normal(0, 0.003, (n, 5)), np.zeros((n, 5))), met(10, 0.05), box(n), ["bp"])
     assert not np.array_equal(j.next()["delta"], i2.next()["delta"])
     np.testing.assert_array_equal(j.next()["delta"], I.step(acc, 0.5 * eq, I.GAMMA0, *box(n)))   # 分叉后关节系数 ½
 
@@ -138,41 +138,41 @@ def test_site_jacobian_matches_kinematic_gyro():
 def test_guard_confirmation_rejection_and_budget():
     n = 100
     eq, ew = np.full((n, 5), 0.001), np.zeros((n, 5))
-    L = I.Learner("c", 4, np.zeros((n, 5)), (eq, ew), met(10, 0.05), box(n), ["b"])
+    L = I.Learner("c", 4, np.zeros((n, 5)), (eq, ew, 0 * ew), met(10, 0.05), box(n), ["b"])
     c1 = L.next()
-    assert L.add(c1, met(11, 0.05), (eq, ew)).startswith("触发护栏") and L.next() is c1
-    assert L.add(c1, met(10.8, 0.05), (eq, ew)).startswith("退回")        # 两遍平均 10.9 > 10.5
+    assert L.add(c1, met(11, 0.05), (eq, ew, 0 * ew)).startswith("触发护栏") and L.next() is c1
+    assert L.add(c1, met(10.8, 0.05), (eq, ew, 0 * ew)).startswith("退回")        # 两遍平均 10.9 > 10.5
     assert L.gamma == 0.25 and not L.acc.any()
     c2 = L.next()
     np.testing.assert_array_equal(c2["delta"], I.step(np.zeros((n, 5)), eq, 0.25, *box(n)))
-    assert L.add(c2, met(9.0, 0.09), (eq, ew)).startswith("接受")         # 共同关节阶段不看末端护栏
+    assert L.add(c2, met(9.0, 0.09), (eq, ew, 0 * ew)).startswith("接受")         # 共同关节阶段不看末端护栏
     assert np.array_equal(L.acc, c2["delta"])
     c3 = L.next()
-    assert L.add(c3, met(11, 0.05), (eq, ew)).startswith("退回") and L.left == 0   # 没有预算确认 → 直接退回
+    assert L.add(c3, met(11, 0.05), (eq, ew, 0 * ew)).startswith("退回") and L.left == 0   # 没有预算确认 → 直接退回
 
 
 def test_imu_branch_switches_to_probing_and_remeasures_last():
     n = 100
     eq, ew = np.full((n, 5), 0.001), np.full((n, 5), 0.002)
-    L = I.Learner("i", 5, np.zeros((n, 5)), (eq, ew), met(10, 0.05), box(n), ["bp"])
+    L = I.Learner("i", 5, np.zeros((n, 5)), (eq, ew, 0 * ew), met(10, 0.05), box(n), ["bp"])
     for _ in range(2):
-        msg = L.add(L.next(), met(10, 0.05), (eq, ew))                     # 接受但目标值没有下降
+        msg = L.add(L.next(), met(10, 0.05), (eq, ew, 0 * ew))                     # 接受但目标值没有下降
     assert L.probing and "改为试探" in msg
     acc, p = L.acc.copy(), L.next()
-    assert p["label"] == "试探+" and L.add(p, met(10.2, 0.051), (eq, ew)).startswith("等")
+    assert p["label"] == "试探+" and L.add(p, met(10.2, 0.051), (eq, ew, 0 * ew)).startswith("等")
     m = L.next()
     assert m["label"] == "试探−"
     np.testing.assert_array_equal(m["delta"], I.step(acc, 0.5 * eq - 0.5 * ew, L.gamma, *box(n)))
-    assert L.add(m, met(9.8, 0.049), (eq, ew)) == "接受试探−" and np.array_equal(L.acc, m["delta"])
+    assert L.add(m, met(9.8, 0.049), (eq, ew, 0 * ew)) == "接受试探−" and np.array_equal(L.acc, m["delta"])
     last = L.next()                                                        # 只剩 1 遍：复测已接受的补正，不再更新
     assert L.left == 1 and last["label"] == "复测" and np.array_equal(last["delta"], L.acc)
     acc = L.acc.copy()
-    assert L.add(last, met(9.0, 0.040), (eq, ew)).startswith("复测") and np.array_equal(L.acc, acc) and L.met["joint_raw"] == 9.8
-    L2 = I.Learner("i", 6, np.zeros((n, 5)), (eq, ew), met(10, 0.05), box(n), ["bp"])
+    assert L.add(last, met(9.0, 0.040), (eq, ew, 0 * ew)).startswith("复测") and np.array_equal(L.acc, acc) and L.met["joint_raw"] == 9.8
+    L2 = I.Learner("i", 6, np.zeros((n, 5)), (eq, ew, 0 * ew), met(10, 0.05), box(n), ["bp"])
     for _ in range(2):
-        L2.add(L2.next(), met(10, 0.05), (eq, ew))
-    L2.add(L2.next(), met(10.1, 0.05), (eq, ew))
-    assert L2.add(L2.next(), met(10.1, 0.05), (eq, ew)).endswith("c → 0.5")   # 两个试探都没改善
+        L2.add(L2.next(), met(10, 0.05), (eq, ew, 0 * ew))
+    L2.add(L2.next(), met(10.1, 0.05), (eq, ew, 0 * ew))
+    assert L2.add(L2.next(), met(10.1, 0.05), (eq, ew, 0 * ew)).endswith("c → 0.5")   # 两个试探都没改善
 
 
 def test_schedule_budget_and_balance():
@@ -265,3 +265,189 @@ def test_joint_ilc_converges_on_planner_plant():
         J.append(low(ep))
         delta = I.step(delta, I.joint_err(ep, a7[:, :6], none), 0.5, W)
     assert all(b < a for a, b in zip(J, J[1:])) and J[-1] < 0.5 * J[0], J
+
+
+# ── v0.7：只关节支也带编码器预测的末端项（方案 v0.7 §2.4）──────────────────────
+def rigid_case():
+    """已知刚体运动的合成回放：解析关节轨迹 → 刚体运动学 → 按标定约定（R·ω_site(t − d) + 零偏）生成「实测」陀螺。
+    标定故意取非单位旋转、非零零偏和 12 ms 延迟，IMU 时刻与编码器网格错开 3 ms。"""
+    import mujoco
+    from ideal_imu_kinematic import MODEL_PATH, ideal_imu_traj
+    model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "ee_imu_site")
+    c, A, f = np.array([0, 0.8, -0.8, 0, 0.4, 0]), np.array([0.3, 0.2, 0.2, 0, 0.2, 0.3]), np.array([0.5, 0.8, 1.1, 0, 1.3, 0.7])
+
+    def sp(t, nu=0):
+        t = np.atleast_1d(t)[:, None]
+        w = 2 * np.pi * f
+        y = c + A * np.sin(w * t) if nu == 0 else A * w * np.cos(w * t) if nu == 1 else -A * w ** 2 * np.sin(w * t)
+        return np.column_stack([y, np.zeros(len(t))])
+
+    ax = np.array([1.0, 1.0, 0.0]) / np.sqrt(2)
+    K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+    R = np.eye(3) + np.sin(0.5) * K + (1 - np.cos(0.5)) * K @ K
+    calib = {"R": R, "b": np.zeros(3), "gyro_bias": np.array([0.01, -0.02, 0.005]), "dp": np.zeros(3), "delay_s": 0.012}
+    ts = I.RR.DT * np.arange(120)
+    tq, ti = np.arange(ts[0], ts[-1], 1 / I.D.FS_Q), np.arange(ts[0] + 0.003, ts[-1], 1 / I.D.FS_I)
+    g = ideal_imu_traj(model, mujoco.MjData(model), sp, ti - calib["delay_s"], sid)[1][:, 3:] @ R.T + calib["gyro_bias"]
+    ep = {"t_send": ts, "tq": tq, "q": sp(tq)[:, :6], "ti": ti, "imu": np.c_[np.zeros((len(ti), 3)), g]}
+    return ep, sp(ts)[:, :6], calib, model, sid
+
+
+def test_v07_branches_differ_only_by_imu_versus_encoder_prediction():
+    n, rng = 100, np.random.default_rng(4)
+    acc, eq, ee = (rng.normal(0, s, (n, 5)) for s in (0.001, 0.002, 0.002))   # ee = M[ω* − ω_enc]
+    W = np.ones((n, 5))
+
+    def mk(kind, ew):                                                      # 限幅设宽：只检验限幅与接受决策之前的更新量
+        return I.Learner(kind, 6, acc, (eq, ew, ee), met(10, 0.05), (W, -1.0, 1.0), ["bp"], enc=True)
+
+    assert np.array_equal(mk("j", ee).next()["delta"], mk("i", ee).next()["delta"])   # 实测 IMU = 编码器预测 → 两支候选相同
+    ew = rng.normal(0, 0.002, (n, 5))                                      # ew = M[ω* − ω_meas]
+    diff = mk("i", ew).next()["delta"] - mk("j", ew).next()["delta"]
+    np.testing.assert_allclose(diff, W * I.qfilter(I.GAMMA0 * 0.5 * (ew - ee)), atol=1e-12)   # = Q[γ·½·M[ω_enc − ω_meas]]
+
+
+def test_v07_imu_map_is_linear_on_the_same_data():
+    ep, a6, calib, model, sid = rigid_case()
+    rng = np.random.default_rng(5)
+    x, y = rng.normal(0, 0.05, (2, len(ep["ti"]), 3))
+    marked = np.zeros(len(a6), bool)
+    marked[50:60] = True
+    M = lambda e: I.ang_err(ep, e, a6, marked, calib, model, sid)          # noqa: E731
+    np.testing.assert_allclose(M(x) - M(y), M(x - y), atol=1e-12)          # 差分恒等式不依赖刚体投影近似
+
+
+def test_v07_rigid_motion_gives_no_spurious_residual():
+    ep, a6, calib, model, sid = rigid_case()
+    g, ge = ep["imu"][:, 3:], I.enc_gyro(ep, calib, model, sid)
+    m = (ep["ti"] > ep["ti"][0] + 0.5) & (ep["ti"] < ep["ti"][-1] - 0.5)  # 避开滤波端点
+
+    def rms(x):
+        return np.sqrt(np.mean(np.sum(x[m] ** 2, 1)))
+
+    def band(x):
+        return I.D.lp(x, 5, I.D.FS_I) - I.D.lp(x, 0.5, I.D.FS_I)
+
+    assert rms(ge - g) < 0.01 * rms(g - calib["gyro_bias"])               # 坐标、零偏、时延、IMU 时刻都对上
+    assert rms(band(ge - g)) < 0.01 * rms(band(g))                         # 更新用的 0.5–5 Hz 带内也没有凭空的残差
+    wrong = dict(calib, delay_s=0.0)                                       # 对照：时延处理错了就会出现残差
+    assert rms(I.enc_gyro(ep, wrong, model, sid) - g) > 0.05 * rms(g - calib["gyro_bias"])
+
+
+def test_v07_encoder_branch_ignores_imu_readings():
+    ep, a6, calib, model, sid = rigid_case()
+    noisy = dict(ep, imu=np.random.default_rng(6).normal(0, 1, ep["imu"].shape))   # 只改 IMU 读数（时间戳不变）
+    assert np.array_equal(I.enc_gyro(ep, calib, model, sid), I.enc_gyro(noisy, calib, model, sid))
+    marked = np.zeros(len(a6), bool)
+    assert np.array_equal(I.joint_err(ep, a6, marked), I.joint_err(noisy, a6, marked))
+    n, rng = 100, np.random.default_rng(7)
+    err = tuple(rng.normal(0, 0.002, (n, 5)) for _ in range(3))
+    runs = []
+    for jw in (0.04, 0.09):                                                # 只关节支的接受与步长不看末端指标
+        L = I.Learner("j", 6, np.zeros((n, 5)), err, met(10, 0.05), box(n), ["bp"], enc=True)
+        msgs = [L.add(L.next(), met(jq, jw), err) for jq in (10.4, 11.0, 10.9, 10.2)]
+        runs.append((msgs, L.gamma, L.acc.copy()))
+    assert runs[0][0] == runs[1][0] and runs[0][1] == runs[1][1] and np.array_equal(runs[0][2], runs[1][2])
+
+
+
+def test_calibration_found_by_session_hash(monkeypatch, tmp_path):
+    cal, out = tmp_path / "imu_calib", tmp_path / "session"
+    cal.mkdir(), out.mkdir()
+    (cal / "imu_calib.json").write_text('{"v": "now"}')
+    (cal / "imu_calib_20261019.json").write_text('{"v": "old"}')
+    monkeypatch.setattr(I, "CALIB", cal / "imu_calib.json")
+    monkeypatch.setattr(I, "OUT", out)
+    assert I.calib_path() == cal / "imu_calib.json"                        # 新会话：用当前标定
+    old = hashlib.sha256(b'{"v": "old"}').hexdigest()[:16]
+    (out / "session.json").write_text(json.dumps({"calib_sha": old}))
+    assert I.calib_path() == cal / "imu_calib_20261019.json"               # 旧会话：按哈希找到备份
+    (out / "session.json").write_text(json.dumps({"calib_sha": "0" * 16}))
+    with pytest.raises(SystemExit):                                       # 找不到就停
+        I.calib_path()
+
+
+# ── v0.8：窗过渡 0.5 s + 同会话对照（方案 v0.8）─────────────────────────────
+def test_v08_rule_params_window_and_schedule():
+    assert I.rule_params("v0.6") == (False, 5, I.EVAL, 0.5)                # 旧会话照原样重建
+    assert I.rule_params("v0.7") == (True, 5, I.EVAL, 0.5)
+    assert I.rule_params("v0.8") == (True, 10, I.EVAL + ("j07",), 0.5)
+    zero = np.zeros((60, 5), bool)
+    zero[:20] = True
+    W = I.window(zero, 10)
+    assert W[:20].max() == 0 and 0 < W[25, 0] < 1 and W[28, 0] < 1 and W[29:].min() == 1   # 距离 10 帧（0.5 s）才到 1
+    assert I.window(zero, 5)[23, 0] < 1 and I.window(zero, 5)[24:].min() == 1           # 旧窗：距离 5 帧（0.25 s）
+    evals = I.EVAL + ("j07",)
+    plan = I.schedule(evals)
+    assert len(plan) == len(set(plan)) == 76
+    for s in I.SEQS:
+        ev = [(n, lk[2:]) for x, lk, n in plan if x == s and lk.startswith("e_")]
+        assert all({c for r, c in ev if r == n} == set(evals) for n in range(1, I.N_EVAL + 1))   # 每轮每个条件一次
+        pos = Counter((c, [cc for r, cc in ev if r == n].index(c)) for n, c in ev)
+        assert set(pos.values()) == {1}                                    # 每个条件 4 轮占 4 个不同位置
+
+
+def test_v08_comparator_command_replayed_bytewise(monkeypatch, tmp_path):
+    src, out = tmp_path / "v07", tmp_path / "v08"
+    src.mkdir(), out.mkdir()
+    rng = np.random.default_rng(8)
+    s7 = np.cumsum(rng.normal(0, 0.002, (50, 7)), 0).astype(np.float32)
+    old = s7.copy()
+    old[:, I.T.ACTIVE] += rng.normal(0, 0.001, (50, 5)).astype(np.float32)   # v0.7 学出的补正（float32 写在指令里）
+    h = hashlib.sha256(old.tobytes()).hexdigest()[:16]
+    for r in range(1, I.N_EVAL + 1):
+        np.savez(src / f"seq_A_e_j{r:02d}.npz", cmd7=old, source=json.dumps({"cmd_hash": h}))
+    monkeypatch.setattr(I, "COMPARATOR", src)
+    monkeypatch.setattr(I, "OUT", out)
+    cmd, hh = I.comparator("A")
+    assert hh == h
+    z = np.load(I.write_seq("A_e_j0701", s7, None, "评价 j07", cmd7=cmd))
+    assert np.array_equal(z["cmd7"], old) and json.loads(str(z["source"]))["cmd_hash"] == h   # 逐字节原样重放
+    for bad in ({"cmd7": old, "source": json.dumps({"cmd_hash": "x"})},                  # 记下的哈希不一致 → 停
+                {"cmd7": s7, "source": json.dumps({"cmd_hash": h})}):                    # 哈希照旧、内容被改 → 停
+        np.savez(src / "seq_A_e_j03.npz", **bad)
+        with pytest.raises(SystemExit):
+            I.comparator("A")
+
+
+def test_v08_band_metrics_recover_known_sines():
+    ts = I.RR.DT * np.arange(200)
+    tq, ti = np.arange(ts[0], ts[-1], 1 / I.D.FS_Q), np.arange(ts[0] + 0.003, ts[-1], 1 / I.D.FS_I)
+    a6 = np.zeros((200, 6))
+    q = np.zeros((len(tq), 6))
+    q[:, 0] = -0.001 * np.sin(2 * np.pi * 3 * tq)                          # 关节误差：3 Hz、1 mrad，只在 j1
+    g = np.zeros((len(ti), 3))
+    g[:, 0], g[:, 1] = 0.01 * np.sin(2 * np.pi * 10 * ti), 0.02 * np.sin(2 * np.pi * 2 * ti)   # 末端：10 Hz 与 2 Hz
+    ep = {"t_send": ts, "tq": tq, "q": q, "ti": ti, "imu": np.c_[np.zeros((len(ti), 3)), g]}
+    fq, fi = (tq > 1) & (tq < 9), (ti > 1) & (ti < 9)
+    zone = np.zeros(200, bool)
+    zone[60:100] = True
+    m = I.band_metrics(ep, a6, np.zeros((len(ti), 3)), fq, fi, zone, {"delay_s": 0.0})
+    assert m["ee_5_15"] == pytest.approx(0.01 / np.sqrt(2), rel=0.03) and m["ee_05_5"] == pytest.approx(0.02 / np.sqrt(2), rel=0.03)
+    assert m["ee_5_15_zone"] == pytest.approx(0.01 / np.sqrt(2), rel=0.05)
+    assert m["joint_05_5"] == pytest.approx(1.0 / np.sqrt(2) / np.sqrt(5), rel=0.03) and m["joint_5_10"] < 0.02
+
+
+# ── v0.9：加 IMU 支里 IMU 独有部分的权重 ½ → 1（方案 §11）────────────────────
+def test_v09_rule_params_and_three_condition_schedule():
+    assert I.rule_params("v0.9") == (True, 10, ("shift", "j", "i"), 1.0)
+    plan = I.schedule(("shift", "j", "i"))
+    assert len(plan) == len(set(plan)) == 60                               # 4 + 8 + 24 + 3 条件 × 4 轮 × 2 序列
+    for s in I.SEQS:
+        ev = [(n, lk[2:]) for x, lk, n in plan if x == s and lk.startswith("e_")]
+        assert all({c for r, c in ev if r == n} == {"shift", "j", "i"} for n in range(1, I.N_EVAL + 1))
+
+
+def test_v09_weights_only_the_imu_only_part_and_old_weight_is_bytewise():
+    n, rng = 100, np.random.default_rng(9)
+    acc, eq, ee, ew = (rng.normal(0, s, (n, 5)) for s in (0.001, 0.002, 0.002, 0.002))
+    W = np.ones((n, 5))
+
+    def cand(kind, wr, sign=1):                                            # 限幅设宽：只检验限幅与接受决策之前的更新量
+        return I.Learner(kind, 6, acc, (eq, ew, ee), met(10, 0.05), (W, -1.0, 1.0), ["bp"], enc=True, wr=wr).cand(sign, "x")["delta"]
+
+    for sign in (1, -1):                                                   # wr = ½：候选与试探都逐位等于 v0.6–v0.8 的旧式
+        assert np.array_equal(cand("i", 0.5, sign), I.step(acc, 0.5 * eq + sign * 0.5 * ew, I.GAMMA0, W, -1.0, 1.0))
+    np.testing.assert_allclose(cand("i", 1.0) - cand("j", 1.0), W * I.qfilter(I.GAMMA0 * 1.0 * (ew - ee)), atol=1e-12)   # 两支只差 1·M[ω_enc − ω_meas]
+    assert np.array_equal(cand("j", 1.0), cand("j", 0.5))                 # 只关节支不受这个权重影响

@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""路线 1：不训练前向动态 G 的迭代学习补正（方案 reports/PLAN_route_compare.md v0.6 §2、§4、§5）。
+"""路线 1：不训练前向动态 G 的迭代学习补正（方案 reports/PLAN_route_compare.md v0.9 §2、§4、§5、§10、§11）。
 
-  run      按事先排定的顺序跑完一个会话：Shift 基准 → 共同关节阶段 → 两支（只关节 / 加 IMU）→ 最终评价，共 68 遍（标定另做）。
+  run      按事先排定的顺序跑完一个会话：Shift 基准 → 共同关节阶段 → 两支（只关节 / 加 IMU）→ 最终评价，共 68 遍（v0.8 加对照为 76 遍，v0.9 只评三个条件为 60 遍；标定另做）。
            每遍之后按 §2.5 判定，并由已接受补正的回放误差生成下一个候选；中断后重新运行，从已有回放记录重建状态接着跑。
-  analyze  最终评价：同序列同轮配对、按序列汇总、分层自助法置信区间、四组判定；诊断（纯时间平移分量、经验滞后、迭代曲线）。
+  analyze  最终评价：同序列同轮配对、按序列汇总、分层自助法置信区间、四组判定（v0.8 另加只关节支 vs 对照、对照 vs Shift；
+           v0.9 为只关节支 / 加 IMU 支 vs Shift、加 IMU 支 vs 只关节支；两者都附分频带报告）；诊断（纯时间平移分量、经验滞后、迭代曲线）。
+
+规则版本记在会话目录的 session.json：v0.9（新会话）= v0.8 + 加 IMU 支里 IMU 独有部分 M[ω_enc − ω_meas] 的权重 ½ → 1；
+v0.8 = v0.7 的更新规则 + 窗过渡 0.5 s + 最终评价加同会话对照（v0.7 只关节支的最终补正）；
+v0.7 只关节支 ē = ½ē_q + ½M[ω* − ω_enc]、窗过渡 0.25 s；没有该字段的旧会话按 v0.6（ē = ½ē_q）重建。
 
 用法（lerobot 环境；会话开始前先做当天的 IMU 标定：sim/imu_calib.py replay、fit）：
     python -u sim/ilc_route1.py run --dry-run     # 不连机械臂：只对下一遍要发的序列做回放管线的安全检查
     python -u sim/ilc_route1.py run               # 真机；中断后重新运行即接着跑
     python -u sim/ilc_route1.py analyze
+    python -u sim/ilc_route1.py --out outputs/ilc_route1 analyze      # 重跑 10-19 那一轮（v0.6）
+    python -u sim/ilc_route1.py --out outputs/ilc_route1_v2 analyze   # 重跑 10-21 那一轮（v0.7）
+    python -u sim/ilc_route1.py --out outputs/ilc_route1_v3 analyze   # 重跑 10-22 那一轮（v0.8）
 """
 from __future__ import annotations
 
@@ -31,7 +39,10 @@ import repeat_reversal as RR  # noqa: E402  接触标记、回放子进程、「
 import shift_replay as S  # noqa: E402  零阶保持、线性插值渲染、指标、带保护的回放
 from step4_gvnext import data as D  # noqa: E402  低通、采样率
 
-OUT = HERE.parent / "outputs/ilc_route1"
+OUT = HERE.parent / "outputs/ilc_route1_v4"        # 会话目录（--out 改）
+RULE = "v0.9"                                      # 新会话写进 session.json 的规则版本
+QC_NEW = 2.5                                       # v0.9 起新会话的朝向停机门槛（°，写进 session.json；方案 §11）
+COMPARATOR = HERE.parent / "outputs/ilc_route1_v2"  # v0.8 的同会话对照：v0.7 只关节支的最终补正（0.25 s 窗）
 SR = HERE.parent / "outputs/shift_replay"          # 原始指令与提前 60 ms 的序列
 CALIB = HERE.parent / "outputs/imu_calib/imu_calib.json"
 SEQS = ("A", "B")
@@ -40,6 +51,8 @@ F_Q, BAND_W, TAPER = 5.0, (0.5, 5.0), 5            # Hz：Q 与关节项低通�
 BUDGET = {"b": 2, "c": 4, "j": 6, "i": 6}           # 每条序列的回放上限（§4）
 N_EVAL, EVAL = 4, ("shift", "bp", "j", "i")
 MARGIN = max(S.CONDS.values()) + 0.05              # 非接触段末尾留白，同 Shift 回放分析
+BAND_KEYS = ("ee_05_5", "ee_5_15", "ee_5_15_zone", "joint_05_5", "joint_5_10")
+BAND_NAMES = dict(zip(BAND_KEYS, ("末端 0.5–5 Hz", "末端 5–15 Hz", "末端 5–15 Hz（窗过渡区）", "关节 0.5–5 Hz", "关节 5–10 Hz")))
 HARD_SLACK = 0.035                                 # rad：回放管线的硬界 = 模型限位 ± 2°（同 replay_probe.safety_checks 的 mlo2 / mhi2）
 BOUND_MARGIN = np.radians(0.2)                     # Shift + Δ 离硬界至少 0.2°
 
@@ -121,30 +134,40 @@ def ang_to_joint(t, eps, J):
     return dq - D.lp(dq, BAND_W[0], D.FS_I)
 
 
-def imu_err(ep, a6, marked, calib, model, sid):
-    """ē_ω（帧 × 5，rad）：e_ω = 目标（原始指令运动学渲染）− 实测陀螺，疑似接触帧置 0 → 带通 0.5–5 Hz、转到安装点坐标
-    → 原始指令位形下的雅可比逆 → 积分、高通 → 取 t_send[k] + τ + d（IMU 记下的是 d 秒前的运动）。"""
+def ang_err(ep, e, a6, marked, calib, model, sid):
+    """M[e]（帧 × 5，rad）：末端角速度误差 e（IMU 坐标、IMU 时刻）→ 疑似接触帧置 0 → 带通 0.5–5 Hz、转到安装点坐标
+    → 原始指令位形下的雅可比逆 → 积分、高通 → 取 t_send[k] + τ + d（IMU 记下的是 d 秒前的运动）。
+    雅可比、滤波、掩码、时间轴都只由指令、标定和时间戳决定，所以对 e 是线性的：M[x] − M[y] = M[x − y]。"""
     ts, ti, d = ep["t_send"], ep["ti"], calib["delay_s"]
-    e = S.raw_gyro(ep, a6, calib, model, sid) - ep["imu"][:, 3:]
+    e = np.array(e, float)
     e[marked[frame_of(ts, ti - d)]] = 0.0
     eps = (D.lp(e, BAND_W[1], D.FS_I) - D.lp(e, BAND_W[0], D.FS_I)) @ np.asarray(calib["R"])   # 逐行 Rᵀ·e
     J = jacobians(model, sid, S.LinCmd(ts, a6)(ti - d)[:, :6])
     return sample(ti, ang_to_joint(ti, eps, J), ts + TAU + d)
 
 
+def enc_gyro(ep, calib, model, sid):
+    """编码器刚体运动学预测的陀螺读数，和实测同一坐标、同一物理时刻、同一标定约定（R·ω_site(t − d) + 零偏，取在 IMU 时刻）：
+    编码器 200 Hz 先零相位 30 Hz 低通（抗混叠）再样条求导，同 beyond_joint.predict_on_grid。只读编码器和时间戳，不读 IMU 读数。"""
+    import beyond_joint as BJ
+    return BJ.at(ep, BJ.predict_on_grid(ep, calib, model, sid)[1], calib["delay_s"])
+
+
 # ── 一支的迭代（§2.4–2.6）────────────────────────────────────────────────
 def mean_res(rs):
-    """几遍回放结果 [(指标, (ē_q, ē_ω))] 的平均：指标逐项平均，误差逐帧平均。"""
+    """几遍回放结果 [(指标, (ē_q, ē_ω, ē_enc))] 的平均：指标逐项平均，误差逐帧平均。"""
     return ({k: float(np.mean([r[0][k] for r in rs])) for k in rs[0][0]},
-            tuple(np.mean([r[1][i] for r in rs], 0) for i in range(2)))
+            tuple(np.mean([r[1][i] for r in rs], 0) for i in range(len(rs[0][1]))))
 
 
 class Learner:
     """一条序列上的一支：c 共同关节阶段、j 只关节支、i 加 IMU 支。acc / err / met = 已接受的补正及其回放误差、指标
-    （经确认的取两遍平均）；base = 护栏与归一化的基准（c：两遍 Shift 基准；j、i：分叉点）。"""
+    （经确认的取两遍平均）；err = (ē_q, ē_ω = M[ω* − ω_meas], ē_enc = M[ω* − ω_enc])；base = 护栏与归一化的基准
+    （c：两遍 Shift 基准；j、i：分叉点）。enc = True（v0.7）时只关节支也带编码器预测的末端项，两支的更新只差「实测 IMU vs 编码器预测」。
+    wr = 加 IMU 支里 IMU 独有部分 M[ω_enc − ω_meas] = ē_ω − ē_enc 的权重（v0.6–v0.8 为 ½，v0.9 为 1）。"""
 
-    def __init__(self, kind, budget, acc, err, met, box, rids):
-        self.kind, self.left, self.box = kind, budget, box   # box = (W, lo, hi)：窗与 Δ 的逐帧上下限
+    def __init__(self, kind, budget, acc, err, met, box, rids, enc=False, wr=0.5):
+        self.kind, self.left, self.box, self.enc, self.wr = kind, budget, box, enc, wr   # box = (W, lo, hi)：窗与 Δ 的逐帧上下限
         self.base = (met["joint_raw"], met["ee_raw"])
         self.acc, self.err, self.met = acc, err, met
         self.gamma, self.c, self.noimp, self.probing = GAMMA0, 1.0, 0, False
@@ -158,8 +181,13 @@ class Learner:
         return m["joint_raw"] <= GUARD * self.base[0] and (self.kind != "i" or m["ee_raw"] <= GUARD * self.base[1])
 
     def cand(self, sign, label):
-        eq, ew = self.err
-        e = eq if self.kind == "c" else 0.5 * eq if self.kind == "j" else 0.5 * eq + sign * self.c * 0.5 * ew
+        eq, ew, ee = self.err
+        if self.kind == "c":
+            e = eq
+        elif self.kind == "j":
+            e = 0.5 * eq + (0.5 * ee if self.enc else 0.0)
+        else:
+            e = 0.5 * eq + sign * self.c * (0.5 * ew + (self.wr - 0.5) * (ew - ee))   # wr = ½ 时逐位等于旧式 ½ē_ω
         return {"label": label, "delta": step(self.acc, e, self.gamma, *self.box), "res": [], "rids": [], "confirm": False}
 
     def next(self):
@@ -203,7 +231,7 @@ class Learner:
                 self.noimp += 1
                 msg = f"退回，γ → {self.gamma:g}"
             else:
-                better = self.J(m) < self.J(self.met)
+                better = self.kind != "i" or self.J(m) < self.J(self.met)    # 「没有改善」只在加 IMU 支用；其余不看末端
                 self.acc, self.err, self.met = c["delta"], e, m
                 self.hist.append((c["rids"], c["delta"]))
                 self.noimp = 0 if better else self.noimp + 1
@@ -225,21 +253,57 @@ class Learner:
 
 
 # ── 会话 ─────────────────────────────────────────────────────────────────
-def schedule():
-    """[(序列, 环节, 第几遍)]，共 68 遍：Shift 基准 2、共同关节阶段 4、两支各 6（交错，各占一半先手）、最终评价 16（拉丁方）。"""
+def rule_params(rule):
+    """规则版本 → (只关节支是否带编码器末端项, 窗的过渡帧数, 最终评价的条件, IMU 独有部分的权重)。旧会话照原样重建。
+    v0.8 只改窗（0.25 s → 0.5 s），并在最终评价里加同会话对照 j07（v0.7 只关节支的最终补正当天重放）。
+    v0.9 只把加 IMU 支里 IMU 独有部分的权重 ½ → 1（窗同 v0.8），最终评价只放 Shift、只关节支、加 IMU 支。"""
+    if rule == "v0.9":
+        return True, 10, ("shift", "j", "i"), 1.0
+    return rule in ("v0.7", "v0.8"), (10 if rule == "v0.8" else TAPER), (EVAL + ("j07",) if rule == "v0.8" else EVAL), 0.5
+
+
+def schedule(evals=EVAL):
+    """[(序列, 环节, 第几遍)]：Shift 基准 2、共同关节阶段 4、两支各 6（交错，各占一半先手）、最终评价 len(evals) × 4 轮
+    （按轮轮换；4 个条件时为拉丁方，共 68 遍；v0.8 的 5 个条件每个条件 4 轮占 4 个不同位置，共 76 遍）。"""
     out = [(s, "b", n) for n in range(1, BUDGET["b"] + 1) for s in SEQS]
     out += [(s, "c", n) for n in range(1, BUDGET["c"] + 1) for s in SEQS]
     for n in range(1, BUDGET["j"] + 1):
         first, second = ("j", "i") if n % 2 else ("i", "j")
         out += [("A", first, n), ("B", second, n), ("A", second, n), ("B", first, n)]
-    out += [(s, "e_" + EVAL[(i + r) % len(EVAL)], r + 1) for r in range(N_EVAL) for s in SEQS for i in range(len(EVAL))]
+    out += [(s, "e_" + evals[(i + r) % len(evals)], r + 1) for r in range(N_EVAL) for s in SEQS for i in range(len(evals))]
     return out
+
+
+def comparator(s):
+    """v0.8 的同会话对照：v0.7 会话只关节支最终补正发出的指令（4 轮评价用的是同一份）→ (cmd7, 指令哈希)。
+    记下的哈希与按文件内容重算的哈希，4 轮全部一致才用（防文件被改动或损坏）。"""
+    hs, cmd = set(), None
+    for r in range(1, N_EVAL + 1):
+        z = np.load(COMPARATOR / f"seq_{s}_e_j{r:02d}.npz")
+        cmd = z["cmd7"]
+        hs |= {json.loads(str(z["source"]))["cmd_hash"], hashlib.sha256(np.ascontiguousarray(cmd, np.float32).tobytes()).hexdigest()[:16]}
+    if len(hs) != 1:
+        raise SystemExit(f"⛔ 对照来源 {COMPARATOR} 里序列 {s} 的四轮指令不一致，或与记下的哈希不符")
+    return cmd, hs.pop()
 
 
 def bounds(s6, lo_hard, hi_hard):
     """Δ 的逐帧上下限（帧 × 5）：±15 mrad，且 Shift + Δ 离管线硬界至少 0.2°。"""
     return (np.maximum(-CLIP, (lo_hard + BOUND_MARGIN - s6)[:, T.ACTIVE]),
             np.minimum(CLIP, (hi_hard - BOUND_MARGIN - s6)[:, T.ACTIVE]))
+
+
+def calib_path():
+    """本会话用的标定文件：会话目录里记了标定哈希，就在 outputs/imu_calib/imu_calib*.json（含备份）里按哈希找那一份；
+    新会话（还没有 session.json）用当前的 imu_calib.json。找不到就停。"""
+    sess = OUT / "session.json"
+    if not sess.exists():
+        return CALIB
+    want = json.loads(sess.read_text())["calib_sha"]
+    for p in sorted(CALIB.parent.glob("imu_calib*.json")):
+        if hashlib.sha256(p.read_bytes()).hexdigest()[:16] == want:
+            return p
+    raise SystemExit(f"⛔ {CALIB.parent} 里没有本会话用的标定（哈希 {want}）")
 
 
 class Ctx:
@@ -251,10 +315,15 @@ class Ctx:
         from ideal_imu_kinematic import MODEL_PATH
         self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
         self.sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "ee_imu_site")
-        self.calib = json.loads(CALIB.read_text())
+        self.calib = json.loads(calib_path().read_text())
+        sess = OUT / "session.json"                  # 规则版本：旧会话没有这个字段 = v0.6
+        meta = json.loads(sess.read_text()) if sess.exists() else {}
+        self.rule = meta.get("rule", "v0.6") if sess.exists() else RULE
+        self.enc, self.taper, self.evals, self.wr = rule_params(self.rule)
+        self.qc_max = meta.get("qc_max", QC_MAX) if sess.exists() else QC_NEW   # 朝向停机门槛：以 session.json 为准；新会话 = QC_NEW
         center = T.target_center("pickcube_raw", self.model)
         lo_m, hi_m = self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1]
-        self.seq = {}
+        self.seq, self.comparator = {}, {}
         for s in SEQS:
             a7 = np.load(SR / f"seq_{s}_base.npz")["cmd7"].astype(float)
             s7 = np.load(SR / f"seq_{s}_d60.npz")["cmd7"]
@@ -263,14 +332,24 @@ class Ctx:
             lo, hi = bounds(s7[:, :6].astype(float), lo_m - HARD_SLACK, hi_m + HARD_SLACK)
             if np.any(lo > 0) or np.any(hi < 0):
                 raise SystemExit(f"⛔ 序列 {s} 的 Shift 指令离管线硬界不足 0.2°：Δ = 0 都不满足限制")
-            self.seq[s] = {"a7": a7, "s7": s7, "marked": marked, "sat": sat, "box": (window(frozen(marked, sat)), lo, hi)}
+            zero = frozen(marked, sat)
+            zone = np.any([(w > 0) & (w < 1) for w in (window(zero, 5), window(zero, 10))], axis=(0, 2))   # 两种窗的过渡区（帧）
+            self.seq[s] = {"a7": a7, "s7": s7, "marked": marked, "sat": sat, "zone": zone, "box": (window(zero, self.taper), lo, hi)}
+            if "j07" in self.evals:
+                self.seq[s]["j07"], self.comparator[s] = comparator(s)
+                if meta.get("comparator", {}).get(s, self.comparator[s]) != self.comparator[s]:
+                    raise SystemExit(f"⛔ 序列 {s} 的对照指令和本会话开始时记下的不同")
 
 
-def write_seq(rid, s7, delta, label):
-    """发出的指令 = 提前 60 ms 的指令 + Δ（5 个活动关节，float32）。这一遍已开始过时，核对重建出的是同一份（不同就停）。
+def write_seq(rid, s7, delta, label, cmd7=None):
+    """发出的指令 = 提前 60 ms 的指令 + Δ（5 个活动关节，float32）；给定 cmd7（同会话对照）时直接用它，逐字节不变。
+    这一遍已开始过时，核对重建出的是同一份（不同就停）。
     单帧跳变按回放管线同一公式检查（Δ 写在序列里，管线自己的这项检查拿序列和它自己比，起不到作用）：以 Shift 为裸序列。"""
-    cmd7 = s7.copy()
-    cmd7[:, T.ACTIVE] += delta.astype(np.float32)
+    if cmd7 is None:
+        cmd7 = s7.copy()
+        cmd7[:, T.ACTIVE] += delta.astype(np.float32)
+    else:
+        cmd7 = np.array(cmd7, np.float32)
     jump, base = (np.abs(np.diff(x[:, :6].astype(float), axis=0)).max() for x in (cmd7, s7))
     if not jump < base * 1.5 + 0.006:
         raise SystemExit(f"⛔ {rid}：单帧跳变 {jump * 1e3:.1f} mrad 超过 Shift 的 1.5 倍 + 6 mrad（{base * 1e3:.1f} mrad）")
@@ -296,12 +375,30 @@ def orientation_deg(ep, calib):
     return float(C._deg(C._kabsch(wi[mv], g[mv]) @ np.asarray(calib["R"]).T))
 
 
+def band_metrics(ep, a6, target, fq, fi, zone, calib):
+    """分频带的残差（原始指令一族，非接触段）：末端角速度偏差 0.5–5、5–15 Hz（rad/s），以及落在窗过渡区（两种窗取并集）的 5–15 Hz；
+    关节偏差 0.5–5、5–10 Hz（mrad）。零相位巴特沃斯带通 = 两个低通之差。"""
+    def bp(x, lo, hi, fs):
+        return D.lp(x, hi, fs) - D.lp(x, lo, fs)
+
+    ew = ep["imu"][:, 3:] - target
+    eq = (S.zoh(ep["t_send"], a6, ep["tq"]) - ep["q"])[:, T.ACTIVE]
+    rms3 = lambda x, m: float(np.sqrt(np.mean(np.sum(x[m] ** 2, 1)))) if m.any() else float("nan")   # noqa: E731
+    zi = fi & zone[frame_of(ep["t_send"], ep["ti"] - calib["delay_s"])]
+    hf = bp(ew, 5, 15, D.FS_I)
+    return {"ee_05_5": rms3(bp(ew, 0.5, 5, D.FS_I), fi), "ee_5_15": rms3(hf, fi), "ee_5_15_zone": rms3(hf, zi),
+            "joint_05_5": float(np.sqrt(np.mean(bp(eq, 0.5, 5, D.FS_Q)[fq] ** 2))) * 1e3,
+            "joint_5_10": float(np.sqrt(np.mean(bp(eq, 5, 10, D.FS_Q)[fq] ** 2))) * 1e3}
+
+
 def result(rid, ctx, s):
-    """一遍回放 → (指标, (ē_q, ē_ω), 朝向偏差°)，缓存在 res_{rid}.npz；无效遍（提前终止、哈希或帧数不符、没有编码器）返回 None。"""
+    """一遍回放 → (指标, (ē_q, ē_ω, ē_enc), 朝向偏差°)，缓存在 res_{rid}.npz；无效遍（提前终止、哈希或帧数不符、没有编码器）返回 None。
+    ē_ω = M[ω* − ω_meas]、ē_enc = M[ω* − ω_enc] 用同一个目标 ω*（原始指令运动学渲染）和同一个 M。v0.6 的旧缓存没有 ē_enc（那一版用不到），补 0。"""
     cache = OUT / f"res_{rid}.npz"
     if cache.exists():
         z = np.load(cache)
-        return json.loads(str(z["met"])), (z["eq"], z["ew"]), float(z["qc"])
+        ee = z["ee"] if "ee" in z.files else np.zeros_like(z["ew"])
+        return json.loads(str(z["met"])), (z["eq"], z["ew"], ee), float(z["qc"])
     h = json.loads((OUT / f"replay_{rid}_r1.json").read_text())
     z = np.load(OUT / f"seq_{rid}.npz")
     if not (h.get("stopped") is None and h.get("cmd_hash") == json.loads(str(z["source"]))["cmd_hash"]
@@ -311,13 +408,16 @@ def result(rid, ctx, s):
     q, a6 = ctx.seq[s], ctx.seq[s]["a7"][:, :6]
     fq, fi = S.masks(ep, q["marked"], MARGIN)
     met = S.metrics(ep, a6, fq, fi, ctx.calib, ctx.model, ctx.sid)
-    err = (joint_err(ep, a6, q["marked"]), imu_err(ep, a6, q["marked"], ctx.calib, ctx.model, ctx.sid))
+    target = S.raw_gyro(ep, a6, ctx.calib, ctx.model, ctx.sid)               # ω*：两项共用
+    met.update(band_metrics(ep, a6, target, fq, fi, q["zone"], ctx.calib))  # v0.8 的分频带量（只报告）
+    M = lambda x: ang_err(ep, x, a6, q["marked"], ctx.calib, ctx.model, ctx.sid)   # noqa: E731
+    err = (joint_err(ep, a6, q["marked"]), M(target - ep["imu"][:, 3:]), M(target - enc_gyro(ep, ctx.calib, ctx.model, ctx.sid)))
     qc = orientation_deg(ep, ctx.calib)
-    np.savez(cache, met=json.dumps(met), eq=err[0], ew=err[1], qc=qc)
+    np.savez(cache, met=json.dumps(met), eq=err[0], ew=err[1], ee=err[2], qc=qc)
     return met, err, qc
 
 
-def learner(st, lk, box):
+def learner(st, lk, box, enc, wr):
     """需要时建这一环节的学习器：共同关节阶段从两遍 Shift 基准出发（Δ = 0）；两支从分叉点（共同阶段最后接受的补正）出发。"""
     if lk == "b" or lk.startswith("e_"):
         return None
@@ -326,10 +426,10 @@ def learner(st, lk, box):
             if not st["b"]:
                 raise SystemExit("⛔ 没有有效的 Shift 基准回放，不能开始共同关节阶段")
             m, e = mean_res([r for _, r in st["b"]])
-            st["c"] = Learner("c", BUDGET["c"], np.zeros_like(e[0]), e, m, box, [rid for rid, _ in st["b"]])
+            st["c"] = Learner("c", BUDGET["c"], np.zeros_like(e[0]), e, m, box, [rid for rid, _ in st["b"]], enc, wr)
         else:
             c = st["c"]
-            st[lk] = Learner(lk, BUDGET[lk], c.acc, c.err, c.met, box, c.hist[-1][0])
+            st[lk] = Learner(lk, BUDGET[lk], c.acc, c.err, c.met, box, c.hist[-1][0], enc, wr)
     return st[lk]
 
 
@@ -345,13 +445,16 @@ def walk(ctx, execute=None):
     它返回 True 表示跑完了、接着往下，返回整数则以此为退出码停下。
     返回 (各序列状态, 退出码)。状态：b = [(rid, 结果)]、e = {(轮, 条件): 指标}、trace = [(序号, 环节, 指标)]、c / j / i = Learner。"""
     st = {s: {"b": [], "e": {}, "trace": []} for s in SEQS}
-    plan = schedule()
+    plan = schedule(ctx.evals)
     for k, (s, lk, n) in enumerate(plan, 1):
         rid, q = f"{s}_{lk}{n:02d}", ctx.seq[s]
-        L = learner(st[s], lk, q["box"])
+        L = learner(st[s], lk, q["box"], ctx.enc, ctx.wr)
         cand = L.next() if L else None
         label = cand["label"] if cand else ("Shift 基准" if lk == "b" else f"评价 {lk[2:]}")
-        seq = write_seq(rid, q["s7"], cand["delta"] if cand else fixed(st[s], lk, len(q["s7"])), label)
+        if lk == "e_j07":                             # 同会话对照：v0.7 只关节支最终补正发出的指令，原样重放
+            seq = write_seq(rid, q["s7"], None, label, cmd7=q["j07"])
+        else:
+            seq = write_seq(rid, q["s7"], cand["delta"] if cand else fixed(st[s], lk, len(q["s7"])), label)
         if not RR.attempted(rid, 1, OUT):
             if execute is None:
                 return st, 0
@@ -363,8 +466,8 @@ def walk(ctx, execute=None):
             msg = "无效的一遍（提前终止或记录不全）：占预算、不补跑"
             if L:
                 L.void()
-        elif res[2] > QC_MAX:
-            print(f"⛔ {rid}：IMU 朝向偏差 {res[2]:.1f}° > {QC_MAX}°，IMU 可能被碰动；停下重新标定，本会话不能接着用")
+        elif res[2] > ctx.qc_max:
+            print(f"⛔ {rid}：IMU 朝向偏差 {res[2]:.1f}° > {ctx.qc_max}°：停下检查（方案 §1）——先做标定核对，确认 IMU 有没有动，再定本会话能否接着用")
             return st, 3
         else:
             st[s]["trace"].append((k, lk, res[0]))
@@ -402,14 +505,15 @@ def cmd_run(dry_run, one=None):
         _, rc = walk(ctx, lambda k, n, rid, seq, _L: print(f"下一遍：[{k}/{n}] {rid}") or RP.run("r1", True, seqfile=str(seq), tag=f"{rid}_", outdir=OUT))
         return rc
     if not sess.exists():
-        sess.write_text(json.dumps({"calib_sha": sha, "plan": "reports/PLAN_route_compare.md v0.6"}))
+        sess.write_text(json.dumps({"calib_sha": sha, "plan": f"reports/PLAN_route_compare.md {RULE}", "rule": RULE, "qc_max": QC_NEW,
+                                    **({"comparator": ctx.comparator, "comparator_source": str(COMPARATOR)} if ctx.comparator else {})}))
     rp_sha = hashlib.sha256((HERE / "replay_probe.py").read_bytes()).hexdigest()
 
     def execute(k, n, rid, seq, _L):
         if input(f"\n[{k}/{n}] {rid}：桌面已清空、可以运动就按回车（输入 q 退出）").strip().lower() == "q":
             return 0
         utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        code = RR.run_child([sys.executable, "-u", __file__, "run", "--one", str(seq), rid])
+        code = RR.run_child([sys.executable, "-u", __file__, "--out", str(OUT), "run", "--one", str(seq), rid])
         with open(OUT / "run_log.jsonl", "a") as f:
             f.write(json.dumps({"k": k, "rid": rid, "utc": utc, "code": code, "replay_probe_sha256": rp_sha}) + "\n")
         if code:
@@ -418,8 +522,9 @@ def cmd_run(dry_run, one=None):
         return True
 
     _, rc = walk(ctx, execute)
-    if rc == 0 and all(RR.attempted(f"{s}_{lk}{n:02d}", 1, OUT) for s, lk, n in schedule()):
-        print("68 遍都已开始过。下一步：python -u sim/ilc_route1.py analyze")
+    plan = schedule(ctx.evals)
+    if rc == 0 and all(RR.attempted(f"{s}_{lk}{n:02d}", 1, OUT) for s, lk, n in plan):
+        print(f"{len(plan)} 遍都已开始过。下一步：python -u sim/ilc_route1.py analyze")
     return rc
 
 
@@ -519,6 +624,7 @@ def plot_compare(st, ctx):
     plt.rcParams.update({"font.family": "Noto Sans CJK JP", "font.size": 9, "axes.edgecolor": T.MUTED,
                          "xtick.color": T.MUTED, "ytick.color": T.MUTED})
     conds = (("shift", "Shift（提前 60 ms）", T.MUTED, "-"), ("j", "ILC 只关节支", T.BLUE, "-"), ("i", "ILC 加 IMU 支", T.ORANGE, "--"))
+    conds += (("j07", "v0.7 只关节支（0.25 s 窗）", T.INK, ":"),) if "j07" in ctx.evals else ()
     keys = {"joint_raw": D.FS_Q, "joint_ideal": D.FS_Q, "ee_raw": D.FS_I, "ee_ideal": D.FS_I}
     curves = {}
     for s in SEQS:
@@ -569,15 +675,23 @@ def plot_compare(st, ctx):
 
 def cmd_analyze():
     sess = json.loads((OUT / "session.json").read_text())
-    if sess["calib_sha"] != hashlib.sha256(CALIB.read_bytes()).hexdigest()[:16]:
-        print("⛔ 当前标定文件不是本会话用的那一份")
-        return 2
+    print(f"标定：{calib_path().name}（会话记录的哈希 {sess['calib_sha']}）")
+    if sess.get("deviation"):
+        print(f"偏离记录：{sess['deviation']}")
     ctx = Ctx()
     st, _ = walk(ctx)
     keys = ("joint_raw", "ee_raw", "path", "speed")
     names = {"joint_raw": "关节偏差", "ee_raw": "末端角速度偏差", "path": "护栏：关节路径长度", "speed": "护栏：关节速度 RMS"}
     e = {s: st[s]["e"] for s in SEQS}
-    res = {f"{x} vs {y}": compare(e, x, y) for x, y in (("bp", "shift"), ("j", "shift"), ("i", "shift"), ("i", "j"))}
+    pairs = [(x, "shift") for x in ("bp", "j", "i") if x in ctx.evals] + [("i", "j")] + ([("j", "j07"), ("j07", "shift")] if "j07" in ctx.evals else [])
+    res = {f"{x} vs {y}": compare(e, x, y) for x, y in pairs}
+    bands = {}
+    band_pairs = {"v0.8": (("j", "j07"), ("j", "shift"), ("j07", "shift"), ("i", "shift")),   # v0.8：窗的影响（主问题 = 只关节支 vs j07 的末端 5–15 Hz）
+                  "v0.9": (("i", "j"), ("j", "shift"), ("i", "shift"))}.get(ctx.rule, ())    # 分频带都只报告
+    for x, y in band_pairs:
+        rounds = [n for n in range(1, N_EVAL + 1) if all((n, x) in e[s] and (n, y) in e[s] for s in e)]
+        bands[f"{x} vs {y}"] = {k: hier({s: [(e[s][(n, x)][k] - e[s][(n, y)][k]) / e[s][(n, y)][k] * 100 for n in rounds] for s in e})
+                                for k in BAND_KEYS} if rounds else None
     diag = {}
     for s in SEQS:
         W, a6 = ctx.seq[s]["box"][0], ctx.seq[s]["a7"][:, :6]
@@ -586,8 +700,12 @@ def cmd_analyze():
                    "empirical_lag_ms": empirical_lag_ms(hist, W),
                    "final": {lk: {"gamma": st[s][lk].gamma, "c": st[s][lk].c, "probing": st[s][lk].probing,
                                   "accepted": len(st[s][lk].hist) - 1} for lk in ("c", "j", "i") if lk in st[s]}}
-    (OUT / "summary.json").write_text(json.dumps({"plan": sess["plan"], "paired": res, "diagnostics": diag}, ensure_ascii=False, indent=1))
-    label = {"bp": "分叉点", "shift": "Shift", "j": "只关节支", "i": "加 IMU 支"}
+    (OUT / "summary.json").write_text(json.dumps({"plan": sess["plan"], "deviation": sess.get("deviation"), "paired": res, "bands": bands, "diagnostics": diag}, ensure_ascii=False, indent=1))
+    label = {"bp": "分叉点", "shift": "Shift", "j": "只关节支", "i": "加 IMU 支", "j07": "v0.7 只关节支（0.25 s 窗）"}
+    for comp, r in bands.items():
+        x, y = comp.split(" vs ")
+        print(f"\n··· 分频带（只报告）：{label[x]} vs {label[y]}（相对变化 %：总体 [95% 区间]）")
+        print("  " + "；".join(f"{BAND_NAMES[k]} {v['effect']:+.1f} [{v['ci95'][0]:+.1f}, {v['ci95'][1]:+.1f}]" for k, v in r.items()) if r else "  N/A")
     for comp, r in res.items():
         x, y = comp.split(" vs ")
         print(f"\n=== {label[x]} vs {label[y]}（相对变化 %：总体 = 两条序列中位数的平均 [分层自助法 95% 区间]；逐序列中位）")
@@ -607,14 +725,17 @@ def cmd_analyze():
 
 
 def main(argv=None) -> int:
+    global OUT
     gc.disable()        # mujoco 与 scipy 同进程时 GC 会段错误（见 infra 记录）
     ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=str(OUT), help="会话目录（默认新会话 outputs/ilc_route1_v4）")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="跑会话（加 --dry-run 只检查下一遍要发的序列，不连机械臂）")
     r.add_argument("--dry-run", action="store_true")
     r.add_argument("--one", nargs=2, help=argparse.SUPPRESS)      # 内部用：子进程跑一遍（序列文件, rid）
     sub.add_parser("analyze", help="最终评价的配对比较、四组判定与诊断")
     a = ap.parse_args(argv)
+    OUT = Path(a.out).resolve()
     if a.cmd == "run":
         return cmd_run(a.dry_run, a.one)
     return cmd_analyze()
