@@ -180,7 +180,7 @@ def test_schedule_budget_and_balance():
     assert len(plan) == len(set(plan)) == 68
     cnt = Counter((s, lk) for s, lk, _ in plan)
     for s in I.SEQS:
-        assert all(cnt[(s, lk)] == b for lk, b in I.BUDGET.items())
+        assert all(cnt[(s, lk)] == b for lk, b in I.BUDGET.items() if lk != "h")   # h 支只在 v0.10 的三支排程里
         ev = [(n, lk[2:]) for x, lk, n in plan if x == s and lk.startswith("e_")]
         assert all({c for r, c in ev if r == n} == set(I.EVAL) for n in range(1, I.N_EVAL + 1))
         pos = Counter((c, [cc for r, cc in ev if r == n].index(c)) for n, c in ev)
@@ -451,3 +451,56 @@ def test_v09_weights_only_the_imu_only_part_and_old_weight_is_bytewise():
         assert np.array_equal(cand("i", 0.5, sign), I.step(acc, 0.5 * eq + sign * 0.5 * ew, I.GAMMA0, W, -1.0, 1.0))
     np.testing.assert_allclose(cand("i", 1.0) - cand("j", 1.0), W * I.qfilter(I.GAMMA0 * 1.0 * (ew - ee)), atol=1e-12)   # 两支只差 1·M[ω_enc − ω_meas]
     assert np.array_equal(cand("j", 1.0), cand("j", 0.5))                 # 只关节支不受这个权重影响
+
+
+# ── v0.10：两条开 CUDA graph 后的评测指令，三支 0 / ½ / 1（方案 §12）───────────────────
+def test_v010_rule_params_three_branch_schedule_and_old_schedule_unchanged():
+    assert I.rule_params("v0.10") == (True, 10, ("shift", "j", "h", "i"), 1.0)
+    evals = ("shift", "j", "h", "i")
+    plan = I.schedule(evals)
+    assert len(plan) == len(set(plan)) == 80                               # 4 + 8 + 3 支 × 6 × 2 + 4 条件 × 4 轮 × 2
+    for s in I.SEQS:
+        br = [(lk, n) for x, lk, n in plan if x == s and lk in ("j", "h", "i")]
+        assert Counter(lk for lk, _ in br) == {"j": 6, "h": 6, "i": 6}
+        pos = Counter((lk, [l for l, m in br if m == n].index(lk)) for lk, n in br)
+        assert set(pos.values()) == {2}                                    # 6 遍里每支在每个先后位置各 2 次
+        ev = [(n, lk[2:]) for x, lk, n in plan if x == s and lk.startswith("e_")]
+        assert all({c for r, c in ev if r == n} == set(evals) for n in range(1, I.N_EVAL + 1))
+    old = [(s, "b", n) for n in (1, 2) for s in I.SEQS] + [(s, "c", n) for n in range(1, 5) for s in I.SEQS]
+    for n in range(1, 7):
+        f, g = ("j", "i") if n % 2 else ("i", "j")
+        old += [("A", f, n), ("B", g, n), ("A", g, n), ("B", f, n)]
+    assert I.schedule(I.EVAL)[:len(old)] == old and I.schedule(("shift", "j", "i"))[:len(old)] == old   # 两支的老排程不变
+
+
+def test_v010_half_branch_equals_old_imu_branch_and_follows_imu_rules():
+    n, rng = 100, np.random.default_rng(10)
+    acc, eq, ee, ew = (rng.normal(0, s, (n, 5)) for s in (0.001, 0.002, 0.002, 0.002))
+    W = np.ones((n, 5))
+    bx = (W, -1.0, 1.0)
+    st = {"c": I.Learner("c", 4, acc, (eq, ew, ee), met(10, 0.05), bx, ["c4"], True, 1.0)}
+    h, i, j = (I.learner(st, lk, bx, True, 1.0) for lk in ("h", "i", "j"))
+    assert (h.wr, i.wr) == (0.5, 1.0)                                       # h 固定 ½，i 取规则版本给的权重
+    for sign in (1, -1):                                                   # h = v0.7 / v0.8 的加 IMU 支（逐位）
+        assert np.array_equal(h.cand(sign, "x")["delta"], I.step(acc, 0.5 * eq + sign * 0.5 * ew, I.GAMMA0, W, -1.0, 1.0))
+    assert not h.ok(met(10, 0.05 * 1.06)) and j.ok(met(10, 0.05 * 1.06))   # 末端护栏对 h 生效，只关节支不看末端
+    for _ in range(2):                                                     # 两次「接受但目标值没有下降」→ h 也转入试探
+        c = h.next()
+        c["rids"].append("x")
+        h.add(c, met(10, 0.05), (eq, ew, ee))
+    assert h.probing
+
+
+def test_v010_sequences_are_episode_command_and_60ms_shift(monkeypatch, tmp_path):
+    cmd7 = np.cumsum(np.random.default_rng(11).normal(0, 0.002, (60, 7)), 0).astype(np.float32)
+    monkeypatch.setattr(I.RR, "episode_cmd", lambda repo, i: cmd7 + np.float32(i * 1e-3))
+    monkeypatch.setattr(I, "SR_V10", tmp_path)
+    assert I.cmd_seq() == 0
+    for s, (repo, i) in I.SRC_V10.items():
+        src = (cmd7 + np.float32(i * 1e-3)).astype(float)
+        b, d = (np.load(tmp_path / f"seq_{s}_{c}.npz")["cmd7"] for c in ("base", "d60"))
+        assert np.array_equal(b, src.astype(np.float32)) and np.array_equal(d, I.S.shifted(src, 0.060))   # 基线 = 原指令；提前 60 ms
+    assert I.cmd_seq() == 0                                                # 再跑：内容相同就跳过
+    monkeypatch.setattr(I.RR, "episode_cmd", lambda repo, i: cmd7 + np.float32(1.0))
+    with pytest.raises(SystemExit):
+        I.cmd_seq()                                                        # 内容变了：不覆盖

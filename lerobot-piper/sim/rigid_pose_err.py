@@ -28,8 +28,8 @@ import shift_replay as S  # noqa: E402
 OUT = HERE.parent / "outputs/rigid_pose_err"
 KEYS = ("pos_raw", "rot_raw", "pos_ideal", "rot_ideal")
 NAMES = {"pos_raw": "位置 相对原始指令", "rot_raw": "姿态 相对原始指令", "pos_ideal": "位置 相对理想渲染", "rot_ideal": "姿态 相对理想渲染"}
-ILC = (("ilc_route1", "10-19 路线 1（v0.6）"), ("ilc_route1_v2", "10-21 v0.7"), ("ilc_route1_v3", "10-22 v0.8"), ("ilc_route1_v4", "v0.9"))
-LABEL = {"shift": "Shift", "bp": "分叉点", "j": "只关节支", "i": "加 IMU 支", "j07": "v0.7 只关节支（0.25 s 窗）"}
+ILC = (("ilc_route1", "10-19 路线 1（v0.6）"), ("ilc_route1_v2", "10-21 v0.7"), ("ilc_route1_v3", "10-22 v0.8"), ("ilc_route1_v4", "10-23 v0.9"), ("ilc_route1_v5", "v0.10"))
+LABEL = {"shift": "Shift", "bp": "分叉点", "j": "只关节支", "h": "加 IMU 支（½）", "i": "加 IMU 支", "j07": "v0.7 只关节支（0.25 s 窗）"}
 
 
 def fk(model, data, sid, q6):
@@ -90,7 +90,8 @@ def ilc_session(name):
             h = json.loads((I.OUT / f"replay_{s}_e_{c}{n:02d}_r1.json").read_text())
             ep = T.from_record(h, np.asarray(h["cmd"], float))
             e[s][(n, c)] = metrics(ep, ctx.seq[s]["a7"][:, :6], S.masks(ep, ctx.seq[s]["marked"], I.MARGIN)[0], ctx.model, data, ctx.sid)
-    pairs = [(x, "shift") for x in ("bp", "j", "i") if x in ctx.evals] + [("i", "j")] + ([("j", "j07"), ("j07", "shift")] if "j07" in ctx.evals else [])
+    pairs = ([(x, "shift") for x in ("bp", "j", "h", "i") if x in ctx.evals] + [(x, "j") for x in ("h", "i") if x in ctx.evals]
+             + ([("i", "h")] if "h" in ctx.evals else []) + ([("j", "j07"), ("j07", "shift")] if "j07" in ctx.evals else []))
     paired = {}
     for x, y in pairs:
         rounds = [n for n in range(1, I.N_EVAL + 1) if all((n, x) in e[s] and (n, y) in e[s] for s in e)]
