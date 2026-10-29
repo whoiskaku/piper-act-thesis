@@ -272,9 +272,15 @@ class OpenCVCamera:
             cv2.setNumThreads(1)
 
         camera_idx = f"/dev/video{self.camera_index}" if platform.system() == "Linux" else self.camera_index
+        # Linux 必须显式走 V4L2 后端(2026-08-04 修)。传 "/dev/videoN" 字符串时 OpenCV 会选
+        # FFMPEG 后端, 而 FFMPEG **忽略** CAP_PROP_FOURCC / CAP_PROP_FPS 的设置 —— 实测
+        # fourcc 读回空、fps 恒等于设备上残留的值。于是能不能拿到 30 fps 取决于该设备上一次
+        # 被谁设成了什么, 表现为"时好时坏"。V4L2 后端才认这些属性。
+        cam_args = ((self.camera_index, cv2.CAP_V4L2) if platform.system() == "Linux"
+                    else (camera_idx,))
         # First create a temporary camera trying to access `camera_index`,
         # and verify it is a valid camera by calling `isOpened`.
-        tmp_camera = cv2.VideoCapture(camera_idx)
+        tmp_camera = cv2.VideoCapture(*cam_args)
         is_camera_open = tmp_camera.isOpened()
         # Release camera to make it accessible for `find_camera_indices`
         tmp_camera.release()
@@ -297,7 +303,16 @@ class OpenCVCamera:
         # Secondly, create the camera that will be used downstream.
         # Note: For some unknown reason, calling `isOpened` blocks the camera which then
         # needs to be re-created.
-        self.camera = cv2.VideoCapture(camera_idx)
+        self.camera = cv2.VideoCapture(*cam_args)
+
+        # FOURCC 必须**先于** fps/宽高设置(2026-08-04 补)。此前从不设 FOURCC, 相机按驱动
+        # 默认打开, 多数 UVC 摄像头默认是未压缩的 YUYV —— 640x480 下 YUYV 只有 5 fps,
+        # 而 MJPG 有 30 fps, 于是 set(CAP_PROP_FPS, 30) 静默失败, 报
+        # "Can't set self.fps=30 ... Actual value is 5.0"。历史上能录到 30 fps 的运行
+        # 必然已经是 MJPG(YUYV 在该分辨率给不出 30), 所以显式指定 MJPG 是**还原原有口径**,
+        # 不改变已采数据的可比性。设不上时不报错, 退回原行为。
+        if platform.system() == "Linux":
+            self.camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
         if self.fps is not None:
             self.camera.set(cv2.CAP_PROP_FPS, self.fps)

@@ -85,6 +85,11 @@ class ACTConfig(PreTrainedConfig):
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
             more information on how ensembling works, please see `ACTTemporalEnsembler`.
+        cuda_graph: Replay the inference forward (normalization, network, unnormalization) as one captured
+            CUDA graph instead of launching its operations one by one from Python: the actions are the same,
+            the call does not wait for the interpreter lock at every operation when other Python threads run.
+            Inference on a CUDA device only, without autocast; training is unaffected. (Ported from
+            ~/ACT_WITH_IMU/lerobot-piper, 2026-10-18.)
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
@@ -127,6 +132,7 @@ class ACTConfig(PreTrainedConfig):
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
+    cuda_graph: bool = False
 
     # Training and loss computation.
     dropout: float = 0.1
@@ -161,6 +167,15 @@ class ACTConfig(PreTrainedConfig):
     history_use_action: bool = True     # include a.seq(T-1) branch
     history_use_imu: bool = True        # include r.IMU(T-1) branch
 
+    # Stage 3a (negative ablation): fine-tune ACT itself with a high-frequency
+    # smoothness penalty on its predicted action chunk. Default OFF — when False
+    # the ACT loss is unchanged. hf_fraction (5Hz, stopgrad denominator) matches
+    # the Stage 3b RefineNet metric so the two are directly comparable.
+    enable_denoise_smooth: bool = False
+    denoise_lambda_hf: float = 0.1
+    denoise_active_joints: tuple[int, ...] | None = (0, 1, 2, 6)  # j1/j2/j3/grip; None=all
+    denoise_hf_cutoff_hz: float = 5.0
+
     # Phase 2 RL fine-tuning: value head for actor-critic.
     # When True, ACT gains a Linear(dim_model → 1) value head on the latent
     # token's encoder output. The value head's gradient is detached from the
@@ -184,6 +199,11 @@ class ACTConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
                 "because the policy needs to be queried every step to compute the ensembled action."
+            )
+        if self.cuda_graph and self.enable_history_input:
+            raise NotImplementedError(
+                "`cuda_graph` only puts the input features into the graph; the history inputs of "
+                "`enable_history_input` are not among them."
             )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(

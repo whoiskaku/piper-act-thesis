@@ -1,0 +1,409 @@
+{
+ "prereg": "PREREG_STEP1_V3.md §5 (判据/口径/matched/安全门 沿用 v2 §5/§6 原样)",
+ "candidate": {
+  "corner": "-++",
+  "a_prox": -2.0,
+  "a_wrist": 2.0,
+  "tau": 10.0
+ },
+ "n_blocks": 30,
+ "n_episodes": 60,
+ "arms": {
+  "A": "裸 ACT (BCORR_MODE=off)",
+  "B": "候选 (-++) (BCORR_MODE=step1_v2)"
+ },
+ "order_rule": "严格逐 block 交替, block1=AB ⇒ 会话1 AB8/BA7, 会话2 AB7/BA8, 全体 AB15/BA15",
+ "matched": "附录 B: 同 block_id / 同初始物体位姿 / 同 reset target / 两臂各关节初始编码器差 ≤0.5°",
+ "blocks": [
+  {
+   "block": 1,
+   "session": 1,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 2,
+   "session": 1,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 3,
+   "session": 1,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 4,
+   "session": 1,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 5,
+   "session": 1,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 6,
+   "session": 1,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 7,
+   "session": 1,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 8,
+   "session": 1,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 9,
+   "session": 1,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 10,
+   "session": 1,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 11,
+   "session": 1,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 12,
+   "session": 1,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 13,
+   "session": 1,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 14,
+   "session": 1,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 15,
+   "session": 1,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 16,
+   "session": 2,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 17,
+   "session": 2,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 18,
+   "session": 2,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 19,
+   "session": 2,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 20,
+   "session": 2,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 21,
+   "session": 2,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 22,
+   "session": 2,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 23,
+   "session": 2,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 24,
+   "session": 2,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 25,
+   "session": 2,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 26,
+   "session": 2,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 27,
+   "session": 2,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 28,
+   "session": 2,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  },
+  {
+   "block": 29,
+   "session": 2,
+   "order": "AB",
+   "episodes": [
+    {
+     "arm": "A"
+    },
+    {
+     "arm": "B"
+    }
+   ]
+  },
+  {
+   "block": 30,
+   "session": 2,
+   "order": "BA",
+   "episodes": [
+    {
+     "arm": "B"
+    },
+    {
+     "arm": "A"
+    }
+   ]
+  }
+ ]
+}

@@ -122,6 +122,7 @@ python lerobot/scripts/control_robot.py \
 """
 
 import logging
+import os
 import time
 from dataclasses import asdict
 from pprint import pformat
@@ -146,6 +147,7 @@ from lerobot.common.robot_devices.control_utils import (
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
     stop_recording,
+    warm_up_policy,
     warmup_record,
 )
 from lerobot.common.robot_devices.robots.utils import Robot, make_robot_from_config
@@ -255,6 +257,67 @@ def record(
 
     # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, cfg.device, ds_meta=dataset.meta)
+    if policy is not None:
+        warm_up_policy(policy)   # 在挂任何 wrapper 之前；第一条的第一帧不再等初始化和 graph 录制
+
+    # Stage 5 RefineNet 部署(默认关,env 门控)。三方 A/B 协议(blend/残差已解耦):
+    #   A 裸 ACT:     不设 REFINE_CKPT(或 REFINE_MODE=off)
+    #   B 纯 blend:   REFINE_CKPT=<ckpt> REFINE_MODE=blend
+    #   C blend+残差: REFINE_CKPT=<ckpt> REFINE_MODE=full   (用 absboth ckpt)
+    # 包装后 .config 仍指向 ACT,故下方 HistoryBuffer 构建不受影响。
+    _refine_ckpt = os.environ.get("REFINE_CKPT")
+    if policy is not None and _refine_ckpt:
+        from lerobot.common.policies.act.refine_deploy import build_refine_deploy_policy
+        _mode = os.environ.get("REFINE_MODE", "full")
+        if os.environ.get("REFINE_ENABLED") == "0":   # 兼容旧开关
+            _mode = "off"
+        policy = build_refine_deploy_policy(policy, _refine_ckpt, cfg.device,
+                                            blend_m=int(os.environ.get("REFINE_BLEND_M", "10")),
+                                            mode=_mode)
+        logging.info(f"RefineNet deploy wrapper active (mode={_mode}, ckpt={_refine_ckpt})")
+
+    # B/Step1 校正模块部署(默认关, env 门控):
+    #   Step1 A 裸 ACT: BCORR_CKPT=<candidate.npz> BCORR_MODE=off   (仅日志)
+    #   Step1 B:       BCORR_CKPT=<candidate.npz> BCORR_MODE=step1_b
+    #   Step1 C:       BCORR_CKPT=<candidate.npz> BCORR_MODE=step1_c
+    # 旧 π/FF 模式仍保留: ff / pi_only / full / record / probe。
+    # 与 RefineNet 互斥(两者都改指令流, 同时开会混淆归因)。
+    _bcorr_ckpt = os.environ.get("BCORR_CKPT")
+    if policy is not None and _bcorr_ckpt:
+        if _refine_ckpt:
+            raise ValueError("BCORR_CKPT 与 REFINE_CKPT 不可同时设置(归因会混淆)")
+        from lerobot.common.policies.act.b_correction_deploy import build_b_correction_policy
+        _bmode = os.environ.get("BCORR_MODE", "full")
+        _calib = os.environ.get("BCORR_CALIB")
+        if not _calib:
+            raise ValueError("BCORR_CALIB 未设置(需 IMU 标定 manifest.json)")
+        policy = build_b_correction_policy(policy, _bcorr_ckpt, cfg.device, _calib,
+                                           mode=_bmode,
+                                           log_path=os.environ.get("BCORR_LOG"),
+                                           ff_lag=os.environ.get("BCORR_FF_LAG"),
+                                           ff_blend=os.environ.get("BCORR_FF_BLEND"),
+                                   probe_seed=os.environ.get("BCORR_PROBE_SEED"),
+                                   probe_mrad=os.environ.get("BCORR_PROBE_MRAD"),
+                                   probe_seeds=os.environ.get("BCORR_PROBE_SEEDS"),
+                                   theta_path=os.environ.get("BCORR_THETA"))
+        logging.info(f"B/Step1 correction wrapper active (mode={_bmode}, artifact={_bcorr_ckpt})")
+
+    # B4 部署包装（默认关，env 门控；方案 reports/PLAN_b4.md）。要求开 TE：
+    #   B4_MODE=raw    原始 ACT，只记录（整段预测、在线 Shift、在线窗……）
+    #   B4_MODE=shift  闭环 Shift：发提前 60 ms 的指令（TE 的部分融合值插值）
+    #   B4_MODE=net    闭环 Shift + 补正网络（B4_NET=<冻结文件 outputs/b4/net/frozen.json>）
+    #   B4_CFG=<在线配置>（默认 outputs/b4/online_cfg.json）
+    # 每集在 high_rate/ 下另存 episode_XXXXXX_b4.npz。与 RefineNet、BCORR 互斥。
+    _b4_mode = os.environ.get("B4_MODE")
+    if policy is not None and _b4_mode:
+        if _refine_ckpt or _bcorr_ckpt:
+            raise ValueError("B4_MODE 与 REFINE_CKPT / BCORR_CKPT 不可同时设置(归因会混淆)")
+        if policy.config.temporal_ensemble_coeff is None:
+            raise ValueError("B4 需要开 TE：--control.policy.temporal_ensemble_coeff=0.01 --control.policy.n_action_steps=1")
+        from lerobot.common.policies.act.b4_deploy import build_b4_policy
+        policy = build_b4_policy(policy, _b4_mode, os.environ.get("B4_CFG", "outputs/b4/online_cfg.json"),
+                                 net_path=os.environ.get("B4_NET"))
+        logging.info(f"B4 deploy wrapper active (mode={_b4_mode})")
 
     # Build a HistoryBuffer when the loaded policy was trained with autoregressive
     # history inputs. The buffer survives across episodes and is the runtime mirror
@@ -328,6 +391,11 @@ def record(
 
         if events["stop_recording"]:
             break
+
+    # 最后一集没有后续 reset() 触发落盘 —— 显式收尾, 否则末集的 summary 只写到
+    # 最后一个 20 帧边界(逐 20 帧增量 flush), 尾部帧与最终统计会丢。
+    if policy is not None and hasattr(policy, "summary"):
+        policy.summary()
 
     log_say("Stop recording", cfg.play_sounds, blocking=True)
     stop_recording(robot, listener, cfg.display_cameras)
