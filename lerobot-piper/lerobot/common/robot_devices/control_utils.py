@@ -214,10 +214,11 @@ def record_episode(
             time.sleep(1.0)
     # 高频记录（老师 2026-10 计划）：每次策略运行都记，与补正 wrapper、TE 无关。
     # 编号用数据集的集编号（按 ← 重录时编号不变，文件随之覆盖，与数据集一致）。
-    high_rate_log = hr_path = None
+    high_rate_log = hr_path = b4_path = None
     if policy is not None:
         from lerobot.common.robot_devices.high_rate_log import HighRateLog
         hr_path = Path(dataset.root) / "high_rate" / f"episode_{dataset.meta.total_episodes:06d}.json"
+        b4_path = hr_path.with_name(hr_path.stem + "_b4.npz")     # B4 包装的每集记录（整段预测等），见 b4_deploy.py
         high_rate_log = HighRateLog(robot)
     try:
         control_loop(
@@ -241,9 +242,16 @@ def record_episode(
                 high_rate_log.save(hr_path, error=f"{type(e).__name__}: {e}")
             except Exception:
                 logging.exception("高频记录保存失败（原异常照常抛出）")
+        if hasattr(policy, "save_episode_log"):
+            try:
+                policy.save_episode_log(b4_path, error=f"{type(e).__name__}: {e}")
+            except Exception:
+                logging.exception("B4 记录保存失败（原异常照常抛出）")
         raise
     if high_rate_log is not None:
         high_rate_log.save(hr_path)
+    if hasattr(policy, "save_episode_log"):
+        policy.save_episode_log(b4_path)
     # End of episode → next episode's history input is this episode's recorded sequence.
     if history_buffer is not None:
         history_buffer.end_episode()

@@ -302,6 +302,23 @@ def record(
                                    theta_path=os.environ.get("BCORR_THETA"))
         logging.info(f"B/Step1 correction wrapper active (mode={_bmode}, artifact={_bcorr_ckpt})")
 
+    # B4 部署包装（默认关，env 门控；方案 reports/PLAN_b4.md）。要求开 TE：
+    #   B4_MODE=raw    原始 ACT，只记录（整段预测、在线 Shift、在线窗……）
+    #   B4_MODE=shift  闭环 Shift：发提前 60 ms 的指令（TE 的部分融合值插值）
+    #   B4_MODE=net    闭环 Shift + 补正网络（B4_NET=<冻结文件 outputs/b4/net/frozen.json>）
+    #   B4_CFG=<在线配置>（默认 outputs/b4/online_cfg.json）
+    # 每集在 high_rate/ 下另存 episode_XXXXXX_b4.npz。与 RefineNet、BCORR 互斥。
+    _b4_mode = os.environ.get("B4_MODE")
+    if policy is not None and _b4_mode:
+        if _refine_ckpt or _bcorr_ckpt:
+            raise ValueError("B4_MODE 与 REFINE_CKPT / BCORR_CKPT 不可同时设置(归因会混淆)")
+        if policy.config.temporal_ensemble_coeff is None:
+            raise ValueError("B4 需要开 TE：--control.policy.temporal_ensemble_coeff=0.01 --control.policy.n_action_steps=1")
+        from lerobot.common.policies.act.b4_deploy import build_b4_policy
+        policy = build_b4_policy(policy, _b4_mode, os.environ.get("B4_CFG", "outputs/b4/online_cfg.json"),
+                                 net_path=os.environ.get("B4_NET"))
+        logging.info(f"B4 deploy wrapper active (mode={_b4_mode})")
+
     # Build a HistoryBuffer when the loaded policy was trained with autoregressive
     # history inputs. The buffer survives across episodes and is the runtime mirror
     # of the EpisodeHistoryDataset wrapper used during training.

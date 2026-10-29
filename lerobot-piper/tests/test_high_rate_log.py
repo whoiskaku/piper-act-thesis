@@ -172,10 +172,10 @@ def test_write_failure_still_stops_recorders(tmp_path, fake_can):
 
 # ── 接入 record_episode（需要 lerobot 环境）──────────────────────────────
 
-def _record(cu, robot, root):
-    """以「数据集第 7 集」调一次 record_episode；策略是原生的，没有补正 wrapper 的任何属性。"""
+def _record(cu, robot, root, policy=None):
+    """以「数据集第 7 集」调一次 record_episode；默认策略是原生的，没有补正 wrapper 的任何属性。"""
     dataset = SimpleNamespace(root=root, meta=SimpleNamespace(total_episodes=7))
-    policy = SimpleNamespace(reset=lambda: None)
+    policy = policy or SimpleNamespace(reset=lambda: None)
     cu.record_episode(robot=robot, dataset=dataset, events={}, episode_time_s=1,
                       display_cameras=False, policy=policy, device="cpu", use_amp=False,
                       fps=20, single_task="t")
@@ -262,3 +262,27 @@ def test_save_failure_during_interrupt_does_not_hide_the_interrupt(tmp_path, mon
     with pytest.raises(KeyboardInterrupt):      # 抛出来的仍是原来的 Ctrl+C，不是存盘错误
         _record(cu, FakeRobot(imu), root)
     assert imu.calls == ["start", "stop"] and FakeCan.made[-1].stopped
+
+
+def test_b4_log_saved_next_to_high_rate_and_on_interrupt(tmp_path, monkeypatch, cu):
+    """B4 包装（有 save_episode_log）：正常结束存到 high_rate/episode_000007_b4.npz、不带错误；
+    中断时也存一次并写明原因，原来的 Ctrl+C 照常抛出；中断时存盘失败也不掩盖 Ctrl+C。"""
+    calls = []
+    policy = SimpleNamespace(reset=lambda: None, save_episode_log=lambda path, error=None: calls.append((Path(path), error)))
+    monkeypatch.setattr(cu, "control_loop", lambda **kw: None)
+    _record(cu, FakeRobot(FakeIMU()), tmp_path, policy)
+    assert calls == [(tmp_path / "high_rate" / "episode_000007_b4.npz", None)]
+
+    def loop(**kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cu, "control_loop", loop)
+    with pytest.raises(KeyboardInterrupt):
+        _record(cu, FakeRobot(FakeIMU()), tmp_path, policy)
+    assert calls[1][0] == calls[0][0] and calls[1][1].startswith("KeyboardInterrupt")
+
+    def broken(path, error=None):
+        raise OSError("disk full")
+
+    with pytest.raises(KeyboardInterrupt):
+        _record(cu, FakeRobot(FakeIMU()), tmp_path, SimpleNamespace(reset=lambda: None, save_episode_log=broken))
