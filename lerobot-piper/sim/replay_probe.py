@@ -25,6 +25,7 @@ import json
 import sys
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +63,12 @@ EPS_B_FALLBACK = 0.010          # 与 lerobot/common/policies/act/b_runtime.py �
 
 # ⚠ **两种探针形态，检查不同** —— 新增 ③c 用的多关节模式时**不删旧模式的断言**。
 PROBE_KINDS = ("single_joint_pulse", "multi_joint_continuous")
+MISSING_RATE_LIMIT_BLOCKER = (
+    "multi_joint_continuous：速度/加速度**无有出处又适用于本设备的上限**"
+    "（G-v2 A_MAX 是阶跃拟合的模型参数，裸轨迹本身就超它；"
+    "发送路径无软件限幅）⇒ **安全审查未完成**")
+PILOT_START_RESERVE_S = 60.0
+PILOT_RETURN_RESERVE_S = 15.0
 
 
 def safety_checks(cmd7, da, model_path=None, probe_kind="single_joint_pulse"):
@@ -172,10 +179,7 @@ def safety_checks(cmd7, da, model_path=None, probe_kind="single_joint_pulse"):
                                  f"{d2t[:, j].max()/DT**2*R2D:.0f}" for j in range(6)))
         msgs.append("⚠ **这些是指令差分，不是实测关节速度/加速度**；且仓内目前"
                     "**没有有出处又适用于本设备的速度/加速度上限**")
-        blockers.append(
-            "multi_joint_continuous：速度/加速度**无有出处又适用于本设备的上限**"
-            "（G-v2 A_MAX 是阶跃拟合的模型参数，裸轨迹本身就超它；"
-            "发送路径无软件限幅）⇒ **安全审查未完成**")
+        blockers.append(MISSING_RATE_LIMIT_BLOCKER)
     return msgs, degraded, blockers
 
 
@@ -239,9 +243,99 @@ def staged_return(robot, torch, grip: float) -> bool:
     return True
 
 
+def pilot_check_imu_freshness(robot):
+    """Pilot-only use of the existing TSND monotonic sample timestamp.
+
+    The ordinary robot wrapper rejects >100 ms; this replay's declared 50 ms
+    bound is enforced here without equating an unchanged value with stale data.
+    """
+    rdr = getattr(robot, "imu_reader", None)
+    if rdr is None or not callable(getattr(rdr, "get_latest", None)):
+        raise RuntimeError("pilot: 缺 IMU 新鲜度接口")
+    latest = rdr.get_latest()
+    if latest is None:
+        raise RuntimeError("pilot: IMU 尚无样本")
+    age = time.monotonic() - float(latest[0])
+    if not np.isfinite(age) or age < 0 or age > IMU_STALE_S:
+        raise RuntimeError(f"pilot: IMU 时间戳异常/陈旧 age={age!r}s")
+    if not np.isfinite(np.asarray(latest[2:4], dtype=float)).all():
+        raise RuntimeError("pilot: IMU 样本非有限")
+
+
+def _pilot_guard(pilot, robot=None):
+    if pilot is None:
+        return
+    if time.monotonic() >= pilot["deadline_monotonic"] - PILOT_RETURN_RESERVE_S:
+        raise RuntimeError("pilot 现场预算到达停止采集点；保留安全归位时间")
+    if robot is not None:
+        pilot_check_imu_freshness(robot)
+
+
+def _pilot_abort_before_record(robot, torch, cmd7, pilot, started_at_utc,
+                               arm, seqfile, outdir, tag, reason):
+    """Preserve pre-move/settle failure evidence before the existing return path."""
+    p = (outdir or PROBE) / f"replay_{tag}{arm}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"arm": arm, "seqfile": str(seqfile), "pilot": pilot,
+           "started_at_utc": started_at_utc, "clock": "time.monotonic",
+           "t": [], "t_send": [], "cmd": [], "imu": [], "state": [],
+           "imu100": [], "can_hs": [], "can_q200": [], "stopped": reason}
+    p.write_text(json.dumps(rec))
+    try:
+        if not staged_return(robot, torch, float(np.clip(cmd7[0, 6], 0, 0.035))):
+            rec["return_blocked"] = True
+    except Exception as e:
+        rec["return_error"] = f"{type(e).__name__}: {e}"
+    p.write_text(json.dumps(rec))
+    print(f"  ✗ pilot 预采集阶段停止，已保留记录: {reason}")
+    return 1
+
+
 def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         outdir=None, robot_type="piper", settle_probe=0.0, canhs=True,
-        probe_kind="single_joint_pulse"):
+        probe_kind="single_joint_pulse", pilot_context=None):
+    """Pilot lifecycle owns cleanup; legacy lifecycle is left unchanged."""
+    devices = [] if pilot_context is not None else None
+    code = 5
+    try:
+        code = _run_impl(arm, dry_run, seqfile, tag, b2, outdir, robot_type,
+                         settle_probe, canhs, probe_kind, pilot_context, devices)
+    finally:
+        if devices:
+            robot = devices[0]
+            # PiperRobot.__del__ calls disconnect(), which sends an additional
+            # un-interpolated home target and then disables motors. Never let
+            # that override a stopped/blocked staged return. This flag affects
+            # the wrapper only: it DOES NOT disable motors or establish safety.
+            robot.is_connected = False
+            cleanup = {"wrapper_destructor_disarmed": True,
+                       "motion_or_disable_sent_by_cleanup": False, "errors": []}
+            for name, target, method in (
+                ("imu_stop", getattr(robot, "imu_reader", None), "stop"),
+                ("can_close", getattr(getattr(robot, "arm", None), "piper", None),
+                 "DisconnectPort")):
+                try:
+                    if target is not None:
+                        getattr(target, method)()
+                    cleanup[name] = target is not None
+                except Exception as e:
+                    cleanup["errors"].append(f"{name}: {type(e).__name__}: {e}")
+            p = (outdir or PROBE) / f"replay_{tag}{arm}.json"
+            rec = json.loads(p.read_text()) if p.exists() else {
+                "arm": arm, "imu": [], "stopped": "pilot failed before capture record"}
+            rec["pilot_cleanup"] = cleanup
+            if cleanup["errors"]:
+                rec["stopped"] = rec.get("stopped") or "pilot cleanup failed"
+                code = 1
+            p.write_text(json.dumps(rec))
+            print("  pilot cleanup: no additional home/disable command; motors may remain enabled.")
+    return code
+
+
+def _run_impl(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
+              outdir=None, robot_type="piper", settle_probe=0.0, canhs=True,
+              probe_kind="single_joint_pulse", pilot_context=None, _devices=None):
+    started_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     cmd7, da, z = load_seq(seqfile, b2)
     import re
     is_bare = bool(re.fullmatch(r"A\d+", arm))      # A1/A2/A3/A4… 全是裸复放
@@ -255,6 +349,31 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         print("  " + m)
     for d in degraded:
         print(f"  ⚠ 降级: {d}")
+
+    # No CLI bypass. The dedicated runner validates the on-disk release, exact
+    # manifest/sequence hashes and active persistent-budget slot on every call.
+    # Only this specific unresolved-source item can be accepted as an explicitly
+    # recorded engineering judgment; no applicable physical limit is invented.
+    pilot = None
+    if pilot_context is not None:
+        try:
+            if probe_kind != "multi_joint_continuous" or settle_probe or b2 or tag:
+                raise ValueError("pilot 仅允许已冻结的多关节连续复放入口")
+            from run_pilot_response14 import validate_replay_context
+            pilot = validate_replay_context(pilot_context, seqfile, arm, cmd7, da, use_probe)
+            deadline = float(pilot["deadline_monotonic"])
+            needed = max(PILOT_START_RESERVE_S, len(cmd7) / FPS + 28.0)
+            if not np.isfinite(deadline) or deadline - time.monotonic() < needed:
+                raise ValueError("pilot 现场预算余量不足，不连接设备")
+            pilot = dict(pilot, deadline_monotonic=deadline)
+            blockers = [b for b in blockers if b != MISSING_RATE_LIMIT_BLOCKER]
+            print("  · 本 pilot 的来源未知项按已记录工程授权处理；不是安全证明")
+        except Exception as e:
+            print(f"  ⛔ pilot 授权/预算核验失败（设备未连接）: {type(e).__name__}: {e}")
+            return 4
+        if degraded:
+            print("  ⛔ pilot 依赖降级，不允许连接设备")
+            return 2
 
     if dry_run:
         print("\n[dry-run] 不连机器人。时序模拟:")
@@ -276,15 +395,17 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             for b in blockers:
                 print(f"     ⛔ {b}")
             return 4
-        print("  ✓ 全部安全检查通过 —— 可上机")
+        print("  ✓ 离线检查及本 pilot 作用域核验通过（未连接设备）" if pilot
+              else "  ✓ 全部安全检查通过 —— 可上机")
         return 0
 
     # ---- ⛔ 运动入口硬阻断（**不是打印警告**）────────────────────────────
     # 退出码 4 = 安全审查未完成。**发生在 make_robot / connect 之前**，
     # 因此设备不会被连接、电机不会被使能、臂不会动。
-    # 解除方式**只有一条**：完成 `reports/CHECKLIST_3c_readonly.md` 的 R 阶段，
+    # 旧路径解除方式：完成 `reports/CHECKLIST_3c_readonly.md` 的 R 阶段，
     # 把有出处且适用的限值填进 `sim/audit_send_chain_3c.py` 的来源表，
-    # 使 safety_checks 不再产生 blockers。**不提供 --force 之类的旁路。**
+    # 使 safety_checks 不再产生 blockers。没有 --force；本 pilot 仅在上方经
+    # 专用 runner 的磁盘授权/序列/预算核验后处理指定项，旧③c未被放行。
     if blockers:
         print(f"\n  ⛔⛔ **拒绝上机：{len(blockers)} 项安全审查未完成** ⛔⛔")
         for b in blockers:
@@ -296,17 +417,25 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     # ---- 真机 ----
     import torch
     from lerobot.common.robot_devices.robots.utils import make_robot
+    if pilot:
+        try:
+            needed = max(PILOT_START_RESERVE_S, len(cmd7) / FPS + 28.0)
+            if pilot["deadline_monotonic"] - time.monotonic() < needed:
+                raise RuntimeError("pilot 现场预算余量不足，不开始连接")
+        except RuntimeError as e:
+            print(f"  ⛔ {e}（尚未连接设备）")
+            return 4
+        (outdir or PROBE).mkdir(parents=True, exist_ok=True)
     # 探针只需 IMU+关节: inference_time=True(推理模式,无手柄teleop) · enable_imu=True(默认关!)
     # · cameras={}(不读图, 省循环开销且避开已知的 ffmpeg SIGABRT)
-    # ── 退出码 3 = 「机器还没动就失败」(2026-08-26 冻结) ────────────────────
-    # 建机器人 / 连接 / IMU 自检**全部发生在任何运动之前**: 失败时机时为 0、
-    # 无数据产生, 因此它对「这条序列能不能跑」不提供任何信息。编排器据此记为
-    # **环境失败**, **不计入该序列的作废额度**, 并立即停整轮等人修环境 ——
-    # 而不是对着一个 CAN 故障连撞 MAX_VOIDS 次(2026-08-26 实际发生过)。
-    # 越过这一段之后的任何失败, 判据仍是**帧数**(⑥-5b), 按正常作废处理。
+    # 退出码 3 仍表示初始化失败，保留旧接口；但 make_robot/connect 可能
+    # 已使能/归位，不能从 rc=3 推出「没有动作」。本 pilot runner 在连接前
+    # 已计入尝试，任何失败立即停整轮，不自动重试。
     try:
         robot = make_robot(robot_type, inference_time=True, enable_imu=True,
                            cameras={})
+        if _devices is not None:
+            _devices.append(robot)  # Own partial-connect failures as well.
         if not robot.is_connected:
             robot.connect()
         # IMU 连接自检: 动之前先确认 IMU 活着, 否则白跑 59s
@@ -318,8 +447,14 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             raise RuntimeError(f"IMU 首帧异常: {imu0}")
     except Exception as e:                                        # noqa: BLE001
         traceback.print_exc()
-        print(f"\n  ✗✗ **环境失败(运动前)**: {type(e).__name__}: {e}")
-        print("      机器未动、无数据产生 ⇒ 不计入该序列作废额度。")
+        print(f"\n  ✗✗ **环境初始化失败**: {type(e).__name__}: {e}")
+        print("      make_robot/connect 可能已有使能或归位副作用；不能据此声称机器未动。")
+        if pilot:
+            p = (outdir or PROBE) / f"replay_{tag}{arm}.json"
+            p.write_text(json.dumps({"arm": arm, "seqfile": str(seqfile),
+                "pilot": pilot, "started_at_utc": started_at_utc, "imu": [],
+                "stopped": f"初始化失败: {type(e).__name__}: {e}",
+                "traceback": traceback.format_exc()}))
         print("      常见: CAN 未起(ip -br link show can0) / 臂未上电 / "
               "TSND 未插(/dev/ttyACM0)")
         return 3
@@ -379,18 +514,27 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     print(f"  预移动 {PREMOVE_S:.0f}s: 最大位移 "
           f"{np.degrees(np.abs(q_tgt - q_now)).max():.2f}° (j{int(np.abs(q_tgt-q_now).argmax())+1}) "
           f"→ 峰速约 {np.degrees(np.abs(q_tgt - q_now)).max()/PREMOVE_S:.1f}°/s")
-    for i in range(n_pre + 1):
-        w = (1.0 - np.cos(np.pi * i / n_pre)) / 2.0        # 余弦缓入缓出, 零起始/终止速度
-        act = np.concatenate([q_now + w * (q_tgt - q_now), cmd7[0, 6:7]]).astype(np.float32)
-        robot.send_action(torch.from_numpy(act))
-        time.sleep(DT)
     settle = []
-    for _ in range(int(PRESETTLE_S * FPS)):               # 稳定, 让余振衰完
-        robot.send_action(torch.from_numpy(
-            np.concatenate([q_tgt, cmd7[0, 6:7]]).astype(np.float32)))
-        settle.append(robot.capture_observation()["observation.state"].numpy()[:6]
-                      * np.pi / 180 / 1000)
-        time.sleep(DT)
+    try:
+        for i in range(n_pre + 1):
+            _pilot_guard(pilot, robot)
+            w = (1.0 - np.cos(np.pi * i / n_pre)) / 2.0
+            act = np.concatenate([q_now + w * (q_tgt - q_now), cmd7[0, 6:7]]).astype(np.float32)
+            robot.send_action(torch.from_numpy(act))
+            time.sleep(DT)
+        for _ in range(int(PRESETTLE_S * FPS)):
+            _pilot_guard(pilot, robot)
+            robot.send_action(torch.from_numpy(
+                np.concatenate([q_tgt, cmd7[0, 6:7]]).astype(np.float32)))
+            settle.append(robot.capture_observation()["observation.state"].numpy()[:6]
+                          * np.pi / 180 / 1000)
+            time.sleep(DT)
+        _pilot_guard(pilot, robot)
+    except BaseException as e:
+        if not pilot:
+            raise
+        return _pilot_abort_before_record(robot, torch, cmd7, pilot, started_at_utc,
+            arm, seqfile, outdir, tag, f"{type(e).__name__}: {e}")
     if settle_probe > 0:
         s = np.degrees(np.asarray(settle, float))
         v = np.abs(np.diff(s, axis=0) * FPS)
@@ -440,7 +584,14 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
         robot.disconnect()
         return 0
 
-    obs0 = robot.capture_observation()                    # 起始状态改在**预移动后**取
+    try:
+        obs0 = robot.capture_observation()                # 起始状态改在**预移动后**取
+        _pilot_guard(pilot, robot)
+    except BaseException as e:
+        if not pilot:
+            raise
+        return _pilot_abort_before_record(robot, torch, cmd7, pilot, started_at_utc,
+            arm, seqfile, outdir, tag, f"{type(e).__name__}: {e}")
     q_pre = obs0["observation.state"].numpy()[:6] * np.pi / 180 / 1000
     # (a) 稳定: **位置带**判据 —— 最后 BAND_WINDOW_S 秒内每个关节的 max−min
     win = np.asarray(settle[-int(BAND_WINDOW_S * FPS):], float)
@@ -544,12 +695,18 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     # (例: j3 0.6°>0.5 超标, j4 0.7°<0.8 合规, 带宽最大的却是 j4)。
     # 必须报真正超标那一个及**它自己的**阈值, 否则错误信息张冠李戴。
     _jb = int(np.argmax(np.where(band_bad, band - BAND_TOL, -np.inf)))
-    assert not band_bad.any(), (
-        f"稳定段位置带超限: j{_jb+1} R={np.degrees(band[_jb]):.3f}° "
-        f"> {np.degrees(BAND_TOL[_jb]):.1f}° —— **立即停机, 不自动重试**")
-    assert (dev <= tol).all(), (
-        f"预移动未到位: j{j_bad+1} 偏差 {np.degrees(dev[j_bad]):.3f}° > 容差 "
-        f"{np.degrees(tol[j_bad]):.3f}° —— 停机排查, 六臂起始位姿必须一致")
+    try:
+        assert not band_bad.any(), (
+            f"稳定段位置带超限: j{_jb+1} R={np.degrees(band[_jb]):.3f}° "
+            f"> {np.degrees(BAND_TOL[_jb]):.1f}° —— **立即停机, 不自动重试**")
+        assert (dev <= tol).all(), (
+            f"预移动未到位: j{j_bad+1} 偏差 {np.degrees(dev[j_bad]):.3f}° > 容差 "
+            f"{np.degrees(tol[j_bad]):.3f}° —— 停机排查, 六臂起始位姿必须一致")
+    except AssertionError as e:
+        if not pilot:
+            raise
+        return _pilot_abort_before_record(robot, torch, cmd7, pilot, started_at_utc,
+            arm, seqfile, outdir, tag, f"{type(e).__name__}: {e}")
     print(f"  ✓ 预移动到位 (最大超容差 {np.degrees((dev - tol).max()):+.3f}°)")
 
     # t_send: **JointCtrl 真正写总线的时刻**(ZOH 起点), monotonic 与 TSND host_t 同钟。
@@ -566,6 +723,8 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
                        "tol_deg": np.degrees(tol).tolist(),
                        "settle_vmax_dps": float(np.degrees(vmax))},
            "state_init": obs0["observation.state"].numpy().tolist()}
+    if pilot:
+        rec.update(pilot=pilot, started_at_utc=started_at_utc)
     print(f"  基准指令 hash {cmd_hash}  起始关节 "
           f"{np.round(np.array(rec['state_init'][:6]) * np.pi / 180 / 1000, 4)}")
     rdr = getattr(robot, "imu_reader", None)
@@ -587,6 +746,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
     stopped = None
     try:
         for i in range(len(cmd7)):
+            _pilot_guard(pilot, robot)
             t_start = time.perf_counter()
             act = np.concatenate([total[i], cmd7[i, 6:7]]).astype(np.float32)
             robot.send_action(torch.from_numpy(act))
@@ -594,6 +754,7 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             span = getattr(robot.arm, "last_jointctrl_t", None)
             t_send = 0.5 * (span[0] + span[1]) if span else time.monotonic()
             obs = robot.capture_observation()
+            _pilot_guard(pilot, robot)
             imu = obs.get("observation.imu_real")
             if imu is None or not np.isfinite(imu.numpy()).all():
                 stopped = f"帧 {i}: IMU 异常"
@@ -615,19 +776,34 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
                 time.sleep(DT - dt)
     except KeyboardInterrupt:
         stopped = "用户中断"
+    except Exception as e:
+        if not pilot:
+            raise
+        stopped = f"{type(e).__name__}: {e}"
+        rec["traceback"] = traceback.format_exc()
     finally:
-        if rdr is not None and hasattr(rdr, "stop_recording"):
-            for ht, ms, ac, gy in rdr.drain_recording():
-                rec["imu100"].append([float(ht), int(ms), *map(float, ac), *map(float, gy)])
-            rdr.stop_recording()
-        if can_rec is not None:
-            can_raw.extend(can_rec.drain_recording())
-            can_rec.stop_recording()
-            # 解码放在停机之后 —— 在回路里解码会拖慢 20 Hz 主环(2026-09-01 教训)
-            from can_hs_recorder import decode as _candec
-            rec["can_hs"], rec["can_q200"] = _candec(can_raw)
-            # 固件/SDK 版本要与数据同文件落盘: effort 标度规则依赖固件版本
-            rec["can_hs_meta"] = can_rec.meta(getattr(robot.arm, "piper", None))
+        try:
+            if rdr is not None and hasattr(rdr, "stop_recording"):
+                try:
+                    for ht, ms, ac, gy in rdr.drain_recording():
+                        rec["imu100"].append([float(ht), int(ms), *map(float, ac), *map(float, gy)])
+                finally:
+                    rdr.stop_recording()
+            if can_rec is not None:
+                try:
+                    can_raw.extend(can_rec.drain_recording())
+                finally:
+                    can_rec.stop_recording()
+                # Decode after stopping collection; a decode failure must not
+                # skip the staged return and pilot cleanup below.
+                from can_hs_recorder import decode as _candec
+                rec["can_hs"], rec["can_q200"] = _candec(can_raw)
+                rec["can_hs_meta"] = can_rec.meta(getattr(robot.arm, "piper", None))
+        except Exception as e:
+            if not pilot:
+                raise
+            stopped = stopped or f"capture finalization: {type(e).__name__}: {e}"
+            rec["finalization_error"] = traceback.format_exc()
         p = (outdir or PROBE) / f"replay_{tag}{arm}.json"   # tag 含 ep 与轮次
         if p.exists():
             # **移开, 不覆盖**。判据修订后重跑同一条序列会同名 —— 原始数据仍然
@@ -649,13 +825,22 @@ def run(arm, dry_run=False, seqfile="probe_seq.npz", tag="", b2=False,
             ok = staged_return(robot, torch, float(np.clip(cmd7[0, 6], 0, 0.035)))
             if not ok:
                 rec["return_blocked"] = True
+                if pilot:
+                    stopped = rec["stopped"] = stopped or "归位受阻"
                 p.write_text(json.dumps(rec))
                 print("  ⚠ **归位受阻已记入结果文件**(return_blocked)。"
                       "机器停在中途, 请人工检查后再运行下一条。")
-        except NameError:
-            pass                                   # 未走到真机路径
+        except NameError as e:
+            if pilot:
+                rec["return_error"] = f"{type(e).__name__}: {e}"
+                stopped = rec["stopped"] = stopped or "归位异常"
+                p.write_text(json.dumps(rec))
         except Exception as e:                     # noqa: BLE001
             print(f"  ⚠ 归位过程异常: {type(e).__name__}: {e}")
+            if pilot:
+                rec["return_error"] = f"{type(e).__name__}: {e}"
+                stopped = rec["stopped"] = stopped or "归位异常"
+                p.write_text(json.dumps(rec))
     return 0 if stopped is None else 1
 
 
