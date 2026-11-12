@@ -16,12 +16,15 @@ import pytest  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import b4_eval as E  # noqa: E402
+import b4_net as N  # noqa: E402
 import b4_teacher as B  # noqa: E402
 import ilc_route1 as I  # noqa: E402
 import repeat_reversal as RR  # noqa: E402
 
 from lerobot.common.policies.act.b4_deploy import B4Deploy  # noqa: E402
 from tests.test_b4_deploy import CFG, CHUNKS, MODEL, ChunkReplayer  # noqa: E402
+
+ACT = [0, 1, 2, 4, 5]
 
 
 @pytest.fixture(scope="module")
@@ -131,25 +134,100 @@ def test_cached_result_is_bound_to_calibration(tmp_path):
         B.replay_result("x", tmp_path, {}, SimpleNamespace(calib_sha="bbb"))
 
 
-def _fake_session(root, name, tid, rounds, net_sha, conds=("shift", "net")):
+def _fake_session(root, name, tid, rounds, shas, conds=("shift", "net"), prefix="e"):
+    """假会话：每个条件、每轮一遍；seq 文件里记的网络哈希按条件取 shas（没有网络的条件记空）。"""
     import json
     s = root / name
     s.mkdir(parents=True)
     for c in conds:
         for r in rounds:
-            rid = f"{tid}_e{c}{r}"
+            rid = f"{tid}_{prefix}{c}{r}"
             (s / f"replay_{rid}_r1.json").write_text("{}")
-            np.savez(s / f"seq_{rid}.npz", source=json.dumps({"net_sha": net_sha if c == "net" else ""}))
+            np.savez(s / f"seq_{rid}.npz", source=json.dumps({"net_sha": shas.get(c, "")}))
     return s
 
 
 def test_pick_session_binds_network_and_whole_trajectory(tmp_path):
     """审阅 Important 2：一条轨迹的全部轮次必须来自同一会话，且网络那几遍用的是指定的网络；取最新的那个会话。"""
-    old = _fake_session(tmp_path, "20261101", "a", (1, 2), "OLD")
-    new = _fake_session(tmp_path, "20261103", "a", (1, 2), "NEW")
-    _fake_session(tmp_path, "20261102", "b", (1,), "NEW")
-    _fake_session(tmp_path, "20261104", "b", (2,), "NEW")
+    old = _fake_session(tmp_path, "20261101", "a", (1, 2), {"net": "OLD"})
+    new = _fake_session(tmp_path, "20261103", "a", (1, 2), {"net": "NEW"})
+    _fake_session(tmp_path, "20261102", "b", (1,), {"net": "NEW"})
+    _fake_session(tmp_path, "20261104", "b", (2,), {"net": "NEW"})
     ss = [old, tmp_path / "20261102", new, tmp_path / "20261104"]
-    assert E.pick_session("a", ss, ("shift", "net"), 2, "NEW") == new
-    assert E.pick_session("a", ss, ("shift", "net"), 2, "OLD") == old
-    assert E.pick_session("b", ss, ("shift", "net"), 2, "NEW") is None          # 两轮跨了会话：不拼
+    assert E.pick_session("a", ss, ("shift", "net"), 2, {"net": "NEW"}) == new
+    assert E.pick_session("a", ss, ("shift", "net"), 2, {"net": "OLD"}) == old
+    assert E.pick_session("b", ss, ("shift", "net"), 2, {"net": "NEW"}) is None  # 两轮跨了会话：不拼
+
+
+# ── 整段版 ①：验证集三条件回放与分析（实现计划 reports/PLAN_IMPL_b4_seq.md 任务 4）──────────────────
+@pytest.fixture(scope="module")
+def teacher(case):
+    """同 test_b4_net 的教师：冻结的在线 Shift ＋ 含窗的小补正。"""
+    delta = case.seq["w"] * 0.003 * np.sin(np.arange(len(case.seq["w"]))[:, None] * 0.2 + np.arange(5))
+    cmd7 = case.seq["s7"].copy()
+    cmd7[:, ACT] += delta.astype(np.float32)
+    return {"cmd7": cmd7}
+
+
+def test_seq_command_with_perfect_prediction_reproduces_teacher(case, teacher):
+    """把标签当网络输出（按帧顺序给）：复算的实发指令等于教师指令，j4、夹爪就是 Shift。"""
+    rows = iter(N.assemble_seq(case.log, case.seq, teacher, 8, 16, 10)["Y"])
+    cmd7 = E.seq_command(case.log, lambda x: next(rows), 8, 16, 10, CFG)
+    assert np.abs(cmd7[RR.HOLD:] - teacher["cmd7"][RR.HOLD:]).max() <= 1e-6         # 只差 float32 舍入
+    assert np.array_equal(cmd7[RR.HOLD:, [3, 6]], case.seq["s7"][RR.HOLD:, [3, 6]])
+
+
+def test_seq_command_sends_only_the_first_frame(case):
+    f = lambda x: np.tile(0.002 * np.tanh(x[-7:-2]), 10)                 # noqa: E731
+    g = lambda x: np.r_[0.002 * np.tanh(x[-7:-2]), np.full(45, 0.5)]     # noqa: E731  第 2…10 帧乱给
+    assert np.array_equal(E.seq_command(case.log, f, 8, 16, 10, CFG), E.seq_command(case.log, g, 8, 16, 10, CFG))
+
+
+def test_seq_command_uses_only_chunks_up_to_k(case):
+    """Review Focus 4：P、F 与录制时不同 → 由整段预测复算输入；改第 31 帧及以后的 chunk，前 31 帧的指令不变。"""
+    chunk = case.log["chunk"].copy()
+    chunk[31:] += 0.05
+    f = lambda x: np.tile(0.002 * np.tanh(x[-7:-2]), 10)                 # noqa: E731  取最远那一帧未来值
+    a, b = (E.seq_command({**case.log, "chunk": c}, f, 8, 16, 10, CFG) for c in (case.log["chunk"], chunk))
+    assert np.array_equal(a[:RR.HOLD + 31], b[:RR.HOLD + 31]) and not np.array_equal(a, b)
+
+
+def test_valseq_plan_alternates_two_conditions():
+    """用户 11-06：valseq 只有 shift、seq 两个条件，每轮先后交替。"""
+    assert E.plan("valseq", ["a"]) == [("a", "shift", 1), ("a", "seq", 1), ("a", "seq", 2), ("a", "shift", 2)]
+
+
+def test_valseq_session_never_feeds_the_old_val_analysis(tmp_path):
+    """Review Focus 3：新会话的回放编号用 q 前缀，旧的 val 分析仍读 20261105v；整段版那几遍核对网络哈希。"""
+    old = _fake_session(tmp_path, "20261105v", "a", (1, 2), {"net": "NET1"})
+    new = _fake_session(tmp_path, "20261107q1", "a", (1, 2), {"seq": "SEQ"}, ("shift", "seq"), "q")
+    assert E.pick_session("a", [old, new], ("shift", "net"), 2, {"net": "NET1"}) == old
+    assert E.pick_session("a", [old, new], ("shift", "seq"), 2, {"seq": "SEQ"}, "q") == new
+    assert E.pick_session("a", [old, new], ("shift", "seq"), 2, {"seq": "X"}, "q") is None
+
+
+def test_valseq_trajectory_split_across_batches_is_not_joined(tmp_path):
+    """Review Focus 5：一条轨迹的两轮分在两个会话（批）里 → 不拼。"""
+    s1 = _fake_session(tmp_path, "q1", "a", (1,), {"seq": "S"}, ("shift", "seq"), "q")
+    s2 = _fake_session(tmp_path, "q2", "a", (2,), {"seq": "S"}, ("shift", "seq"), "q")
+    assert E.pick_session("a", [s1, s2], ("shift", "seq"), 2, {"seq": "S"}, "q") is None
+
+
+def results_seq(n_traj=10, seq=0.90):
+    """合成：每条 2 轮；整段版关节偏差是 Shift 的 seq 倍。"""
+    rng = np.random.default_rng(0)
+    out = {}
+    for t in range(n_traj):
+        d = {}
+        for r in (1, 2):
+            j = 5.0 + rng.normal(0, 0.05)
+            m = lambda f: {"joint_raw": j * f, "ee_raw": 0.06, "path": 1.0, "speed": 1.0}   # noqa: E731
+            d[("shift", r)], d[("seq", r)] = m(1), m(seq)
+        out[f"t{t}"] = d
+    return out
+
+
+def test_analyze_judges_seq_against_shift():
+    out = E.analyze_results(results_seq(), ("shift", "seq"), 2, judged="seq")
+    assert out["verdict"] == "有效" and out["joint_raw"]["effect"] == pytest.approx(-10, abs=0.5)
+    assert out["joint_raw"]["n_groups"] == 10

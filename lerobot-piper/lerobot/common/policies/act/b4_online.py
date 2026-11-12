@@ -165,28 +165,42 @@ from torch import nn  # noqa: E402
 
 
 class B4Net(nn.Module):
-    """网络输入 ((P+F)·7) → 第 k 帧五个活动关节的补正（rad）。输入先按训练集的均值、标准差标准化（buffer mu、sd）。"""
+    """网络输入 ((P+F)·7) → n_out 维（rad）：一帧版是第 k 帧五个活动关节的补正（n_out = 5）；
+    整段版 ① 是第 k … k+N−1 帧相对参考的指令，按帧优先展平（n_out = 5·N）。
+    输入先经 `prep`（整段版 v0.3 的相对化；一帧版原样），再按训练集的均值、标准差标准化（buffer mu、sd）。"""
 
-    def __init__(self, n_in: int, hidden: int = 128):
+    def __init__(self, n_in: int, hidden: int = 128, n_out: int = len(ACTIVE), rel_P: int | None = None):
         super().__init__()
-        self.register_buffer("mu", torch.zeros(n_in))
-        self.register_buffer("sd", torch.ones(n_in))
-        self.mlp = nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU(),
-                                 nn.Linear(hidden, len(ACTIVE)))
+        self.rel_P = rel_P
+        n_feat = n_in + 7 if rel_P else n_in
+        self.register_buffer("mu", torch.zeros(n_feat))
+        self.register_buffer("sd", torch.ones(n_feat))
+        self.mlp = nn.Sequential(nn.Linear(n_feat, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, n_out))
+
+    def prep(self, x):
+        """整段版 v0.3（方案 `reports/PLAN_b4_seq.md` §4.2）：x 按 (P+F, 7) 帧排，第 rel_P−1 帧是 a_π(k)；
+        各帧减去它（展平）再附上它本身。提前量于是成了几个小差值的线性组合。rel_P = None（一帧版）原样返回。"""
+        if self.rel_P is None:
+            return x
+        f = x.reshape(*x.shape[:-1], -1, 7)
+        cur = f[..., self.rel_P - 1, :]
+        return torch.cat([(f - cur.unsqueeze(-2)).flatten(-2), cur], -1)
 
     def forward(self, x):
-        return self.mlp((x - self.mu) / self.sd)
+        return self.mlp((self.prep(x) - self.mu) / self.sd)
 
 
 def load_frozen(path: str):
-    """冻结文件（JSON）→ (CPU 上的推理函数 np (n_in,) → np (5,), 权重哈希, P, F)。权重文件的哈希和冻结时不同就停。"""
+    """冻结文件（JSON）→ (CPU 上的推理函数 np (n_in,) → np (n_out,), 权重哈希, P, F)。权重文件的哈希和冻结时不同就停。
+    n_out、rel_P 取权重文件里记的；一帧版的旧文件没有这两个键，就是 5 和 None（不相对化）。"""
     d = json.loads(Path(path).read_text())
     w = Path(d["weights"])
     sha = hashlib.sha256(w.read_bytes()).hexdigest()[:16]
     if sha != d["weights_sha"]:
         raise SystemExit(f"⛔ 冻结网络的权重文件被改过（{d['weights_sha']} → {sha}）")
     m = torch.load(w, map_location="cpu")
-    net = B4Net(m["n_in"], m["hidden"])
+    net = B4Net(m["n_in"], m["hidden"], m.get("n_out", len(ACTIVE)), m.get("rel_P"))
     net.load_state_dict(m["state_dict"])
     net.eval()
 
