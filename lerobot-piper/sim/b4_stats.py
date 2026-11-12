@@ -31,13 +31,14 @@ def hier2(rel: dict[str, list[float]], n_boot: int = 10000, seed: int = 0) -> di
             "n_groups": len(vals)}
 
 
-def judge(r: dict) -> str:
-    """r = {"joint_raw", "path", "speed", …}（各为 hier2 的结果）。护栏：路径长度、关节速度的效应在 ±5% 内；
-    有效：关节偏差的 95% 区间上限 < 0（不设最小降幅）。其余键只报告。"""
+def judge(r: dict, main: str = "joint_raw") -> str:
+    """r = {main, "path", "speed", …}（各为 hier2 的结果）。护栏：路径长度、关节速度的效应在 ±5% 内；
+    有效：主指标的 95% 区间上限 < 0（不设最小降幅）。main 默认是关节偏差（相对原始指令零阶保持）；
+    11-12 起用户定的主指标是相对老师理想的关节偏差（joint_ideal）。其余键只报告。"""
     bad = [name for key, name in (("path", "路径长度"), ("speed", "关节速度")) if abs(r[key]["effect"]) > 5]
     if bad:
         return f"护栏未过（{'、'.join(bad)}的变化超过 ±5%）"
-    return "有效" if r["joint_raw"]["ci95"][1] < 0 else "关节偏差没有显著下降"
+    return "有效" if r[main]["ci95"][1] < 0 else "关节偏差没有显著下降"
 
 
 def strict_count(pairs: list[tuple[bool, bool]]) -> tuple[int, int, bool]:
