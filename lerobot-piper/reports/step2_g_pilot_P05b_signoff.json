@@ -1,0 +1,56 @@
+{
+ "signed_at": "2026-08-26 00:24:55+0900",
+ "signed_by": "郭鹏 (whoiskaku) —— 会话中回复「目视签字：通过」",
+ "scope": "j4 pilot 设计修订 P05b / P06b 的接触表目视审查",
+ "sequences": [
+  {
+   "name": "P05b_step_rise10",
+   "sha": "21be68bc3a95",
+   "frames": 190,
+   "amp_deg": 8.245,
+   "peak_v_deg_s": 28.6,
+   "peak_a_deg_s2": 187.0,
+   "n": 15,
+   "rise_frames": 10,
+   "revision": "replaces P05/P06; rise 5→10 to cut dynamic intensity"
+  },
+  {
+   "name": "P06b_step_rise10",
+   "sha": "21be68bc3a95",
+   "frames": 190,
+   "amp_deg": 8.245,
+   "peak_v_deg_s": 28.6,
+   "peak_a_deg_s2": 187.0,
+   "n": 16,
+   "rise_frames": 10,
+   "revision": "replaces P05/P06; rise 5→10 to cut dynamic intensity"
+  }
+ ],
+ "contact_sheets": [
+  "P05b_step_rise10",
+  "P06b_step_rise10"
+ ],
+ "model_sha256_12": "7f15d5a97d62",
+ "git_commit": "3675b18",
+ "reviewer_notes": [
+  "两张接触表完整，序列 hash 均为 9b27852d8a16",
+  "预移动、激励和回停连续平滑",
+  "未见明显穿模、危险包络、方向错误或指令跳变",
+  "j4 轨迹响应正常，无异常发散"
+ ],
+ "what_this_does_NOT_cover": [
+  "**碰撞安全** —— piper_model.xml 的碰撞全部关闭 (contype/conaffinity 非零 0/17)",
+  "力矩安全 —— 执行器无力矩上限",
+  "热安全",
+  "**真实过冲** —— 回放用的是未标定模型的动力学"
+ ],
+ "execution_order": "先跑 P05b；全部门禁通过后再跑 P06b。两条都通过后，才修改正式主套件的 j4 阶跃包络。",
+ "gates_unchanged": [
+  "固定 2 帧滞后 p99 ≤ 0.5°",
+  "稳定位置带 R_j ≤ 0.5°",
+  "最终到位",
+  "限位",
+  "速度"
+ ],
+ "note": "若序列重新生成且 sha 改变，本签字即失效。"
+}

@@ -38,6 +38,29 @@ from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 
 
+def _hf_fraction_loss(actions: Tensor, fps: float = 30.0, cutoff: float = 5.0,
+                      active=None, eps: float = 1e-8) -> Tensor:
+    """High-freq energy fraction (>cutoff Hz) with stopgrad denominator.
+
+    actions: (B, T, A). Per-channel scale-invariant, so equals the raw-space
+    value even when computed on normalized actions. Used by the Stage 3a
+    negative ablation (enable_denoise_smooth); matches Stage 3b's RefineNet hf.
+    """
+    B, T, A = actions.shape
+    x = actions - actions.mean(dim=1, keepdim=True)
+    w = torch.hann_window(T, device=actions.device).view(1, T, 1)
+    X = torch.fft.rfft(x * w, dim=1)
+    P = X.abs() ** 2                                              # (B, F, A)
+    freqs = torch.fft.rfftfreq(T, d=1.0 / fps).to(actions.device)
+    hf = (freqs > cutoff).view(1, -1, 1)
+    E_high = (P * hf).sum(dim=1)                                  # (B, A)
+    E_total = P.sum(dim=1)
+    frac = E_high / (E_total.detach() + eps)                     # stopgrad denom
+    if active is not None:
+        frac = frac[:, list(active)]
+    return frac.mean()
+
+
 class ACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -72,6 +95,7 @@ class ACTPolicy(PreTrainedPolicy):
         )
 
         self.model = ACT(config)
+        self._cuda_graph = None  # `config.cuda_graph`: captured at the first inference
 
         # Legacy buffer kept for ckpt backward compat (was used for ΦSim aux warmup).
         self.register_buffer("_train_step", torch.zeros(1, dtype=torch.long), persistent=True)
@@ -119,33 +143,40 @@ class ACTPolicy(PreTrainedPolicy):
         """
         self.eval()
 
+        # If we are doing temporal ensembling, do online updates where we keep track of the number of actions
+        # we are ensembling over.
+        if self.config.temporal_ensemble_coeff is not None:
+            return self.temporal_ensembler.update(self.predict_chunk(batch))
+
+        # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
+        # querying the policy.
+        if len(self._action_queue) == 0:
+            actions = self.predict_chunk(batch)[:, : self.config.n_action_steps]
+
+            # `predict_chunk` returns a (batch_size, chunk_size, action_dim) tensor, but the queue
+            # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
+            self._action_queue.extend(actions.transpose(0, 1))
+        return self._action_queue.popleft()
+
+    def predict_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        """The unnormalized chunk of actions predicted from one observation, (batch_size, chunk_size, action_dim).
+        With `config.cuda_graph`, the same computation replayed as a CUDA graph."""
+        if not self.config.cuda_graph:
+            return self._predict_chunk(batch)
+        if self._cuda_graph is None:
+            self._cuda_graph = ACTCUDAGraph(self._predict_chunk)
+        # Only what the inference reads: other entries of the batch neither enter the graph nor cause a capture.
+        return self._cuda_graph({key: batch[key] for key in self.config.input_features if key in batch})
+
+    def _predict_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch["observation.images"] = torch.stack(
                 [batch[key] for key in self.config.image_features], dim=-4
             )
-
-        # If we are doing temporal ensembling, do online updates where we keep track of the number of actions
-        # we are ensembling over.
-        if self.config.temporal_ensemble_coeff is not None:
-            actions = self.model(batch)[0]  # (batch_size, chunk_size, action_dim)
-            actions = self.unnormalize_outputs({"action": actions})["action"]
-            action = self.temporal_ensembler.update(actions)
-            return action
-
-        # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-        # querying the policy.
-        if len(self._action_queue) == 0:
-            actions = self.model(batch)[0][:, : self.config.n_action_steps]
-
-            # TODO(rcadene): make _forward return output dictionary?
-            actions = self.unnormalize_outputs({"action": actions})["action"]
-
-            # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-            # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
+        actions = self.model(batch)[0]
+        return self.unnormalize_outputs({"action": actions})["action"]
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -163,6 +194,19 @@ class ACTPolicy(PreTrainedPolicy):
         ).mean()
 
         loss_dict = {"l1_loss": l1_loss.item()}
+
+        # Stage 3a negative ablation: high-freq smoothness penalty on ACT's own
+        # output (default OFF). hf_fraction is per-channel scale-invariant, so
+        # computing it on the normalized actions_hat equals the raw-space value.
+        denoise_smooth = torch.zeros((), device=actions_hat.device)
+        if getattr(self.config, "enable_denoise_smooth", False):
+            denoise_smooth = _hf_fraction_loss(
+                actions_hat,
+                cutoff=self.config.denoise_hf_cutoff_hz,
+                active=self.config.denoise_active_joints,
+            )
+            loss_dict["denoise_hf"] = denoise_smooth.item()
+
         if self.config.use_vae:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total
@@ -176,12 +220,66 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             loss = l1_loss
 
+        if getattr(self.config, "enable_denoise_smooth", False):
+            loss = loss + self.config.denoise_lambda_hf * denoise_smooth
+
         # ΦSim aux loss removed (Phase 2 cleanup, 2026-05-05)
 
         if self.training:
             self._train_step += 1
 
         return loss, loss_dict
+
+
+class ACTCUDAGraph:
+    """Runs `fn`, a function of a dict of tensors returning a tensor, by replaying a CUDA graph of it.
+
+    Run from Python, a network launches its kernels one operation at a time, and every operation hands the
+    interpreter lock over and takes it back: with other Python threads running (the robot's camera, IMU and CAN
+    readers), taking it back can wait for them, operation after operation. A replay launches all the kernels with
+    one call. The inputs are copied into the tensors the graph was captured with and the output is copied out
+    of its tensor, so the results are those of `fn` itself. The graph is captured at the first call, and again
+    when the names, shapes, dtypes or devices of the inputs change.
+    (Ported from ~/ACT_WITH_IMU/lerobot-piper, 2026-10-18.)
+    """
+
+    def __init__(self, fn: Callable[[dict[str, Tensor]], Tensor]):
+        self.fn = fn
+        self.signature = None
+        self.graph = None
+
+    def __call__(self, inputs: dict[str, Tensor]) -> Tensor:
+        if torch.is_autocast_enabled("cuda"):
+            raise ValueError("`cuda_graph` does not run under autocast (`use_amp`).")
+        signature = tuple((key, value.shape, value.dtype, value.device) for key, value in inputs.items())
+        if signature != self.signature:
+            self._capture(inputs)
+            self.signature = signature
+        for key, value in inputs.items():
+            self.inputs[key].copy_(value)
+        self.graph.replay()
+        return self.output.clone()
+
+    def _capture(self, inputs: dict[str, Tensor]) -> None:
+        if not inputs or any(value.device.type != "cuda" for value in inputs.values()):
+            raise ValueError("`cuda_graph` needs the policy and its inputs on a CUDA device.")
+        self.graph = self.output = None  # frees the previous graph's memory
+        with torch.inference_mode(False):  # tensors that can be written in inference mode and outside it
+            self.inputs = {key: torch.empty_like(value) for key, value in inputs.items()}
+        for key, value in inputs.items():
+            self.inputs[key].copy_(value)
+        # Warm-up runs on a side stream, as `torch.cuda.graph` requires: cuDNN and cuBLAS choose their kernels,
+        # and the normalization stats are checked, before the capture.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self.fn(self.inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self.output = self.fn(self.inputs)
+        self.graph = graph
 
 
 class ACTTemporalEnsembler:
@@ -523,11 +621,11 @@ class ACT(nn.Module):
             # Sample the latent with the reparameterization trick.
             latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
         else:
-            # When not using the VAE encoder, we set the latent to be all zeros.
+            # When not using the VAE encoder, we set the latent to be all zeros. Made on the device: no copy from
+            # the CPU, which also keeps the inference forward capturable in a CUDA graph.
             mu = log_sigma_x2 = None
-            # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch["observation.state"].device
+            latent_sample = torch.zeros(
+                [batch_size, self.config.latent_dim], dtype=torch.float32, device=batch["observation.state"].device
             )
 
         # Prepare transformer encoder inputs.

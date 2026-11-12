@@ -114,7 +114,12 @@ class PiperMotorsBus:
         gripper_range = round(target_joint[6]*1000*1000)
 
         self.piper.MotionCtrl_2(0x01, 0x01, 100, 0x00) # joint control
+        # ZOH 起点 = JointCtrl 真正写总线的时刻(不是 send_action 入口, 也不是计划发送时刻)。
+        # 前有 MotionCtrl_2、后有 GripperCtrl, 在外层加时间戳会把它们的耗时算进去。
+        # 探针分析读 last_jointctrl_t = (pre, post), 用中点, 用 (post-pre) 量化不确定度。
+        t_pre = time.monotonic()
         self.piper.JointCtrl(joint_0, joint_1, joint_2, joint_3, joint_4, joint_5)
+        self.last_jointctrl_t = (t_pre, time.monotonic())
         self.piper.GripperCtrl(abs(gripper_range), 1000, 0x01, 0) # 单位 0.001°
     
 

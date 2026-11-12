@@ -43,6 +43,8 @@ class TSND151Reader:
         self.device_path = device_path
         self.interval_ms = interval_ms
         self.buffer = deque(maxlen=buffer_size)  # tuples: (host_t, device_ms, acc[3], gyro[3])
+        self._rec = deque()                      # 100Hz 记录队列(与控制侧 buffer 分离)
+        self._recording = False
         self._buffer_lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._thread = None
@@ -75,6 +77,8 @@ class TSND151Reader:
             gyro = np.array(gyro_raw, dtype=np.float32) * GYRO_UNIT_TO_RADS
             with self._buffer_lock:
                 self.buffer.append((host_t, ms, acc, gyro))
+                if self._recording:              # 记录侧独立累积, 不影响控制侧环形覆盖
+                    self._rec.append((host_t, ms, acc, gyro))
 
     def get_latest(self):
         """最新一条 sample；无数据返回 None。"""
@@ -87,6 +91,31 @@ class TSND151Reader:
         """当前 ring buffer 的全部快照（拷贝）。"""
         with self._buffer_lock:
             return list(self.buffer)
+
+    def start_recording(self):
+        """开启 100Hz 全样本记录（独立队列，**绝不触碰控制侧 buffer**）。"""
+        with self._buffer_lock:
+            self._rec = deque()
+            self._recording = True
+
+    def drain_recording(self):
+        """取出并清空**记录队列**（100Hz 全样本）。控制侧 get_latest() 完全不受影响。
+
+        2026-07-27: 早先版本让 drain() 清空共用 ring buffer —— 那会使 get_latest()
+        在排空瞬间返回 None，**改变控制行为**。现分两个队列:
+            _drain_loop → buffer(控制侧, maxlen 环形) + _rec(记录侧, 无上限)
+        """
+        with self._buffer_lock:
+            if not getattr(self, "_recording", False):
+                return []
+            out = list(self._rec)
+            self._rec.clear()
+            return out
+
+    def stop_recording(self):
+        with self._buffer_lock:
+            self._recording = False
+            self._rec = deque()
 
     def stop(self):
         self._stop_evt.set()

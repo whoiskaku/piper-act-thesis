@@ -1,5 +1,7 @@
 import abc
+import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Type, TypeVar
@@ -154,4 +156,16 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         # HACK: this is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
-        return draccus.parse(cls, config_file, args=cli_overrides)
+        if not cli_overrides:
+            return draccus.parse(cls, config_file, args=[])
+        # 带覆盖项时必须用具体子类（如 ACTConfig）解析：用基类解析，子类字段（n_action_steps、
+        # temporal_ensemble_coeff 等）会报 unrecognized arguments（2026-10-18 实测）。
+        # 子类解析不认文件里的 type 键，所以先去掉它（同上游 lerobot 后来的做法）。
+        sub = type(draccus.parse(cls, config_file, args=[]))
+        with open(config_file) as f:
+            raw = json.load(f)
+        raw.pop("type", None)
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(raw, f)
+            f.flush()
+            return draccus.parse(sub, f.name, args=cli_overrides)

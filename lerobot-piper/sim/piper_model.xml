@@ -1,0 +1,118 @@
+<mujoco model="piper">
+    <!-- 对照官方 soulde/Piper_mujoco (assets/Piper/robot.xml) 后的结论 (2026-06-23):
+         官方是 torque(motor) 控制模型 — RK4 + 低关节阻尼(0.05) + 不同 mesh/惯量 + 无 IMU,
+         其参数为力矩控制服务。本模型是 position 伺服模型 (kp + 关节阻尼 + 我们的 IMU site/sensor),
+         是本研究正确范式 (ACT 输出关节位置命令)。故官方的 actuator/mesh/惯量/低阻尼均不适配本范式,
+         不采纳 (position 伺服靠关节阻尼防振铃, 砍到 0.05 会让刚性 kp 伺服高频振铃 → 注入假 action→IMU 高频)。
+         仅采纳与范式无关的数值改进:
+           · integrator=implicitfast — 对刚性 kp+阻尼比默认 Euler / 官方 RK4 更稳更准;
+           · autolimits — 由 joint range 自动推 ctrl 限位, 规范。
+         2026-07-08 与厂商官方 agilexrobotics/piper_ros(noetic) mujoco_model/piper_description.xml 程序化比对:
+         运动学(全body pos/quat)/惯量/关节轴·限位·阻尼/全部mesh(md5) 完全一致(diff=0);
+         差异仅 3 处(有意): actuator kp 调软(500/200/200/100/50/50 vs 官方10000/2000/2000/500/200/200),
+         integrator, 以及我们添加的 ee_imu_site+acc/gyro/quat 传感器。
+         注: joint1 限位不对称(-2.618~2.168, ctrlrange±2.618 超限位)为官方原样, 非本仓笔误。
+         2026-07-08 修复: 初始位姿即存在自碰撞 world(base_link)↔link1 与 link7↔link8 —
+         前者把 j1 接触锁死(kp=10000 力矩~4937 仍纹丝不动), 后者令双指互顶。本模型无操作物体,
+         接触全为 mesh 伪影 → default 关碰撞(contype/conaffinity=0)。此前所有动力学回放
+         (Stage1 replay/noisy_piper_sim)的 j1 均被锁; 运动学管线(直接设qpos)不受影响。
+         关节阻尼/惯量保留 (范式相关)。action→state 的真实传递已由控制器代理 C(·) (#71, corr 0.99,
+         从真机标定) 描述, 不依赖 MJCF 保真 — 见 STAGE/讨论"为何 sim 保真非本研究限制"。 -->
+    <compiler angle="radian" autolimits="true" />
+    <option integrator="implicitfast" timestep="0.002" />
+    <size njmax="500" nconmax="100" />
+    <default>
+        <geom contype="0" conaffinity="0" />
+    </default>
+    <asset>
+        <mesh name="base_link" file="meshes/base_link.STL" />
+        <mesh name="link1" file="meshes/link1.STL" />
+        <mesh name="link2" file="meshes/link2.STL" />
+        <mesh name="link3" file="meshes/link3.STL" />
+        <mesh name="link4" file="meshes/link4.STL" />
+        <mesh name="link5" file="meshes/link5.STL" />
+        <mesh name="link6" file="meshes/link6.STL" />
+        <mesh name="gripper_base" file="meshes/gripper_base.STL" />
+        <mesh name="link7" file="meshes/link7.STL" />
+        <mesh name="link8" file="meshes/link8.STL" />
+    </asset>
+    <worldbody>
+        <!-- ==== 视觉道具 (2026-07-09): 纯显示用, 无碰撞(default contype/conaffinity=0),
+             位置为示意(真实物体位姿未记录); viewer 按 '2' 键可整组显隐(group=2)。
+             若需接触物理(归因接触段偏差)再另建带碰撞版本 — 见 plan_correction_framework。 ==== -->
+        <light name="deco_top" pos="0.4 0 1.2" dir="0 0 -1" directional="true"
+               diffuse="0.55 0.55 0.55" specular="0.1 0.1 0.1"/>
+        <geom name="deco_floor" type="plane" pos="0 0 -0.75" size="2 2 0.1"
+              rgba="0.90 0.90 0.88 1" group="2"/>
+        <geom name="deco_table" type="box" pos="0.22 0 -0.021" size="0.42 0.36 0.02"
+              rgba="0.85 0.80 0.70 1" group="2"/>
+        <geom name="deco_cube" type="box" pos="0.34 0.12 0.015" size="0.015 0.015 0.015"
+              rgba="0.92 0.45 0.18 1" group="2"/>
+        <geom name="deco_tray" type="box" pos="0.34 -0.14 0.004" size="0.05 0.05 0.004"
+              rgba="0.35 0.48 0.62 1" group="2"/>
+        <geom name="deco_slot_base" type="box" pos="0.42 0 0.02" size="0.03 0.022 0.02"
+              rgba="0.30 0.30 0.32 1" group="2"/>
+        <geom name="deco_slot_hole" type="box" pos="0.42 0 0.0405" size="0.017 0.009 0.001"
+              rgba="0.05 0.05 0.05 1" group="2"/>
+        <geom name="deco_battery" type="box" pos="0.34 0 0.0125" size="0.009 0.014 0.0125"
+              rgba="0.20 0.65 0.35 1" group="2"/>
+        <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="base_link" />
+        <body name="link1" pos="0 0 0.123">
+            <inertial pos="0.000121505 0.000104632 -0.00438597" quat="0.682111 0.730899 0.0143111 -0.0175062" mass="0.71" diaginertia="0.000489262 0.000439887 0.000404551" />
+            <joint name="joint1" pos="0 0 0" axis="0 0 1" limited="true" range="-2.618 2.168" damping="500"/>
+            <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link1" />
+            <body name="link2" pos="0 0 0" quat="0.0356735 -0.0356786 -0.706207 -0.706205">
+                <inertial pos="0.198666 -0.0109269 0.00142122" quat="0.510131 0.475585 0.525075 0.48773" mass="1.17" diaginertia="0.0679032 0.067745 0.00111966" />
+                <joint name="joint2" pos="0 0 0" axis="0 0 1" limited="true" range="0 3.14" damping="5"/>
+                <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link2" />
+                <body name="link3" pos="0.28503 0 0" quat="0.637536 0 0 -0.77042">
+                    <inertial pos="-0.0202738 -0.133915 -0.000458683" quat="0.706282 0.705111 0.0532202 0.0339395" mass="0.5" diaginertia="0.0138227 0.0138032 0.000244685" />
+                    <joint name="joint3" pos="0 0 0" axis="0 0 1" limited="true" range="-2.967 0" damping="20"/>
+                    <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link3" />
+                    <body name="link4" pos="-0.021984 -0.25075 0" quat="0.707105 0.707108 0 0">
+                        <inertial pos="-9.66636e-05 0.000876064 -0.00496881" quat="0.714689 -0.0948484 0.0635223 0.690064" mass="0.38" diaginertia="0.000191586 0.000185052 0.000152863" />
+                        <joint name="joint4" pos="0 0 0" axis="0 0 1" limited="true" range="-1.745 1.745" damping="5"/>
+                        <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link4" />
+                        <body name="link5" pos="0 0 0" quat="0.707105 -0.707108 0 0">
+                            <inertial pos="-4.10554e-05 -0.0566487 -0.00372058" quat="0.709589 0.704614 0.00134613 -0.00132656" mass="0.383" diaginertia="0.00166169 0.00164328 0.000185028" />
+                            <joint name="joint5" pos="0 0 0" axis="0 0 1" limited="true" range="-1.22 1.22" damping="5"/>
+                            <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link5" />
+                            <body name="link6" pos="8.8259e-05 -0.091 0" quat="0.707105 0.707108 0 0">
+                                <inertial pos="-0.000182345 7.94104e-05 0.0316214" quat="0.999977 6.30554e-05 0.00678017 0.000789386" mass="0.456991" diaginertia="0.000938039 0.000723068 0.000395388" />
+                                <joint name="joint6" pos="0 0 0" axis="0 0 1" limited="true" range="-2.0944 2.0944" damping="5"/>
+                                <geom type="mesh" rgba="0.898039 0.917647 0.929412 1" mesh="link6" />
+                                <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="gripper_base" />
+                                <site name="ee_imu_site" pos="0 0 0.13" quat="0.705583 -0.013848 -0.708475 0.004918" size="0.009" rgba="1 0.15 0.15 1"/>
+                                <body name="link7" pos="0 0 0.1358" quat="0.707105 0.707108 0 0">
+                                    <inertial pos="0.000651232 -0.049193 0.00972259" quat="0.477798 0.572974 -0.518028 0.418398" mass="0.025" diaginertia="7.74531e-05 7.36783e-05 5.0886e-06" />
+                                    <joint name="joint7" pos="0 0 0" axis="0 0 1" type="slide" limited="true" range="0 0.035" damping="100"/>
+                                    <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link7" />
+                                </body>
+                                <body name="link8" pos="0 0 0.1358" quat="-2.59734e-06 -2.59735e-06 -0.707108 -0.707105">
+                                    <inertial pos="0.000651232 -0.049193 0.00972259" quat="0.477798 0.572974 -0.518028 0.418398" mass="0.025" diaginertia="7.74531e-05 7.36783e-05 5.0886e-06" />
+                                    <joint name="joint8" pos="0 0 0" axis="0 0 -1" type="slide" limited="true" range="-0.035 0" damping="100"/>
+                                    <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link8" />
+                                </body>
+                            </body>
+                        </body>
+                    </body>
+                </body>
+            </body>
+        </body>
+    </worldbody>
+    <actuator>
+        <position name="joint1" ctrllimited="true" ctrlrange="-2.618 2.618" joint="joint1" kp="500" user="1" forcelimited="false"/>
+        <position name="joint2" ctrllimited="true" ctrlrange="0 3.14158" joint="joint2" kp="200" user="1" forcelimited="false"/>
+        <position name="joint3" ctrllimited="true" ctrlrange="-2.697 0" joint="joint3" kp="200" user="1" forcelimited="false"/>
+        <position name="joint4" ctrllimited="true" ctrlrange="-1.832 1.832" joint="joint4" kp="100" user="1" forcelimited="false"/>
+        <position name="joint5" ctrllimited="true" ctrlrange="-1.22 1.22" joint="joint5" kp="50" user="1" forcelimited="false"/>
+        <position name="joint6" ctrllimited="true" ctrlrange="-3.14158 3.14158" joint="joint6" kp="50" user="1" forcelimited="false"/>
+        <position name="joint7" ctrllimited="true" ctrlrange="0 0.0475" joint="joint7" kp="500" user="1" forcelimited="false" forcerange="-100 100"/>
+        <position name="joint8" ctrllimited="true" ctrlrange="-0.0475 0" joint="joint8" kp="500" user="1" forcelimited="false" forcerange="-100 100"/>
+    </actuator>
+    <sensor>
+        <accelerometer name="ee_accel" site="ee_imu_site"/>
+        <gyro name="ee_gyro" site="ee_imu_site"/>
+        <framequat name="ee_quat" objtype="site" objname="ee_imu_site"/>
+    </sensor>
+</mujoco>

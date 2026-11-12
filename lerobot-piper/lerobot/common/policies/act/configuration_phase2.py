@@ -34,8 +34,12 @@ class Phase2Config:
     )
     # Step schedule: at each step value, σ multiplier changes (multiplied
     # against sigma_per_dim). Discrete jumps for simplicity.
-    sigma_schedule_steps: tuple[int, ...] = (0, 25_000, 50_000)
-    sigma_schedule_values: tuple[float, ...] = (1.0, 0.5, 0.2)
+    # Round B (v4b): σ taper aligned to update_step. Round A bug had
+    # (0, 25K, 50K) which never advanced past stage 0 in 100 updates, so
+    # σ stayed at 1.0× the whole run (§6.9 cause #2). Now σ tapers to 0.7
+    # at update 100 and 0.5 at update 200 across the 300-update budget.
+    sigma_schedule_steps: tuple[int, ...] = (0, 100, 200)
+    sigma_schedule_values: tuple[float, ...] = (1.0, 0.7, 0.5)
     # → effective σ at step t is sigma_per_dim × sigma_schedule_values[stage(t)]
 
     # ============================================================
@@ -54,6 +58,12 @@ class Phase2Config:
     reward_clip_max: float = 3.0
     # Sim-to-real IMU offset correction (None = trust v2 stats)
     real_imu_calib_episodes: int = 0  # >0 = calibrate at episode 0..N-1
+    # Number of distinct demos to average for cross-demo NN reward.
+    # k=1 → Round A style (single nearest demo).
+    # k=5 → Round C style (cross-demo averaging, decouples per-demo noise).
+    # Round B (v4b) uses k=1 to keep reward identical to Round A for clean
+    # single-axis (schedule) ablation.
+    reward_k_demos: int = 1
 
     # ============================================================
     # Trajectory / GAE (D3)
@@ -81,11 +91,15 @@ class Phase2Config:
     # Loss coordination (D5)
     # ============================================================
     # α schedule: weight of RL loss in total loss
-    alpha_schedule_steps: tuple[int, ...] = (0, 100, 300)
-    alpha_schedule_values: tuple[float, ...] = (0.005, 0.025, 0.05)
-    # NOTE: halved from original (0.01, 0.05, 0.10) because Phase 2 smoketest
-    # showed L_BC drift to 2.34× C1 baseline after only 2 updates. RL gradient
-    # was too aggressive vs BC anchor at small σ.
+    # v4c (Round D / α sweet-spot search): constant α=0.012, midpoint between
+    # Round A's 0.005 (RL too weak, no smoothness change) and Round B's 0.025
+    # (RL too strong, task collapsed in 8 updates). Single-value schedule
+    # makes the α effect isolable.
+    alpha_schedule_steps: tuple[int, ...] = (0,)
+    alpha_schedule_values: tuple[float, ...] = (0.012,)
+    # Reference schedules:
+    #   Round A: (0,100,300)/(0.005,0.025,0.05) → 100 updates
+    #   Round B: (0,50,150)/(0.025,0.05,0.10)   → 300 updates, collapsed @ 8
     value_loss_coef: float = 0.5  # coefficient of L_V (V detached from encoder)
     bc_batch_size_chunks: int = 12  # B=12 × L=600 ≈ 14GB; B=24 was OOM on RTX 3090
     # KL penalty (off by default, enable on failure)
@@ -96,12 +110,13 @@ class Phase2Config:
     # Safety (D6)
     # ============================================================
     # Action range = v2 stats min/max × this margin
-    action_clamp_margin: float = 1.2
+    # Round B (v4b): middle ground after v4a (1.2 collision) and v4a_safe (0.95
+    # over-clamping caused PPO ratio mismatch + KL explosion to 1000-10000).
+    # 1.05 gives ACT 5% explore room while staying close to demo range.
+    action_clamp_margin: float = 1.05
     # Step-to-step velocity limit (rad). Only enforced in stochastic mode.
-    # Bumped from 0.05 → 0.10 because σ-noise on gripper + natural ACT motion
-    # were tripping the limit on 41-66% of steps in smoketest. 0.10 rad/step
-    # = 3 rad/s, still well within Piper safety envelope.
-    velocity_max_delta: float = 0.10
+    # Round B: middle of v4a (0.10) and v4a_safe (0.05).
+    velocity_max_delta: float = 0.08
     # Chunk boundary μ smoothing
     chunk_boundary_ramp_steps: int = 5
     # IMU sanity check
@@ -118,7 +133,7 @@ class Phase2Config:
     # ============================================================
     # Main loop (D6)
     # ============================================================
-    n_updates: int = 100
+    n_updates: int = 150  # v4c: shorter budget for α sweet-spot test; abort fast if no improvement.
     save_freq: int = 20  # save ckpt every N updates
 
     # ============================================================
@@ -149,12 +164,14 @@ class Phase2Config:
     # ============================================================
     # Paths (updated 2026-05-09 to v3 — fixed IMU/camera mount)
     # ============================================================
+    # Round B (v4b): fresh start from C1-v3 70K (clean BC baseline) for
+    # single-axis ablation vs Round A.
     c1_ckpt_path: str = (
         "/home/enolab-guo/claude-test-2/lerobot-piper/outputs/train/"
         "2026-05-08/C1_v3_history_seed42/checkpoints/070000/pretrained_model"
     )
     v2_dataset_repo: str = "local/piper_pick_place_imu_v3"
-    output_dir: str = "outputs/train/phase2"
+    output_dir: str = "outputs/train/phase2_v4c"
     reward_computer_pickle: str = "outputs/eval/d2_imu_reward_computer.pkl"
 
     # ============================================================

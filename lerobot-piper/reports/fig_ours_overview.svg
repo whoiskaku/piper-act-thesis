@@ -1,0 +1,234 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="660" viewBox="0 0 1600 660">
+  <!-- 草稿：仿 APEX 图 1 上半部分，画我们的方法（pi-g2env-v1 + FF）。数字均为旧桌面。 -->
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 L3,5 z" fill="#1d8fbf"/>
+    </marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 L3,5 z" fill="#d6405f"/>
+    </marker>
+    <marker id="ahk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 L3,5 z" fill="#1f2d4d"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: 'DejaVu Sans', Helvetica, Arial, sans-serif; fill: #1f2d4d; }
+    .t { font-size: 15px; font-weight: 700; }
+    .m { font-size: 13px; }
+    .s { font-size: 12px; }
+    .i { font-style: italic; }
+    .note { font-size: 11.5px; fill: #5b6b80; }
+    .box { fill: #def0f7; stroke: #1d8fbf; stroke-width: 2.5; }
+    .learn { fill: #fbe9ee; stroke: #d6405f; stroke-width: 2.5; }
+    .wire { fill: none; stroke: #1d8fbf; stroke-width: 2.4; }
+    .bp { fill: none; stroke: #d6405f; stroke-width: 2.2; stroke-dasharray: 8 5; }
+    .inset { fill: #ffffff; stroke: #1d8fbf; stroke-width: 2; stroke-dasharray: 7 4; }
+    .node { fill: #ffffff; stroke: #1f2d4d; stroke-width: 2.4; }
+    .pill { font-size: 11.5px; font-weight: 700; fill: #ffffff; }
+  </style>
+
+  <rect width="1600" height="660" fill="#ffffff"/>
+  <rect x="88" y="14" width="1500" height="632" rx="28" fill="#f6fafc" stroke="#1d8fbf" stroke-width="4" stroke-dasharray="16 10"/>
+  <text transform="translate(42,330) rotate(-90)" text-anchor="middle" font-size="25" font-weight="700">Ours (draft):</text>
+  <text transform="translate(72,330) rotate(-90)" text-anchor="middle" font-size="25">IMU-guided Execution Correction</text>
+
+  <!-- 行标签 -->
+  <text x="108" y="52" class="s" font-weight="700" fill="#1d8fbf">① OFFLINE</text>
+  <text x="108" y="69" class="note">train in simulator</text>
+  <text x="108" y="400" class="s" font-weight="700" fill="#1d8fbf">② ONLINE</text>
+  <text x="108" y="417" class="note">deploy on real Piper</text>
+
+  <!-- ACT 策略 -->
+  <text x="180" y="196" text-anchor="middle" class="t">ACT policy</text>
+  <g stroke="#1f2d4d" stroke-width="1.6">
+    <line x1="150" y1="230" x2="180" y2="218"/><line x1="150" y1="230" x2="180" y2="245"/><line x1="150" y1="230" x2="180" y2="272"/>
+    <line x1="150" y1="260" x2="180" y2="218"/><line x1="150" y1="260" x2="180" y2="245"/><line x1="150" y1="260" x2="180" y2="272"/>
+    <line x1="180" y1="218" x2="210" y2="230"/><line x1="180" y1="245" x2="210" y2="230"/><line x1="180" y1="272" x2="210" y2="230"/>
+    <line x1="180" y1="218" x2="210" y2="260"/><line x1="180" y1="245" x2="210" y2="260"/><line x1="180" y1="272" x2="210" y2="260"/>
+  </g>
+  <g fill="#1f2d4d">
+    <circle cx="150" cy="230" r="8"/><circle cx="150" cy="260" r="8"/>
+    <circle cx="180" cy="218" r="8"/><circle cx="180" cy="245" r="8"/><circle cx="180" cy="272" r="8"/>
+    <circle cx="210" cy="230" r="8"/><circle cx="210" cy="260" r="8"/>
+  </g>
+  <text x="180" y="300" text-anchor="middle" class="note">(any policy, untouched)</text>
+
+  <!-- 指令 u 的总线 -->
+  <path class="wire" d="M222,245 H285"/>
+  <text x="253" y="237" text-anchor="middle" class="m i">u</text>
+  <path class="wire" d="M285,115 V404"/>
+  <circle cx="285" cy="245" r="4.5" fill="#1d8fbf"/>
+  <circle cx="285" cy="300" r="4.5" fill="#1d8fbf"/>
+  <path class="wire" d="M285,115 H328" marker-end="url(#ah)"/>
+  <path class="wire" d="M285,300 H328" marker-end="url(#ah)"/>
+  <path class="wire" d="M285,404 H328" marker-end="url(#ah)"/>
+
+  <!-- ① 训练行 -->
+  <rect class="learn" x="330" y="62" width="210" height="106" rx="12"/>
+  <text x="435" y="88" text-anchor="middle" class="t">π<tspan dy="4" font-size="11">θ</tspan><tspan dy="-4">  correction net</tspan></text>
+  <text x="435" y="110" text-anchor="middle" class="m">dilated CNN · 68.8k params</text>
+  <text x="435" y="129" text-anchor="middle" class="m">in: 2 chunks of <tspan class="i">u</tspan></text>
+  <text x="435" y="148" text-anchor="middle" class="s">out: <tspan class="i">δa</tspan>, |<tspan class="i">δa</tspan>| ≤ 10 mrad</text>
+
+  <path class="wire" d="M540,115 H598" marker-end="url(#ah)"/>
+  <text x="569" y="106" text-anchor="middle" class="m i">δa</text>
+
+  <rect class="box" x="600" y="62" width="290" height="106" rx="12"/>
+  <text x="745" y="88" text-anchor="middle" class="t">G-2 simulator (frozen)</text>
+  <text x="745" y="110" text-anchor="middle" class="m">runs <tspan class="i">u</tspan>+<tspan class="i">δa</tspan>: joints → IMU <tspan class="i">ω̂</tspan></text>
+  <text x="745" y="129" text-anchor="middle" class="m">fitted on real robot logs</text>
+  <text x="745" y="150" text-anchor="middle" class="m i">ω̂(u+δa) ≈ ω̂(u) + J ∗ δa</text>
+
+  <path class="wire" d="M890,115 H947" marker-end="url(#ah)"/>
+  <text x="918" y="106" text-anchor="middle" class="m i">ω̂</text>
+  <circle class="node" cx="966" cy="115" r="17"/>
+  <line x1="957" y1="115" x2="975" y2="115" stroke="#1f2d4d" stroke-width="3"/>
+  <path class="wire" d="M983,115 H1018" marker-end="url(#ah)"/>
+
+  <rect class="box" x="1020" y="62" width="270" height="106" rx="12"/>
+  <text x="1155" y="88" text-anchor="middle" class="t">Loss (IMU gap, 0.5–9 Hz)</text>
+  <text x="1155" y="111" text-anchor="middle" class="s i">L = ‖BP(ω̂ − ω*)‖² / ‖BP(ω̂₀ − ω*)‖²</text>
+  <text x="1155" y="131" text-anchor="middle" class="s"><tspan class="i">ω̂₀</tspan>: <tspan class="i">δa</tspan> = 0  ⇒  <tspan class="i">L</tspan> = 1</text>
+  <text x="1155" y="151" text-anchor="middle" class="s">+ <tspan class="i">λ‖Δδa‖²</tspan> (smoothness)</text>
+
+  <path class="bp" d="M1155,62 V36 H500 V58" marker-end="url(#ahr)"/>
+  <text x="828" y="53" text-anchor="middle" class="s i" fill="#d6405f">∇θ L flows back to π through J  (G-2 itself is frozen and not differentiable)</text>
+
+  <!-- 中间：sim → real -->
+  <path d="M387,172 H413 V238 H428 L400,262 L372,238 H387 Z" fill="#cfe9f5" stroke="#1d8fbf" stroke-width="2"/>
+  <text x="438" y="204" class="m" font-weight="700">sim → real</text>
+  <text x="438" y="222" class="s">copy θ (frozen)</text>
+
+  <rect class="box" x="895" y="222" width="210" height="90" rx="12"/>
+  <text x="1000" y="245" text-anchor="middle" class="t">Ideal rendering</text>
+  <text x="1000" y="265" text-anchor="middle" class="m"><tspan class="i">ω*</tspan> = rigid kinematics(<tspan class="i">u</tspan>)</text>
+  <text x="1000" y="284" text-anchor="middle" class="s">ideal motion = the command</text>
+  <text x="1000" y="302" text-anchor="middle" class="note">no dynamics model (P0-checked)</text>
+  <path class="wire" d="M842,267 H893" marker-end="url(#ah)"/>
+  <text x="835" y="271" text-anchor="end" class="m"><tspan class="i">u</tspan> <tspan class="note">(from ACT)</tspan></text>
+  <path class="wire" d="M966,222 V134" marker-end="url(#ah)"/>
+  <text x="976" y="186" class="m i">ω*</text>
+  <path class="wire" d="M1050,312 V385" marker-end="url(#ah)"/>
+  <text x="1060" y="353" class="m i">ω*</text>
+
+  <!-- ② 部署行 -->
+  <rect class="learn" x="330" y="262" width="210" height="86" rx="12"/>
+  <text x="435" y="284" text-anchor="middle" class="t">π<tspan dy="4" font-size="11">θ</tspan><tspan dy="-4"> (frozen copy)</tspan></text>
+  <text x="435" y="302" text-anchor="middle" class="s">no G-2 / MuJoCo at run time</text>
+  <text x="435" y="319" text-anchor="middle" class="s" fill="#b86e00">? IMU input: none in v1</text>
+  <rect x="370" y="326" width="130" height="17" rx="8.5" fill="#c62828"/>
+  <text x="435" y="338.5" text-anchor="middle" class="pill">✗ failed on robot</text>
+
+  <rect class="box" x="330" y="366" width="210" height="76" rx="12"/>
+  <text x="435" y="388" text-anchor="middle" class="t">FF (feedforward)</text>
+  <text x="435" y="407" text-anchor="middle" class="m">lag preview + seam blend</text>
+  <rect x="364" y="417" width="142" height="17" rx="8.5" fill="#2e7d32"/>
+  <text x="435" y="429.5" text-anchor="middle" class="pill">✓ verified on robot</text>
+
+  <path class="wire" d="M540,300 H610 V385" marker-end="url(#ah)"/>
+  <text x="575" y="292" text-anchor="middle" class="m i">δa</text>
+  <path class="wire" d="M540,404 H591" marker-end="url(#ah)"/>
+  <text x="563" y="396" text-anchor="middle" class="m i">u<tspan dy="4" font-size="10">ff</tspan></text>
+  <circle class="node" cx="610" cy="404" r="17"/>
+  <line x1="601" y1="404" x2="619" y2="404" stroke="#1f2d4d" stroke-width="3"/>
+  <line x1="610" y1="395" x2="610" y2="413" stroke="#1f2d4d" stroke-width="3"/>
+  <path class="wire" d="M627,404 H688" marker-end="url(#ah)"/>
+  <text x="657" y="392" text-anchor="middle" class="s i">u<tspan dy="3" font-size="9">ff</tspan><tspan dy="-3">+δa</tspan></text>
+
+  <rect x="722" y="341" width="128" height="17" rx="8.5" fill="#ef8f00"/>
+  <text x="786" y="353.5" text-anchor="middle" class="pill">? MIT mode option</text>
+  <rect class="box" x="690" y="362" width="190" height="84" rx="12"/>
+  <text x="785" y="385" text-anchor="middle" class="t">Piper controller</text>
+  <text x="785" y="404" text-anchor="middle" class="m">MOVE J (black box)</text>
+  <text x="785" y="421" text-anchor="middle" class="s">planner (accel-limited)</text>
+  <text x="785" y="437" text-anchor="middle" class="s">+ joint servo</text>
+  <path class="wire" d="M880,404 H902" marker-end="url(#ah)"/>
+
+  <!-- 机械臂图标 -->
+  <g fill="#1f2d4d" stroke="#1f2d4d">
+    <rect x="912" y="436" width="46" height="12" rx="2" stroke="none"/>
+    <rect x="922" y="420" width="26" height="18" rx="3" stroke="none"/>
+    <line x1="935" y1="420" x2="935" y2="386" stroke-width="12" stroke-linecap="round"/>
+    <line x1="935" y1="386" x2="968" y2="368" stroke-width="10" stroke-linecap="round"/>
+    <line x1="968" y1="368" x2="977" y2="386" stroke-width="8" stroke-linecap="round"/>
+    <line x1="971" y1="389" x2="969" y2="399" stroke-width="4" stroke-linecap="round"/>
+    <line x1="983" y1="387" x2="986" y2="396" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="935" cy="386" r="9" stroke="none"/>
+    <circle cx="968" cy="368" r="7" stroke="none"/>
+  </g>
+  <circle cx="935" cy="386" r="3.5" fill="#ffffff"/>
+  <rect x="972" y="370" width="10" height="10" fill="#1d8fbf" stroke="#ffffff" stroke-width="1.5"/>
+  <text x="946" y="466" text-anchor="middle" class="note">Piper arm + wrist IMU</text>
+
+  <path class="wire" d="M990,404 H1031" marker-end="url(#ah)"/>
+  <text x="1010" y="396" text-anchor="middle" class="m i">ω</text>
+  <circle class="node" cx="1050" cy="404" r="17"/>
+  <line x1="1041" y1="404" x2="1059" y2="404" stroke="#1f2d4d" stroke-width="3"/>
+  <path class="wire" d="M1067,404 H1098" marker-end="url(#ah)"/>
+
+  <rect class="box" x="1100" y="356" width="190" height="96" rx="12"/>
+  <text x="1195" y="380" text-anchor="middle" class="t">Evaluate</text>
+  <text x="1195" y="399" text-anchor="middle" class="m">actual vs command:</text>
+  <text x="1195" y="418" text-anchor="middle" class="s">gap = <tspan class="i">ω − ω*</tspan> (0.5–9 Hz)</text>
+  <text x="1195" y="436" text-anchor="middle" class="s">+ success rate, joints</text>
+
+  <!-- 右上：仿真结果 -->
+  <rect class="inset" x="1312" y="46" width="262" height="150" rx="6"/>
+  <text x="1324" y="68" class="m" font-weight="700">① In simulator (held-out)</text>
+  <text x="1324" y="85" class="note">IMU gap change vs δa = 0</text>
+  <line x1="1505" y1="98" x2="1505" y2="174" stroke="#1f2d4d" stroke-width="1.5"/>
+  <text x="1324" y="115" class="s">J-linearized</text>
+  <text x="1324" y="129" class="note">(training caliber)</text>
+  <rect x="1457.2" y="104" width="47.8" height="14" fill="#90a4ae"/>
+  <text x="1511" y="115" class="s">−39.8%</text>
+  <text x="1324" y="154" class="s">true G-2</text>
+  <text x="1324" y="168" class="note">(real forward)</text>
+  <rect x="1486" y="143" width="19" height="14" fill="#607d8b"/>
+  <text x="1511" y="154" class="s">−15.8%</text>
+  <text x="1324" y="189" class="note">← better · simulation only</text>
+
+  <!-- 右下：真机结果 -->
+  <rect class="inset" x="1312" y="330" width="262" height="150" rx="6"/>
+  <text x="1324" y="352" class="m" font-weight="700">② On robot (vs bare ACT)</text>
+  <text x="1324" y="369" class="note">IMU gap, 0.5–9 Hz · old table</text>
+  <line x1="1505" y1="380" x2="1505" y2="458" stroke="#1f2d4d" stroke-width="1.5"/>
+  <text x="1324" y="398" class="s">FF alone</text>
+  <text x="1324" y="412" class="note">10/10 episodes better</text>
+  <rect x="1465.4" y="387" width="39.6" height="14" fill="#2e7d32"/>
+  <text x="1511" y="398" class="s">−33.0%</text>
+  <text x="1324" y="438" class="s">π alone</text>
+  <text x="1324" y="452" class="note">6/30 episodes better</text>
+  <rect x="1505" y="427" width="30" height="14" fill="#c62828"/>
+  <text x="1499" y="438" text-anchor="end" class="s">+25.0%</text>
+  <text x="1324" y="473" class="note">← better · separate sessions</text>
+
+  <!-- 左下：问题示意 -->
+  <rect class="inset" x="104" y="490" width="462" height="146" rx="6"/>
+  <text x="118" y="510" class="m" font-weight="700">Without correction (schematic)</text>
+  <line x1="295.1" y1="520" x2="295.1" y2="622" stroke="#8a97a8" stroke-width="1.3" stroke-dasharray="3 3"/>
+  <path fill="none" stroke="#d6405f" stroke-width="2" stroke-dasharray="6 4" d="M118.0,575.0 L119.3,573.9 L120.7,572.8 L122.0,571.7 L123.4,570.5 L124.7,569.4 L126.0,568.3 L127.4,567.3 L128.7,566.2 L130.1,565.1 L131.4,564.1 L132.8,563.1 L134.1,562.1 L135.4,561.1 L136.8,560.1 L138.1,559.2 L139.5,558.2 L140.8,557.4 L142.2,556.5 L143.5,555.7 L144.8,554.8 L146.2,554.1 L147.5,553.3 L148.9,552.6 L150.2,551.9 L151.5,551.3 L152.9,550.7 L154.2,550.1 L155.6,549.6 L156.9,549.1 L158.2,548.7 L159.6,548.3 L160.9,547.9 L162.3,547.6 L163.6,547.3 L165.0,547.0 L166.3,546.9 L167.6,546.7 L169.0,546.6 L170.3,546.5 L171.7,546.5 L173.0,546.5 L174.3,546.6 L175.7,546.7 L177.0,546.9 L178.4,547.0 L179.7,547.3 L181.1,547.6 L182.4,547.9 L183.7,548.3 L185.1,548.7 L186.4,549.1 L187.8,549.6 L189.1,550.1 L190.4,550.7 L191.8,551.3 L193.1,551.9 L194.5,552.6 L195.8,553.3 L197.2,554.1 L198.5,554.8 L199.8,555.7 L201.2,556.5 L202.5,557.4 L203.9,558.2 L205.2,559.2 L206.6,560.1 L207.9,561.1 L209.2,562.1 L210.6,563.1 L211.9,564.1 L213.3,565.1 L214.6,566.2 L215.9,567.3 L217.3,568.3 L218.6,569.4 L220.0,570.5 L221.3,571.7 L222.7,572.8 L224.0,573.9 L225.3,575.0 L226.7,576.1 L228.0,577.2 L229.4,578.3 L230.7,579.5 L232.0,580.6 L233.4,581.7 L234.7,582.7 L236.1,583.8 L237.4,584.9 L238.8,585.9 L240.1,586.9 L241.4,587.9 L242.8,588.9 L244.1,589.9 L245.5,590.8 L246.8,591.8 L248.1,592.6 L249.5,593.5 L250.8,594.3 L252.2,595.2 L253.5,595.9 L254.8,596.7 L256.2,597.4 L257.5,598.1 L258.9,598.7 L260.2,599.3 L261.6,599.9 L262.9,600.4 L264.2,600.9 L265.6,601.3 L266.9,601.7 L268.3,602.1 L269.6,602.4 L270.9,602.7 L272.3,603.0 L273.6,603.1 L275.0,603.3 L276.3,603.4 L277.7,603.5 L279.0,603.5 L280.3,603.5 L281.7,603.4 L283.0,603.3 L284.4,603.1 L285.7,602.9 L287.1,602.4 L288.4,601.4 L289.7,599.1 L291.1,594.7 L292.4,588.4 L293.8,582.4 L295.1,579.5 L296.4,581.3 L297.8,586.4 L299.1,591.6 L300.5,595.0 L301.8,596.4 L303.1,596.4 L304.5,595.9 L305.8,595.1 L307.2,594.3 L308.5,593.5 L309.9,592.6 L311.2,591.8 L312.5,590.8 L313.9,589.9 L315.2,588.9 L316.6,587.9 L317.9,586.9 L319.2,585.9 L320.6,584.9 L321.9,583.8 L323.3,582.7 L324.6,581.7 L326.0,580.6 L327.3,579.5 L328.6,578.3 L330.0,577.2 L331.3,576.1 L332.7,575.0 L334.0,573.9 L335.4,572.8 L336.7,571.7 L338.0,570.5 L339.4,569.4 L340.7,568.3 L342.1,567.3 L343.4,566.2 L344.7,565.1 L346.1,564.1 L347.4,563.1 L348.8,562.1 L350.1,561.1 L351.4,560.1 L352.8,559.2 L354.1,558.2 L355.5,557.4 L356.8,556.5 L358.2,555.7 L359.5,554.8 L360.8,554.1 L362.2,553.3 L363.5,552.6 L364.9,551.9 L366.2,551.3 L367.6,550.7 L368.9,550.1 L370.2,549.6 L371.6,549.1 L372.9,548.7 L374.3,548.3 L375.6,547.9 L376.9,547.6 L378.3,547.3 L379.6,547.0 L381.0,546.9 L382.3,546.7 L383.6,546.6 L385.0,546.5 L386.3,546.5 L387.7,546.5 L389.0,546.6 L390.4,546.7 L391.7,546.9 L393.0,547.0 L394.4,547.3 L395.7,547.6 L397.1,547.9 L398.4,548.3 L399.8,548.7 L401.1,549.1 L402.4,549.6 L403.8,550.1 L405.1,550.7 L406.5,551.3 L407.8,551.9 L409.1,552.6 L410.5,553.3 L411.8,554.1 L413.2,554.8 L414.5,555.7 L415.9,556.5 L417.2,557.4 L418.5,558.2 L419.9,559.2 L421.2,560.1 L422.6,561.1 L423.9,562.1 L425.2,563.1 L426.6,564.1 L427.9,565.1 L429.3,566.2 L430.6,567.3 L431.9,568.3 L433.3,569.4 L434.6,570.5 L436.0,571.7 L437.3,572.8 L438.7,573.9 L440.0,575.0"/>
+  <path fill="none" stroke="#2b4c7e" stroke-width="2.2" d="M118.0,592.5 L119.3,591.6 L120.7,590.6 L122.0,589.7 L123.4,588.7 L124.7,587.7 L126.0,586.7 L127.4,585.7 L128.7,584.7 L130.1,583.6 L131.4,582.5 L132.8,581.4 L134.1,580.3 L135.4,579.2 L136.8,578.1 L138.1,577.0 L139.5,575.9 L140.8,574.8 L142.2,573.7 L143.5,572.5 L144.8,571.4 L146.2,570.3 L147.5,569.2 L148.9,568.1 L150.2,567.0 L151.5,566.0 L152.9,564.9 L154.2,563.9 L155.6,562.9 L156.9,561.9 L158.2,560.9 L159.6,559.9 L160.9,559.0 L162.3,558.1 L163.6,557.2 L165.0,556.3 L166.3,555.5 L167.6,554.7 L169.0,553.9 L170.3,553.2 L171.7,552.5 L173.0,551.8 L174.3,551.2 L175.7,550.6 L177.0,550.0 L178.4,549.5 L179.7,549.0 L181.1,548.6 L182.4,548.2 L183.7,547.8 L185.1,547.5 L186.4,547.2 L187.8,547.0 L189.1,546.8 L190.4,546.7 L191.8,546.6 L193.1,546.5 L194.5,546.5 L195.8,546.5 L197.2,546.6 L198.5,546.7 L199.8,546.9 L201.2,547.1 L202.5,547.3 L203.9,547.6 L205.2,548.0 L206.6,548.3 L207.9,548.8 L209.2,549.2 L210.6,549.7 L211.9,550.2 L213.3,550.8 L214.6,551.4 L215.9,552.1 L217.3,552.8 L218.6,553.5 L220.0,554.2 L221.3,555.0 L222.7,555.8 L224.0,556.7 L225.3,557.5 L226.7,558.4 L228.0,559.4 L229.4,560.3 L230.7,561.3 L232.0,562.3 L233.4,563.3 L234.7,564.3 L236.1,565.3 L237.4,566.4 L238.8,567.5 L240.1,568.6 L241.4,569.7 L242.8,570.8 L244.1,571.9 L245.5,573.0 L246.8,574.1 L248.1,575.2 L249.5,576.3 L250.8,577.5 L252.2,578.6 L253.5,579.7 L254.8,580.8 L256.2,581.9 L257.5,583.0 L258.9,584.0 L260.2,585.1 L261.6,586.1 L262.9,587.1 L264.2,588.1 L265.6,589.1 L266.9,590.1 L268.3,591.0 L269.6,591.9 L270.9,592.8 L272.3,593.7 L273.6,594.5 L275.0,595.3 L276.3,596.1 L277.7,596.8 L279.0,597.5 L280.3,598.2 L281.7,598.8 L283.0,599.4 L284.4,600.0 L285.7,600.5 L287.1,601.0 L288.4,601.4 L289.7,601.8 L291.1,602.2 L292.4,602.5 L293.8,602.8 L295.1,603.0 L296.4,603.2 L297.8,603.3 L299.1,603.4 L300.5,603.5 L301.8,603.5 L303.1,603.5 L304.5,603.4 L305.8,603.3 L307.2,603.1 L308.5,602.9 L309.9,602.7 L311.2,602.4 L312.5,602.0 L313.9,601.7 L315.2,601.2 L316.6,600.8 L317.9,599.7 L319.2,596.2 L320.6,593.2 L321.9,590.8 L323.3,588.9 L324.6,587.5 L326.0,586.7 L327.3,586.4 L328.6,586.4 L330.0,586.8 L331.3,587.3 L332.7,588.0 L334.0,588.7 L335.4,589.3 L336.7,589.8 L338.0,590.1 L339.4,590.2 L340.7,590.0 L342.1,589.6 L343.4,588.8 L344.7,587.8 L346.1,586.6 L347.4,585.2 L348.8,583.6 L350.1,581.9 L351.4,580.1 L352.8,578.3 L354.1,576.5 L355.5,574.8 L356.8,573.1 L358.2,571.5 L359.5,570.0 L360.8,568.7 L362.2,567.4 L363.5,566.3 L364.9,565.3 L366.2,564.3 L367.6,563.5 L368.9,562.7 L370.2,562.0 L371.6,561.3 L372.9,560.6 L374.3,559.9 L375.6,559.2 L376.9,558.5 L378.3,557.8 L379.6,557.0 L381.0,556.3 L382.3,555.5 L383.6,554.7 L385.0,553.9 L386.3,553.1 L387.7,552.3 L389.0,551.6 L390.4,550.9 L391.7,550.2 L393.0,549.5 L394.4,548.9 L395.7,548.4 L397.1,547.9 L398.4,547.5 L399.8,547.2 L401.1,546.9 L402.4,546.7 L403.8,546.5 L405.1,546.4 L406.5,546.3 L407.8,546.3 L409.1,546.4 L410.5,546.5 L411.8,546.6 L413.2,546.8 L414.5,547.0 L415.9,547.2 L417.2,547.5 L418.5,547.8 L419.9,548.1 L421.2,548.5 L422.6,548.9 L423.9,549.3 L425.2,549.8 L426.6,550.3 L427.9,550.9 L429.3,551.5 L430.6,552.1 L431.9,552.7 L433.3,553.4 L434.6,554.2 L436.0,555.0 L437.3,555.8 L438.7,556.6 L440.0,557.5"/>
+  <line x1="172" y1="536" x2="194" y2="536" stroke="#1f2d4d" stroke-width="1.4" marker-start="url(#ahk)" marker-end="url(#ahk)"/>
+  <text x="183" y="530" text-anchor="middle" class="s">lag</text>
+  <text x="295" y="632" text-anchor="middle" class="note">chunk seam</text>
+  <text x="352" y="614" class="note">ringing</text>
+  <line x1="452" y1="558" x2="476" y2="558" stroke="#2b4c7e" stroke-width="2.2"/>
+  <text x="482" y="562" class="s"><tspan class="i">ω</tspan> actual</text>
+  <line x1="452" y1="582" x2="476" y2="582" stroke="#d6405f" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="482" y="586" class="s"><tspan class="i">ω*</tspan> ideal</text>
+
+  <!-- 图例与口径 -->
+  <rect x="598" y="500" width="132" height="17" rx="8.5" fill="#2e7d32"/>
+  <text x="664" y="512.5" text-anchor="middle" class="pill">✓ verified on robot</text>
+  <rect x="740" y="500" width="118" height="17" rx="8.5" fill="#c62828"/>
+  <text x="799" y="512.5" text-anchor="middle" class="pill">✗ failed on robot</text>
+  <rect x="868" y="500" width="110" height="17" rx="8.5" fill="#607d8b"/>
+  <text x="923" y="512.5" text-anchor="middle" class="pill">simulation only</text>
+  <rect x="988" y="500" width="118" height="17" rx="8.5" fill="#ef8f00"/>
+  <text x="1047" y="512.5" text-anchor="middle" class="pill">? open question</text>
+  <text x="600" y="542" class="s"><tspan class="i">u</tspan>: ACT command chunk (100 frames, 20 Hz) · <tspan class="i">δa</tspan>: correction (≤ 10 mrad, zero during contact) · <tspan class="i">ω</tspan>: measured wrist IMU gyro</text>
+  <text x="600" y="561" class="s"><tspan class="i">ω̂</tspan>: G-2-predicted gyro · <tspan class="i">ω*</tspan>: ideal gyro rendered from <tspan class="i">u</tspan> · BP: 0.5–9 Hz band-pass · <tspan class="i">J</tspan>: G-2's own Jacobian</text>
+  <text x="600" y="590" class="s" font-weight="700" fill="#b23c17">⚠ All numbers are from the OLD (unstable) table and must be re-measured on the new table.</text>
+  <text x="600" y="610" class="note">Robot results: FF and π were each tested alone, in separate sessions; FF + this π together was not tested.</text>
+  <text x="600" y="628" class="note">Left inset is schematic; bar values are measured.</text>
+</svg>

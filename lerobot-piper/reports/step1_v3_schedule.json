@@ -1,0 +1,373 @@
+{
+ "seed": 20260824,
+ "n_episodes": 40,
+ "bare_slots": [
+  1,
+  7,
+  14,
+  20
+ ],
+ "note": "裸 ACT: a_prox=a_wrist=0 ⇒ δa≡0, τ 不可识别故记 null。漂移协变量 = slot(=分析序号)。",
+ "schedule": [
+  {
+   "session": 1,
+   "slot": 1,
+   "arm": "bare",
+   "corner": null,
+   "a_prox": 0.0,
+   "a_wrist": 0.0,
+   "tau": null
+  },
+  {
+   "session": 1,
+   "slot": 2,
+   "arm": "corner",
+   "corner": "++-",
+   "a_prox": 2.0,
+   "a_wrist": 2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 1,
+   "slot": 3,
+   "arm": "corner",
+   "corner": "--+",
+   "a_prox": -2.0,
+   "a_wrist": -2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 1,
+   "slot": 4,
+   "arm": "corner",
+   "corner": "-+-",
+   "a_prox": -2.0,
+   "a_wrist": 2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 1,
+   "slot": 5,
+   "arm": "corner",
+   "corner": "+++",
+   "a_prox": 2.0,
+   "a_wrist": 2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 1,
+   "slot": 6,
+   "arm": "corner",
+   "corner": "-++",
+   "a_prox": -2.0,
+   "a_wrist": 2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 1,
+   "slot": 7,
+   "arm": "bare",
+   "corner": null,
+   "a_prox": 0.0,
+   "a_wrist": 0.0,
+   "tau": null
+  },
+  {
+   "session": 1,
+   "slot": 8,
+   "arm": "corner",
+   "corner": "+-+",
+   "a_prox": 2.0,
+   "a_wrist": -2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 1,
+   "slot": 9,
+   "arm": "corner",
+   "corner": "+--",
+   "a_prox": 2.0,
+   "a_wrist": -2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 1,
+   "slot": 10,
+   "arm": "corner",
+   "corner": "---",
+   "a_prox": -2.0,
+   "a_wrist": -2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 1,
+   "slot": 11,
+   "arm": "corner",
+   "corner": "+++",
+   "a_prox": 2.0,
+   "a_wrist": 2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 1,
+   "slot": 12,
+   "arm": "corner",
+   "corner": "-++",
+   "a_prox": -2.0,
+   "a_wrist": 2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 1,
+   "slot": 13,
+   "arm": "corner",
+   "corner": "+-+",
+   "a_prox": 2.0,
+   "a_wrist": -2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 1,
+   "slot": 14,
+   "arm": "bare",
+   "corner": null,
+   "a_prox": 0.0,
+   "a_wrist": 0.0,
+   "tau": null
+  },
+  {
+   "session": 1,
+   "slot": 15,
+   "arm": "corner",
+   "corner": "+--",
+   "a_prox": 2.0,
+   "a_wrist": -2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 1,
+   "slot": 16,
+   "arm": "corner",
+   "corner": "---",
+   "a_prox": -2.0,
+   "a_wrist": -2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 1,
+   "slot": 17,
+   "arm": "corner",
+   "corner": "-+-",
+   "a_prox": -2.0,
+   "a_wrist": 2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 1,
+   "slot": 18,
+   "arm": "corner",
+   "corner": "++-",
+   "a_prox": 2.0,
+   "a_wrist": 2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 1,
+   "slot": 19,
+   "arm": "corner",
+   "corner": "--+",
+   "a_prox": -2.0,
+   "a_wrist": -2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 1,
+   "slot": 20,
+   "arm": "bare",
+   "corner": null,
+   "a_prox": 0.0,
+   "a_wrist": 0.0,
+   "tau": null
+  },
+  {
+   "session": 2,
+   "slot": 1,
+   "arm": "bare",
+   "corner": null,
+   "a_prox": 0.0,
+   "a_wrist": 0.0,
+   "tau": null
+  },
+  {
+   "session": 2,
+   "slot": 2,
+   "arm": "corner",
+   "corner": "++-",
+   "a_prox": 2.0,
+   "a_wrist": 2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 2,
+   "slot": 3,
+   "arm": "corner",
+   "corner": "---",
+   "a_prox": -2.0,
+   "a_wrist": -2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 2,
+   "slot": 4,
+   "arm": "corner",
+   "corner": "+--",
+   "a_prox": 2.0,
+   "a_wrist": -2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 2,
+   "slot": 5,
+   "arm": "corner",
+   "corner": "-+-",
+   "a_prox": -2.0,
+   "a_wrist": 2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 2,
+   "slot": 6,
+   "arm": "corner",
+   "corner": "--+",
+   "a_prox": -2.0,
+   "a_wrist": -2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 2,
+   "slot": 7,
+   "arm": "bare",
+   "corner": null,
+   "a_prox": 0.0,
+   "a_wrist": 0.0,
+   "tau": null
+  },
+  {
+   "session": 2,
+   "slot": 8,
+   "arm": "corner",
+   "corner": "+-+",
+   "a_prox": 2.0,
+   "a_wrist": -2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 2,
+   "slot": 9,
+   "arm": "corner",
+   "corner": "-++",
+   "a_prox": -2.0,
+   "a_wrist": 2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 2,
+   "slot": 10,
+   "arm": "corner",
+   "corner": "+++",
+   "a_prox": 2.0,
+   "a_wrist": 2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 2,
+   "slot": 11,
+   "arm": "corner",
+   "corner": "--+",
+   "a_prox": -2.0,
+   "a_wrist": -2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 2,
+   "slot": 12,
+   "arm": "corner",
+   "corner": "-+-",
+   "a_prox": -2.0,
+   "a_wrist": 2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 2,
+   "slot": 13,
+   "arm": "corner",
+   "corner": "+-+",
+   "a_prox": 2.0,
+   "a_wrist": -2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 2,
+   "slot": 14,
+   "arm": "bare",
+   "corner": null,
+   "a_prox": 0.0,
+   "a_wrist": 0.0,
+   "tau": null
+  },
+  {
+   "session": 2,
+   "slot": 15,
+   "arm": "corner",
+   "corner": "++-",
+   "a_prox": 2.0,
+   "a_wrist": 2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 2,
+   "slot": 16,
+   "arm": "corner",
+   "corner": "+++",
+   "a_prox": 2.0,
+   "a_wrist": 2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 2,
+   "slot": 17,
+   "arm": "corner",
+   "corner": "-++",
+   "a_prox": -2.0,
+   "a_wrist": 2.0,
+   "tau": 10.0
+  },
+  {
+   "session": 2,
+   "slot": 18,
+   "arm": "corner",
+   "corner": "+--",
+   "a_prox": 2.0,
+   "a_wrist": -2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 2,
+   "slot": 19,
+   "arm": "corner",
+   "corner": "---",
+   "a_prox": -2.0,
+   "a_wrist": -2.0,
+   "tau": 2.0
+  },
+  {
+   "session": 2,
+   "slot": 20,
+   "arm": "bare",
+   "corner": null,
+   "a_prox": 0.0,
+   "a_wrist": 0.0,
+   "tau": null
+  }
+ ]
+}

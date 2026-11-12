@@ -1,0 +1,448 @@
+{
+ "signed_at": "2026-09-02 06:04:08",
+ "scope": "G-vNext 复放采集(PREREG_G_VNEXT.md)",
+ "n_sequences": 26,
+ "git_commit": "82b65ae",
+ "excluded": [
+  {
+   "name": "pp2_ep006",
+   "family": "pp2",
+   "reason": "**越模型限位**: j2 最深 0.167°"
+  },
+  {
+   "name": "pp2_ep008",
+   "family": "pp2",
+   "reason": "**越模型限位**: j2 最深 0.396°"
+  },
+  {
+   "name": "pp2f_ep001",
+   "family": "pp2f",
+   "reason": "**越模型限位**: j2 最深 0.297°"
+  },
+  {
+   "name": "pp2f_ep003",
+   "family": "pp2f",
+   "reason": "**越模型限位**: j2 最深 0.074°"
+  }
+ ],
+ "what_this_does_NOT_cover": "未覆盖: 真机接触/负载变化; 剔除项越 MuJoCo 模型限位(j2 下界保守), 未放宽限位",
+ "note": "裸复放 da=0; j4 在所有族里恒为 0 ⇒ 逐关节判据只在 5 个可动关节上成立",
+ "sequences": [
+  {
+   "name": "pp2_ep000",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "8a15ab2a765d",
+   "frames": 581,
+   "family": "pp2",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2_ep001",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "d4dd96a9b558",
+   "frames": 592,
+   "family": "pp2",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2_ep002",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "9e3415c62e74",
+   "frames": 590,
+   "family": "pp2",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2_ep003",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "730b2a7768bc",
+   "frames": 591,
+   "family": "pp2",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2_ep004",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "0cd334acf2c9",
+   "frames": 592,
+   "family": "pp2",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2_ep005",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "6032bf8d957f",
+   "frames": 590,
+   "family": "pp2",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2_ep007",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "ef21fcf8428e",
+   "frames": 590,
+   "family": "pp2",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2_ep009",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "1461d934dab3",
+   "frames": 591,
+   "family": "pp2",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep000",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "a6e0d7673cd9",
+   "frames": 583,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep001",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "1fdca30aea88",
+   "frames": 592,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep002",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "6f04af85a831",
+   "frames": 591,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep003",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "8a71e5881887",
+   "frames": 591,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep004",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "e93773964403",
+   "frames": 590,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep005",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "faedf30d6e65",
+   "frames": 593,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep006",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "3e08fa3e8bba",
+   "frames": 591,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep007",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "1f61e8e464f6",
+   "frames": 591,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep008",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "c77088a72cf7",
+   "frames": 591,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2a_ep009",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "733da8356255",
+   "frames": 591,
+   "family": "pp2a",
+   "session": 1,
+   "role": "train"
+  },
+  {
+   "name": "pp2f60_ep000",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "8198e8ed4a51",
+   "frames": 569,
+   "family": "pp2f60",
+   "session": 2,
+   "role": "holdout"
+  },
+  {
+   "name": "pp2f60_ep001",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "d919cc672825",
+   "frames": 578,
+   "family": "pp2f60",
+   "session": 2,
+   "role": "holdout"
+  },
+  {
+   "name": "pp2f60_ep002",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "9c3f8279a5bc",
+   "frames": 578,
+   "family": "pp2f60",
+   "session": 2,
+   "role": "holdout"
+  },
+  {
+   "name": "pp2f_ep000",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "22f3f7d64d11",
+   "frames": 582,
+   "family": "pp2f",
+   "session": 2,
+   "role": "holdout"
+  },
+  {
+   "name": "pp2f_ep002",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "3b107635faa0",
+   "frames": 591,
+   "family": "pp2f",
+   "session": 2,
+   "role": "holdout"
+  },
+  {
+   "name": "pp2f_ep004",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "def739d16a3a",
+   "frames": 591,
+   "family": "pp2f",
+   "session": 2,
+   "role": "holdout"
+  },
+  {
+   "name": "pp2f_ep005",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "06fa0208ef13",
+   "frames": 591,
+   "family": "pp2f",
+   "session": 2,
+   "role": "holdout"
+  },
+  {
+   "name": "pp2f_ep006",
+   "kind": "pp2_replay",
+   "target": [
+    0,
+    1,
+    2,
+    4,
+    5
+   ],
+   "sha": "84159f4024f8",
+   "frames": 592,
+   "family": "pp2f",
+   "session": 2,
+   "role": "holdout"
+  }
+ ]
+}
