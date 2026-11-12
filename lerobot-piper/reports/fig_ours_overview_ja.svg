@@ -1,0 +1,185 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600">
+  <!-- 日本語版（簡潔版）草稿：APEX 図1上半分にならい、本研究の手法（pi-g2env-v1、FF なし）を描く。数値はすべて旧作業台のもの。 -->
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 L3,5 z" fill="#1d8fbf"/>
+    </marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 L3,5 z" fill="#d6405f"/>
+    </marker>
+    <marker id="ahk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 L3,5 z" fill="#1f2d4d"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: 'DejaVu Sans', Arial, 'Noto Sans CJK JP', 'Source Han Sans JP', 'Hiragino Sans', 'Yu Gothic', 'Meiryo', sans-serif; fill: #1f2d4d; }
+    .t { font-size: 15px; font-weight: 700; }
+    .m { font-size: 13px; }
+    .s { font-size: 12px; }
+    .i { font-style: italic; }
+    .note { font-size: 11.5px; fill: #5b6b80; }
+    .box { fill: #def0f7; stroke: #1d8fbf; stroke-width: 2.5; }
+    .learn { fill: #fbe9ee; stroke: #d6405f; stroke-width: 2.5; }
+    .wire { fill: none; stroke: #1d8fbf; stroke-width: 2.4; }
+    .bp { fill: none; stroke: #d6405f; stroke-width: 2.2; stroke-dasharray: 8 5; }
+    .inset { fill: #ffffff; stroke: #1d8fbf; stroke-width: 2; stroke-dasharray: 7 4; }
+    .node { fill: #ffffff; stroke: #1f2d4d; stroke-width: 2.4; }
+  </style>
+
+  <rect width="1600" height="600" fill="#ffffff"/>
+  <rect x="88" y="14" width="1500" height="572" rx="28" fill="#f6fafc" stroke="#1d8fbf" stroke-width="4" stroke-dasharray="16 10"/>
+  <text transform="translate(42,300) rotate(-90)" text-anchor="middle" font-size="25" font-weight="700">本研究</text>
+  <text transform="translate(72,300) rotate(-90)" text-anchor="middle" font-size="25">IMU を用いた実行補正</text>
+
+  <!-- 行ラベル -->
+  <text x="108" y="114" class="m" font-weight="700" fill="#1d8fbf">① シミュレータで学習</text>
+  <text x="108" y="376" class="m" font-weight="700" fill="#1d8fbf">② 実機で実行</text>
+
+  <!-- ACT 方策 -->
+  <text x="180" y="192" text-anchor="middle" class="t">ACT 方策</text>
+  <g stroke="#1f2d4d" stroke-width="1.6">
+    <line x1="150" y1="226" x2="180" y2="214"/><line x1="150" y1="226" x2="180" y2="241"/><line x1="150" y1="226" x2="180" y2="268"/>
+    <line x1="150" y1="256" x2="180" y2="214"/><line x1="150" y1="256" x2="180" y2="241"/><line x1="150" y1="256" x2="180" y2="268"/>
+    <line x1="180" y1="214" x2="210" y2="226"/><line x1="180" y1="241" x2="210" y2="226"/><line x1="180" y1="268" x2="210" y2="226"/>
+    <line x1="180" y1="214" x2="210" y2="256"/><line x1="180" y1="241" x2="210" y2="256"/><line x1="180" y1="268" x2="210" y2="256"/>
+  </g>
+  <g fill="#1f2d4d">
+    <circle cx="150" cy="226" r="8"/><circle cx="150" cy="256" r="8"/>
+    <circle cx="180" cy="214" r="8"/><circle cx="180" cy="241" r="8"/><circle cx="180" cy="268" r="8"/>
+    <circle cx="210" cy="226" r="8"/><circle cx="210" cy="256" r="8"/>
+  </g>
+
+  <!-- 指令 u のバス -->
+  <path class="wire" d="M222,241 H285"/>
+  <text x="253" y="233" text-anchor="middle" class="m i">u</text>
+  <path class="wire" d="M285,110 V372"/>
+  <circle cx="285" cy="241" r="4.5" fill="#1d8fbf"/>
+  <circle cx="285" cy="282" r="4.5" fill="#1d8fbf"/>
+  <path class="wire" d="M285,170 H900 V198" marker-end="url(#ah)"/>
+  <path class="wire" d="M650,170 V144" marker-end="url(#ah)"/>
+  <circle cx="285" cy="170" r="4.5" fill="#1d8fbf"/>
+  <circle cx="650" cy="170" r="4.5" fill="#1d8fbf"/>
+  <text x="520" y="163" text-anchor="middle" class="m i">u</text>
+  <path class="wire" d="M285,110 H328" marker-end="url(#ah)"/>
+  <path class="wire" d="M285,282 H328" marker-end="url(#ah)"/>
+  <path class="wire" d="M285,372 H411" marker-end="url(#ah)"/>
+  <text x="350" y="364" text-anchor="middle" class="m i">u</text>
+
+  <!-- ① シミュレータで学習 -->
+  <rect class="learn" x="330" y="78" width="200" height="64" rx="12"/>
+  <text x="430" y="104" text-anchor="middle" class="t">補正ネットワーク π<tspan dy="4" font-size="11">θ</tspan></text>
+  <text x="430" y="127" text-anchor="middle" class="m">出力 <tspan class="i">δa</tspan>（≤ 10 mrad）</text>
+  <path class="wire" d="M530,110 H598" marker-end="url(#ah)"/>
+  <text x="564" y="101" text-anchor="middle" class="m i">δa</text>
+
+  <rect class="box" x="600" y="78" width="260" height="64" rx="12"/>
+  <text x="730" y="104" text-anchor="middle" class="t">G シミュレータ（固定）</text>
+  <text x="730" y="127" text-anchor="middle" class="m i">u + δa → ω̂</text>
+  <path class="wire" d="M860,110 H917" marker-end="url(#ah)"/>
+  <text x="888" y="101" text-anchor="middle" class="m i">ω̂</text>
+  <circle class="node" cx="936" cy="110" r="17"/>
+  <line x1="927" y1="110" x2="945" y2="110" stroke="#1f2d4d" stroke-width="3"/>
+  <path class="wire" d="M953,110 H988" marker-end="url(#ah)"/>
+
+  <rect class="box" x="990" y="78" width="240" height="64" rx="12"/>
+  <text x="1110" y="104" text-anchor="middle" class="t">損失</text>
+  <text x="1110" y="127" text-anchor="middle" class="m"><tspan class="i">‖ω̂ − ω*‖²</tspan></text>
+
+  <path class="bp" d="M1110,78 V40 H480 V74" marker-end="url(#ahr)"/>
+  <text x="795" y="58" text-anchor="middle" class="s i" fill="#d6405f">損失で π を更新</text>
+
+  <!-- シミュレーション → 実機 -->
+  <path d="M417,146 H443 V226 H458 L430,250 L402,226 H417 Z" fill="#cfe9f5" stroke="#1d8fbf" stroke-width="2"/>
+  <text x="468" y="196" class="m" font-weight="700">シミュレーション → 実機</text>
+  <text x="468" y="214" class="s">パラメータを固定して移す</text>
+
+  <!-- シミュレーション（理想） -->
+  <rect class="box" x="868" y="200" width="214" height="60" rx="12"/>
+  <text x="975" y="225" text-anchor="middle" class="t">シミュレーション（理想）</text>
+  <text x="975" y="247" text-anchor="middle" class="m"><tspan class="i">ω*</tspan> = 剛体運動学(<tspan class="i">u</tspan>)</text>
+  <path class="wire" d="M936,200 V129" marker-end="url(#ah)"/>
+  <text x="946" y="172" class="m i">ω*</text>
+  <path class="wire" d="M1020,260 V353" marker-end="url(#ah)"/>
+  <text x="1030" y="312" class="m i">ω*</text>
+
+  <!-- ② 実機で実行 -->
+  <rect class="learn" x="330" y="252" width="200" height="60" rx="12"/>
+  <text x="430" y="278" text-anchor="middle" class="t">補正ネットワーク π<tspan dy="4" font-size="11">θ</tspan></text>
+  <text x="430" y="300" text-anchor="middle" class="m">パラメータ固定</text>
+  <path class="wire" d="M430,312 V353" marker-end="url(#ah)"/>
+  <text x="442" y="338" class="m i">δa</text>
+
+  <circle class="node" cx="430" cy="372" r="17"/>
+  <line x1="421" y1="372" x2="439" y2="372" stroke="#1f2d4d" stroke-width="3"/>
+  <line x1="430" y1="363" x2="430" y2="381" stroke="#1f2d4d" stroke-width="3"/>
+  <path class="wire" d="M447,372 H668" marker-end="url(#ah)"/>
+  <text x="557" y="364" text-anchor="middle" class="m i">u + δa</text>
+
+  <rect class="box" x="670" y="340" width="180" height="64" rx="12"/>
+  <text x="760" y="366" text-anchor="middle" class="t">Piper コントローラ</text>
+  <text x="760" y="389" text-anchor="middle" class="m">ブラックボックス</text>
+  <path class="wire" d="M850,372 H872" marker-end="url(#ah)"/>
+
+  <!-- アームのアイコン -->
+  <g transform="translate(-33,-30)">
+    <g fill="#1f2d4d" stroke="#1f2d4d">
+      <rect x="912" y="436" width="46" height="12" rx="2" stroke="none"/>
+      <rect x="922" y="420" width="26" height="18" rx="3" stroke="none"/>
+      <line x1="935" y1="420" x2="935" y2="386" stroke-width="12" stroke-linecap="round"/>
+      <line x1="935" y1="386" x2="968" y2="368" stroke-width="10" stroke-linecap="round"/>
+      <line x1="968" y1="368" x2="977" y2="386" stroke-width="8" stroke-linecap="round"/>
+      <line x1="971" y1="389" x2="969" y2="399" stroke-width="4" stroke-linecap="round"/>
+      <line x1="983" y1="387" x2="986" y2="396" stroke-width="4" stroke-linecap="round"/>
+      <circle cx="935" cy="386" r="9" stroke="none"/>
+      <circle cx="968" cy="368" r="7" stroke="none"/>
+    </g>
+    <circle cx="935" cy="386" r="3.5" fill="#ffffff"/>
+    <rect x="972" y="370" width="10" height="10" fill="#1d8fbf" stroke="#ffffff" stroke-width="1.5"/>
+  </g>
+  <text x="917" y="432" text-anchor="middle" class="note">アーム + 手首 IMU</text>
+
+  <path class="wire" d="M962,372 H1001" marker-end="url(#ah)"/>
+  <text x="981" y="364" text-anchor="middle" class="m i">ω</text>
+  <circle class="node" cx="1020" cy="372" r="17"/>
+  <line x1="1011" y1="372" x2="1029" y2="372" stroke="#1f2d4d" stroke-width="3"/>
+  <path class="wire" d="M1037,372 H1068" marker-end="url(#ah)"/>
+
+  <rect class="box" x="1070" y="340" width="160" height="64" rx="12"/>
+  <text x="1150" y="366" text-anchor="middle" class="t">評価</text>
+  <text x="1150" y="389" text-anchor="middle" class="m">実際の動作 vs 指令</text>
+
+  <!-- 右側：結果（IMU 偏差の変化、負ほど良い） -->
+  <rect class="inset" x="1262" y="60" width="310" height="100" rx="6"/>
+  <text x="1276" y="84" class="m" font-weight="700">シミュレーション内（G、未学習データ）</text>
+  <line x1="1470" y1="96" x2="1470" y2="146" stroke="#1f2d4d" stroke-width="1.5"/>
+  <text x="1276" y="126" class="s">π</text>
+  <rect x="1441.6" y="114" width="28.4" height="16" fill="#607d8b"/>
+  <text x="1476" y="127" class="s">−15.8%</text>
+  <text x="1276" y="152" class="note">← 良い</text>
+
+  <rect class="inset" x="1262" y="318" width="310" height="100" rx="6"/>
+  <text x="1276" y="342" class="m" font-weight="700">実機（補正なし ACT 比）</text>
+  <line x1="1470" y1="354" x2="1470" y2="404" stroke="#1f2d4d" stroke-width="1.5"/>
+  <text x="1276" y="384" class="s">π</text>
+  <rect x="1470" y="372" width="45" height="16" fill="#c62828"/>
+  <text x="1464" y="385" text-anchor="end" class="s">+25.0%</text>
+  <text x="1276" y="410" class="note">← 良い</text>
+
+  <!-- 左下：問題の模式図 -->
+  <rect class="inset" x="104" y="444" width="462" height="132" rx="6"/>
+  <text x="118" y="463" class="m" font-weight="700">補正なしの場合（模式図）</text>
+  <line x1="295.1" y1="472" x2="295.1" y2="558" stroke="#8a97a8" stroke-width="1.3" stroke-dasharray="3 3"/>
+  <path fill="none" stroke="#d6405f" stroke-width="2" stroke-dasharray="6 4" d="M118.0,518.0 L120.0,516.7 L122.0,515.4 L124.0,514.0 L126.0,512.7 L128.1,511.5 L130.1,510.2 L132.1,509.0 L134.1,507.8 L136.1,506.6 L138.1,505.5 L140.1,504.4 L142.2,503.4 L144.2,502.4 L146.2,501.5 L148.2,500.6 L150.2,499.8 L152.2,499.1 L154.2,498.4 L156.2,497.8 L158.2,497.2 L160.3,496.7 L162.3,496.3 L164.3,496.0 L166.3,495.8 L168.3,495.6 L170.3,495.5 L172.3,495.5 L174.3,495.6 L176.4,495.7 L178.4,495.9 L180.4,496.2 L182.4,496.6 L184.4,497.0 L186.4,497.6 L188.4,498.2 L190.4,498.8 L192.5,499.5 L194.5,500.3 L196.5,501.2 L198.5,502.1 L200.5,503.1 L202.5,504.1 L204.5,505.1 L206.6,506.2 L208.6,507.4 L210.6,508.6 L212.6,509.8 L214.6,511.0 L216.6,512.3 L218.6,513.6 L220.6,514.9 L222.7,516.2 L224.7,517.6 L226.7,518.9 L228.7,520.2 L230.7,521.5 L232.7,522.8 L234.7,524.1 L236.7,525.4 L238.8,526.6 L240.8,527.8 L242.8,529.0 L244.8,530.1 L246.8,531.2 L248.8,532.3 L250.8,533.3 L252.8,534.2 L254.8,535.1 L256.9,535.9 L258.9,536.7 L260.9,537.4 L262.9,538.0 L264.9,538.6 L266.9,539.1 L268.9,539.5 L270.9,539.9 L273.0,540.1 L275.0,540.3 L277.0,540.5 L279.0,540.5 L281.0,540.5 L283.0,540.3 L285.0,540.1 L287.1,539.7 L289.1,538.1 L291.1,533.5 L293.1,526.0 L295.1,521.5 L297.1,524.8 L299.1,531.1 L301.1,534.5 L303.1,534.9 L305.2,534.2 L307.2,533.3 L309.2,532.3 L311.2,531.2 L313.2,530.1 L315.2,529.0 L317.2,527.8 L319.2,526.6 L321.3,525.4 L323.3,524.1 L325.3,522.8 L327.3,521.5 L329.3,520.2 L331.3,518.9 L333.3,517.6 L335.4,516.2 L337.4,514.9 L339.4,513.6 L341.4,512.3 L343.4,511.0 L345.4,509.8 L347.4,508.6 L349.4,507.4 L351.4,506.2 L353.5,505.1 L355.5,504.1 L357.5,503.1 L359.5,502.1 L361.5,501.2 L363.5,500.3 L365.5,499.5 L367.6,498.8 L369.6,498.2 L371.6,497.6 L373.6,497.0 L375.6,496.6 L377.6,496.2 L379.6,495.9 L381.6,495.7 L383.6,495.6 L385.7,495.5 L387.7,495.5 L389.7,495.6 L391.7,495.8 L393.7,496.0 L395.7,496.3 L397.7,496.7 L399.8,497.2 L401.8,497.8 L403.8,498.4 L405.8,499.1 L407.8,499.8 L409.8,500.6 L411.8,501.5 L413.8,502.4 L415.9,503.4 L417.9,504.4 L419.9,505.5 L421.9,506.6 L423.9,507.8 L425.9,509.0 L427.9,510.2 L429.9,511.5 L431.9,512.7 L434.0,514.0 L436.0,515.4 L438.0,516.7 L440.0,518.0"/>
+  <path fill="none" stroke="#2b4c7e" stroke-width="2.2" d="M118.0,531.8 L120.0,530.7 L122.0,529.6 L124.0,528.5 L126.0,527.3 L128.1,526.0 L130.1,524.8 L132.1,523.5 L134.1,522.2 L136.1,520.9 L138.1,519.6 L140.1,518.3 L142.2,516.9 L144.2,515.6 L146.2,514.3 L148.2,513.0 L150.2,511.7 L152.2,510.5 L154.2,509.2 L156.2,508.0 L158.2,506.9 L160.3,505.7 L162.3,504.6 L164.3,503.6 L166.3,502.6 L168.3,501.7 L170.3,500.8 L172.3,500.0 L174.3,499.2 L176.4,498.5 L178.4,497.9 L180.4,497.3 L182.4,496.8 L184.4,496.4 L186.4,496.1 L188.4,495.8 L190.4,495.6 L192.5,495.5 L194.5,495.5 L196.5,495.6 L198.5,495.7 L200.5,495.9 L202.5,496.2 L204.5,496.5 L206.6,497.0 L208.6,497.5 L210.6,498.0 L212.6,498.7 L214.6,499.4 L216.6,500.2 L218.6,501.0 L220.6,501.9 L222.7,502.9 L224.7,503.9 L226.7,504.9 L228.7,506.0 L230.7,507.2 L232.7,508.3 L234.7,509.6 L236.7,510.8 L238.8,512.1 L240.8,513.4 L242.8,514.7 L244.8,516.0 L246.8,517.3 L248.8,518.6 L250.8,519.9 L252.8,521.3 L254.8,522.6 L256.9,523.9 L258.9,525.1 L260.9,526.4 L262.9,527.6 L264.9,528.8 L266.9,529.9 L268.9,531.0 L270.9,532.1 L273.0,533.1 L275.0,534.0 L277.0,534.9 L279.0,535.8 L281.0,536.6 L283.0,537.3 L285.0,537.9 L287.1,538.5 L289.1,539.0 L291.1,539.5 L293.1,539.8 L295.1,540.1 L297.1,540.3 L299.1,540.4 L301.1,540.5 L303.1,540.5 L305.2,540.4 L307.2,540.2 L309.2,539.9 L311.2,539.6 L313.2,539.2 L315.2,538.7 L317.2,538.2 L319.2,534.7 L321.3,531.4 L323.3,529.0 L325.3,527.5 L327.3,527.0 L329.3,527.1 L331.3,527.7 L333.3,528.5 L335.4,529.3 L337.4,529.8 L339.4,530.0 L341.4,529.7 L343.4,528.9 L345.4,527.7 L347.4,526.0 L349.4,524.1 L351.4,522.1 L353.5,519.9 L355.5,517.8 L357.5,515.9 L359.5,514.1 L361.5,512.5 L363.5,511.1 L365.5,509.9 L367.6,508.9 L369.6,508.0 L371.6,507.1 L373.6,506.3 L375.6,505.5 L377.6,504.7 L379.6,503.8 L381.6,502.9 L383.6,502.0 L385.7,501.0 L387.7,500.1 L389.7,499.2 L391.7,498.4 L393.7,497.7 L395.7,497.0 L397.7,496.5 L399.8,496.0 L401.8,495.7 L403.8,495.5 L405.8,495.4 L407.8,495.4 L409.8,495.4 L411.8,495.6 L413.8,495.8 L415.9,496.0 L417.9,496.4 L419.9,496.8 L421.9,497.2 L423.9,497.7 L425.9,498.3 L427.9,499.0 L429.9,499.7 L431.9,500.4 L434.0,501.3 L436.0,502.2 L438.0,503.1 L440.0,504.2"/>
+  <line x1="386" y1="486" x2="409" y2="486" stroke="#1f2d4d" stroke-width="1.4" marker-start="url(#ahk)" marker-end="url(#ahk)"/>
+  <text x="397" y="480" text-anchor="middle" class="s">遅れ</text>
+  <text x="295" y="571" text-anchor="middle" class="note">チャンク境界</text>
+  <line x1="452" y1="508" x2="476" y2="508" stroke="#2b4c7e" stroke-width="2.2"/>
+  <text x="482" y="512" class="s">実際 <tspan class="i">ω</tspan></text>
+  <line x1="452" y1="530" x2="476" y2="530" stroke="#d6405f" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="482" y="534" class="s">理想 <tspan class="i">ω*</tspan></text>
+
+  <!-- 記号と注記 -->
+  <text x="600" y="500" class="s"><tspan class="i">u</tspan>：ACT の指令　<tspan class="i">δa</tspan>：補正量　<tspan class="i">ω</tspan>：IMU 実測値　<tspan class="i">ω̂</tspan>：G の予測　<tspan class="i">ω*</tspan>：理想（<tspan class="i">u</tspan> から計算）</text>
+  <text x="600" y="526" class="s" font-weight="700" fill="#b23c17">⚠ 数値はすべて旧作業台での測定。新作業台で再測定が必要。</text>
+</svg>
